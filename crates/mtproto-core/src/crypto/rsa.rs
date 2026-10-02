@@ -20,6 +20,8 @@ pub enum RsaError {
     InvalidDer,
     #[error("modulus must be 2048 bits")]
     UnsupportedModulus,
+    #[error("public exponent must be odd and at least 3")]
+    InvalidExponent,
     #[error("payload is {0} bytes, too long for RSA padding")]
     PayloadTooLong(usize),
 }
@@ -37,6 +39,9 @@ impl RsaPublicKey {
         let e = BigUint::from_bytes_be(e);
         if n.bits() != 2048 {
             return Err(RsaError::UnsupportedModulus);
+        }
+        if e.bits() < 2 || !e.bit(0) {
+            return Err(RsaError::InvalidExponent);
         }
         let mut writer = Writer::new();
         writer.write_bytes(&n.to_bytes_be());
@@ -67,6 +72,10 @@ impl RsaPublicKey {
 
     pub fn modulus_be(&self) -> Vec<u8> {
         self.n.to_bytes_be()
+    }
+
+    pub fn exponent_be(&self) -> Vec<u8> {
+        self.e.to_bytes_be()
     }
 
     fn raw_encrypt(&self, block: &[u8; RSA_BYTES]) -> Option<[u8; RSA_BYTES]> {
@@ -227,6 +236,17 @@ t6N/byY9Nw9p21Og3AoXSL2q/2IJ1WRUhebgAdGVMlV1fkuOQoEzR7EdpqtQD9Cs\n\
             base64::engine::general_purpose::STANDARD.encode(&spki)
         );
         assert_eq!(RsaPublicKey::from_pem(&pem).unwrap(), pkcs1);
+    }
+
+    #[test]
+    fn public_exponent_must_be_odd_and_at_least_three() {
+        let key = RsaPublicKey::from_pem(PRODUCTION_KEY).unwrap();
+        let n = key.modulus_be();
+        for e in [&[][..], &[0], &[1], &[2], &[1, 0, 0]] {
+            assert_eq!(RsaPublicKey::from_components(&n, e), Err(RsaError::InvalidExponent), "{e:?}");
+        }
+        assert!(RsaPublicKey::from_components(&n, &[3]).is_ok());
+        assert!(RsaPublicKey::from_components(&n, &[1, 0, 1]).is_ok());
     }
 
     #[test]

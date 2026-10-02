@@ -14,6 +14,14 @@ pub struct DcAddress {
     pub secret: Option<Vec<u8>>,
 }
 
+impl Drop for DcAddress {
+    fn drop(&mut self) {
+        if let Some(secret) = self.secret.as_mut() {
+            mtproto_core::Zeroize::zeroize(secret);
+        }
+    }
+}
+
 impl core::fmt::Debug for DcAddress {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("DcAddress")
@@ -28,6 +36,19 @@ impl core::fmt::Debug for DcAddress {
 pub enum ProxyConfig {
     Socks5 { host: String, port: u16, username: Option<String>, password: Option<String> },
     MtProxy { host: String, port: u16, secret: Vec<u8> },
+}
+
+impl Drop for ProxyConfig {
+    fn drop(&mut self) {
+        match self {
+            ProxyConfig::Socks5 { password, .. } => {
+                if let Some(password) = password.as_mut() {
+                    mtproto_core::Zeroize::zeroize(password);
+                }
+            }
+            ProxyConfig::MtProxy { secret, .. } => mtproto_core::Zeroize::zeroize(secret),
+        }
+    }
 }
 
 impl core::fmt::Debug for ProxyConfig {

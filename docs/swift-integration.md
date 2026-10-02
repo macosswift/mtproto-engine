@@ -367,3 +367,35 @@ exactly as `MTTcpConnection` does; iOS only.
    toolchain. `scripts/verify-ios-link.sh` checks it.
 6. The xcframework is built from whatever is in `third-party/mtproto-engine`; the framework stamp
    changes with every edit there, so `configure_frameworks.sh` rebuilds it.
+
+## 15. FFI ownership and lifetime
+
+The C ABI in `crates/mtproto-ffi/include/mtproto_engine.h` follows these rules. Any other host must
+follow them too.
+
+- **Version.** `mt_engine_abi_version()` must equal the version the host was built against (1).
+- **Engine.** `mt_engine_create` returns an owned pointer. `mt_engine_destroy` releases it:
+  - Delivery stops at once. A secret payload that is already queued is zeroized, not delivered.
+  - The worker threads are shut down and joined.
+  - After it returns, no callback runs and the pointer must not be used again.
+  - Never call it from inside a callback: the calling worker cannot join itself.
+  - Every other function treats a null engine pointer as a no-op (returning 0 where it returns a value).
+- **Sessions.** Handles come from a counter and are never reused. Calls with an unknown or destroyed
+  handle are ignored. Events for a handle can still arrive after `mt_session_destroy` returns; the host
+  drops them, and still frees their payloads.
+- **Inputs.** Every pointer passed in, and the memory it points to, is read only during the call, and
+  the engine copies what it keeps:
+  - covered: `MTString`, `MTBytes`, address and salt arrays, `MTSessionSetup`, `MTRequest`, `MTEnvironment`;
+  - strings are UTF-8, and invalid sequences are replaced, not rejected;
+  - the host may free or reuse its buffers as soon as the call returns. It should wipe its own copies of
+    secrets: auth keys passed to `mt_session_set_auth_key`, and proxy secrets.
+- **Callbacks.**
+  - `on_event` and `on_log` run on engine worker threads. Different sessions can call back
+    concurrently; events of one session arrive in order.
+  - `event`, and every `MTString` inside it or passed to `on_log`, is valid only until the callback returns.
+  - Callbacks should copy what they need and return quickly. They may call `mt_session_*` functions, which only queue a command for the worker.
+- **Payloads.**
+  - A non-null `event->payload` is owned by the host, which must free it exactly once with
+    `mt_buffer_free`, including when it ignores the event.
+  - Buffers that carry key material are zeroized on free.
+  - `mt_buffer_data` is valid until that free.

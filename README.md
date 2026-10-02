@@ -93,7 +93,7 @@ requirement as pass, fail or untested. See `security/README.md`.
 ### Hostile input, fuzzing and soak
 
 - `crates/mtproto-fuzz`: stable-toolchain, seed-reproducible fuzzer with structure-aware generators for every
-  parser and state machine (TL, gzip, framing, obfuscated2/fake-TLS streams, SOCKS5, proxy secrets, `pq`, the
+  parser and state machine (TL, gzip, framing, obfuscated2/fake-TLS streams, SOCKS5, proxy secrets, RSA keys from PEM/DER, `pq`, the
   handshake against a tampering MITM, session and RPC layers fed validly encrypted hostile packets including
   amplification packets, and a 30–90-day `soak`). Each case is checked for panics (overflow checks on), time,
   memory, livelock and protocol invariants (no forged packet or key accepted, exactly-once delivery).

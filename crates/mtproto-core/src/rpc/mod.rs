@@ -426,6 +426,11 @@ impl RpcClient {
         }
         let candidates: Vec<RequestId> = self.parked.values().copied().collect();
         let initialize = self.needs_initialization();
+        let anonymous = if initialize && self.role == SessionRole::Cdn {
+            self.environment.as_ref().map(ApiEnvironment::anonymous)
+        } else {
+            None
+        };
         for id in candidates {
             let ready = self.requests.get(&id).is_some_and(|state| self.is_ready(state, now));
             if !ready {
@@ -437,7 +442,7 @@ impl RpcClient {
                 .and_then(|state| state.request.invoke_after)
                 .filter(|dependency| self.requests.get(dependency).is_some_and(|other| other.in_session))
                 .map(QueryId::from);
-            let environment = self.environment.as_ref();
+            let environment = anonymous.as_ref().or(self.environment.as_ref());
             let state = self.requests.get_mut(&id).expect("ready request exists");
             let without_updates = state.request.flags.without_updates
                 || environment.is_some_and(|environment| environment.disable_updates);

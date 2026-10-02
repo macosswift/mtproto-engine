@@ -1,5 +1,5 @@
 use num_bigint::BigUint;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::auth_key::AuthKey;
 use crate::crypto::{
@@ -73,12 +73,12 @@ enum State {
     WaitDhParams {
         nonce: [u8; 16],
         server_nonce: [u8; 16],
-        new_nonce: [u8; 32],
+        new_nonce: Zeroizing<[u8; 32]>,
     },
     WaitDhGen {
         nonce: [u8; 16],
         server_nonce: [u8; 16],
-        new_nonce: [u8; 32],
+        new_nonce: Zeroizing<[u8; 32]>,
         auth_key: AuthKey,
         prime: BigUint,
         g: u32,
@@ -155,20 +155,22 @@ impl Handshake {
                 let (p, q) = factorize_pq(pq).ok_or(HandshakeError::FactorizationFailed)?;
                 let p_bytes = minimal_be(p);
                 let q_bytes = minimal_be(q);
-                let new_nonce: [u8; 32] = rng.array();
-                let inner = PqInnerData {
+                let new_nonce: Zeroizing<[u8; 32]> = Zeroizing::new(rng.array());
+                let mut inner = PqInnerData {
                     pq: res_pq.pq.clone(),
                     p: p_bytes.clone(),
                     q: q_bytes.clone(),
                     nonce,
                     server_nonce: res_pq.server_nonce,
-                    new_nonce,
+                    new_nonce: *new_nonce,
                     dc: self.config.dc_id,
                     expires_in: self.config.temp_key_expires_in,
                 };
                 let mut inner_bytes = inner.to_bytes();
-                let encrypted = key.encrypt_pad(&inner_bytes, rng)?;
+                inner.new_nonce.zeroize();
+                let encrypted = key.encrypt_pad(&inner_bytes, rng);
                 inner_bytes.zeroize();
+                let encrypted = encrypted?;
                 let request = ReqDhParams {
                     nonce,
                     server_nonce: res_pq.server_nonce,
@@ -198,7 +200,7 @@ impl Handshake {
                         new_nonce_hash,
                     } => {
                         check_nonces(&nonce, &received_nonce, &server_nonce, &received_server_nonce)?;
-                        let expected = sha1(&new_nonce);
+                        let expected = sha1(&new_nonce[..]);
                         if !constant_time_eq(&new_nonce_hash, &expected[4..20]) {
                             return Err(HandshakeError::NewNonceHashMismatch);
                         }
@@ -262,7 +264,7 @@ impl Handshake {
                     DhGenKind::Fail => 3,
                 };
                 let aux = auth_key.aux_hash().to_le_bytes();
-                let expected = sha1_parts(&[&new_nonce, &[number], &aux]);
+                let expected = sha1_parts(&[&new_nonce[..], &[number], &aux]);
                 if !constant_time_eq(&answer.new_nonce_hash, &expected[4..20]) {
                     return Err(HandshakeError::NewNonceHashMismatch);
                 }
@@ -316,7 +318,7 @@ impl Handshake {
         &mut self,
         nonce: [u8; 16],
         server_nonce: [u8; 16],
-        new_nonce: [u8; 32],
+        new_nonce: Zeroizing<[u8; 32]>,
         prime: BigUint,
         g: u32,
         g_a: BigUint,

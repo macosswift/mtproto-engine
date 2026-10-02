@@ -163,6 +163,58 @@ fn init_connection_until_first_success_then_hash_stored() {
     assert_eq!(calls[0].1, Vec::<u32>::new());
 }
 
+fn first_init_connection(role: SessionRole) -> (i32, Vec<Vec<u8>>, Vec<u8>) {
+    let mut h = Harness::new(role, None);
+    let mut env = environment("h1");
+    env.proxy = Some(ClientProxy { address: "proxy.example".into(), port: 443 });
+    env.params = Some(vec![0x99, 0x71, 0xb5, 0x99, 0, 0, 0, 0]);
+    h.client.update_environment(env, None, h.now);
+    h.send(1, RequestFlags::default());
+    let mut body = None;
+    for _ in 0..10 {
+        h.advance(0.002);
+        let _ = h.client.handle_timeout(h.now);
+        if let Some(transmit) = h.client.poll_transmit(h.now, &mut h.rng) {
+            let packet = h.server.decode(&transmit.data);
+            body = packet
+                .messages
+                .into_iter()
+                .map(|message| message.body)
+                .find(|body| body.starts_with(&ids::INVOKE_WITH_LAYER.to_le_bytes()));
+            if body.is_some() {
+                break;
+            }
+        }
+    }
+    let body = body.expect("the initializing call");
+    let mut reader = Reader::new(&body);
+    assert_eq!(reader.read_u32().unwrap(), ids::INVOKE_WITH_LAYER);
+    reader.read_i32().unwrap();
+    assert_eq!(reader.read_u32().unwrap(), INIT_CONNECTION);
+    let flags = reader.read_i32().unwrap();
+    reader.read_i32().unwrap();
+    let fields = (0..6).map(|_| reader.read_bytes().unwrap().to_vec()).collect();
+    (flags, fields, reader.rest().to_vec())
+}
+
+#[test]
+fn cdn_sessions_send_an_anonymous_init_connection() {
+    let (flags, fields, rest) = first_init_connection(SessionRole::Cdn);
+    assert_eq!(flags, 0, "no proxy and no params for a CDN");
+    assert_eq!(fields[0], b"n/a");
+    assert_eq!(fields[1], b"n/a");
+    assert_eq!(fields[2], b"1");
+    assert_eq!(fields[3], b"en");
+    assert!(fields[4].is_empty() && fields[5].is_empty(), "no lang pack or lang code");
+    assert_eq!(&rest[..4], &CALL.to_le_bytes());
+
+    let (flags, fields, rest) = first_init_connection(SessionRole::Main);
+    assert_eq!(flags, 3);
+    assert_eq!(fields[0], b"Mac");
+    assert_eq!(fields[4], b"macos");
+    assert_eq!(&rest[..4], &INPUT_CLIENT_PROXY.to_le_bytes());
+}
+
 #[test]
 fn stored_hash_skips_initialization_and_change_reinitializes() {
     let mut h = Harness::new(SessionRole::Main, Some("h1"));

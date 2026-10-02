@@ -58,14 +58,28 @@ impl DecryptedMessage {
     }
 }
 
+const PADDING_BUCKETS: [usize; 9] = [64, 128, 192, 256, 384, 512, 768, 1024, 1280];
+const PADDING_BUCKET_STEP: usize = 448;
+
+fn bucketed_len(len: usize) -> usize {
+    PADDING_BUCKETS.iter().copied().find(|bucket| len <= *bucket).unwrap_or_else(|| {
+        let last = PADDING_BUCKETS[PADDING_BUCKETS.len() - 1];
+        last + (len - last).div_ceil(PADDING_BUCKET_STEP) * PADDING_BUCKET_STEP
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PaddingPolicy {
     pub extra_random_blocks: usize,
+    pub size_buckets: bool,
 }
 
 impl PaddingPolicy {
     pub fn padding_len(&self, unpadded: usize, rng: &mut impl SecureRandom) -> usize {
         let mut padding = MIN_PADDING + (16 - (unpadded + MIN_PADDING) % 16) % 16;
+        if self.size_buckets {
+            padding = bucketed_len(unpadded + padding) - unpadded;
+        }
         if self.extra_random_blocks > 0 {
             let extra = (rng.next_u32() as usize % (self.extra_random_blocks + 1)) * 16;
             padding += extra;
@@ -430,10 +444,34 @@ mod tests {
             let padding = PaddingPolicy::default().padding_len(unpadded, &mut rng);
             assert!((12..28).contains(&padding));
             assert_eq!((unpadded + padding) % 16, 0);
-            let padding = PaddingPolicy { extra_random_blocks: 200 }.padding_len(unpadded, &mut rng);
+            let padding =
+                PaddingPolicy { extra_random_blocks: 200, size_buckets: false }.padding_len(unpadded, &mut rng);
             assert!((12..=1024).contains(&padding));
             assert_eq!((unpadded + padding) % 16, 0);
         }
+    }
+
+    #[test]
+    fn bucketed_padding_hides_sizes_like_tdlib() {
+        let mut rng = XorShiftRandom::new(6);
+        let policy = PaddingPolicy { extra_random_blocks: 0, size_buckets: true };
+        let mut sizes = std::collections::BTreeSet::new();
+        for unpadded in INNER_HEADER_LEN..20_000 {
+            let padding = policy.padding_len(unpadded, &mut rng);
+            let total = unpadded + padding;
+            assert!((MIN_PADDING..=MAX_PADDING).contains(&padding), "{unpadded}: {padding}");
+            assert_eq!(total % 16, 0);
+            assert!(
+                PADDING_BUCKETS.contains(&total)
+                    || (total > 1280 && (total - 1280).is_multiple_of(PADDING_BUCKET_STEP)),
+                "{total}"
+            );
+            sizes.insert(total);
+        }
+        assert_eq!(policy.padding_len(52, &mut rng) + 52, 64);
+        assert_eq!(policy.padding_len(53, &mut rng) + 53, 128);
+        assert_eq!(policy.padding_len(1300, &mut rng) + 1300, 1728);
+        assert!(sizes.len() < 60, "{} distinct sizes", sizes.len());
     }
 
     #[test]
@@ -475,7 +513,7 @@ mod tests {
         fn roundtrip_any_body(words in proptest::collection::vec(any::<u32>(), 0..300), seed in any::<u64>(), extra in 0usize..64) {
             let body: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
             let mut rng = XorShiftRandom::new(seed);
-            let packet = encrypt_message(&key(7), &header(), &body, Side::Server, PaddingPolicy { extra_random_blocks: extra }, &mut rng);
+            let packet = encrypt_message(&key(7), &header(), &body, Side::Server, PaddingPolicy { extra_random_blocks: extra, size_buckets: extra % 2 == 0 }, &mut rng);
             let decrypted = decrypt_message(&key(7), &packet.data, Side::Server).unwrap();
             prop_assert_eq!(decrypted.body(), &body[..]);
         }

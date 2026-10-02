@@ -193,13 +193,16 @@ impl Bridge {
         self.deliver(session, event, Some(payload), true);
     }
 
-    fn deliver(&self, session: SessionHandle, mut event: MTEvent, payload: Option<Vec<u8>>, secret: bool) {
-        let Some(callback) = self.on_event else {
-            return;
+    fn deliver(&self, session: SessionHandle, mut event: MTEvent, mut payload: Option<Vec<u8>>, secret: bool) {
+        let callback = match self.on_event {
+            Some(callback) if !self.closed.load(Ordering::Acquire) => callback,
+            _ => {
+                if secret && let Some(data) = payload.as_mut() {
+                    data.zeroize();
+                }
+                return;
+            }
         };
-        if self.closed.load(Ordering::Acquire) {
-            return;
-        }
         if let Some(data) = payload {
             event.payload = buffer(data, secret);
         }

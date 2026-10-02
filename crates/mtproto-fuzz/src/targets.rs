@@ -1,7 +1,7 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use mtproto_core::auth_key::AuthKey;
-use mtproto_core::crypto::{SecureRandom, Side, XorShiftRandom, factorize_pq};
+use mtproto_core::crypto::{RsaPublicKey, SecureRandom, Side, XorShiftRandom, factorize_pq};
 use mtproto_core::handshake::{Handshake, HandshakeConfig, HandshakeStep};
 use mtproto_core::message::{
     MessageHeader, PaddingPolicy, decode_plain_message, decrypt_message, decrypt_message_v1, encode_plain_message,
@@ -52,6 +52,7 @@ pub const TARGETS: &[Target] = &[
     Target { name: "socks5", about: "SOCKS5 handshake against a hostile proxy", run: socks5_case },
     Target { name: "secret", about: "MTProxy secrets from links and binary", run: secret_case },
     Target { name: "pq", about: "pq factorisation of attacker-chosen values", run: pq_case },
+    Target { name: "rsa", about: "RSA public keys from PEM/DER, then RSA_PAD with the parsed key", run: rsa_case },
     Target { name: "handshake", about: "auth key exchange against a hostile server and a MITM", run: handshake_case },
     Target {
         name: "session",
@@ -560,6 +561,142 @@ fn pq_case(seed: u64) -> CaseResult {
     if let Some((p, q)) = factorize_pq(pq) {
         ensure(p as u128 * q as u128 == pq as u128, || format!("factorisation of {pq} returned {p} x {q}"))?;
         ensure(p > 1 && q > 1, || format!("trivial factorisation of {pq}"))?;
+    }
+    Ok(())
+}
+
+const PRODUCTION_KEY_DER: &str = "MIIBCgKCAQEA6LszBcC1LGzyr992NzE0ieY+BSaOW622Aa9Bd4ZHLl+TuFQ4lo4g\
+5nKaMBwK/BIb9xUfg0Q29/2mgIR6Zr9krM7HjuIcCzFvDtr+L0GQjae9H0pRB2OO\
+62cECs5HKhT5DZ98K33vmWiLowc621dQuwKWSQKjWf50XYFw42h21P2KXUGyp2y/\
++aEyZ+uVgLLQbRA1dEjSDZ2iGRy12Mk5gpYc397aYp438fsJoHIgJ2lgMv5h7WY9\
+t6N/byY9Nw9p21Og3AoXSL2q/2IJ1WRUhebgAdGVMlV1fkuOQoEzR7EdpqtQD9Cs\
+5+bfo3Nhmcyvk5ftB0WkJ9z6bNZ7yxrP8wIDAQAB";
+
+fn base64_encode(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let value =
+            chunk.iter().enumerate().fold(0u32, |value, (index, byte)| value | (*byte as u32) << (16 - 8 * index));
+        for index in 0..4 {
+            if index <= chunk.len() {
+                out.push(ALPHABET[(value >> (18 - 6 * index) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+fn base64_decode(text: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut value = 0u32;
+    let mut bits = 0;
+    for byte in text.bytes() {
+        let digit = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => continue,
+        };
+        value = value << 6 | digit as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((value >> bits) as u8);
+        }
+    }
+    out
+}
+
+fn der_length(len: usize) -> Vec<u8> {
+    match len {
+        0..=127 => vec![len as u8],
+        128..=255 => vec![0x81, len as u8],
+        _ => vec![0x82, (len >> 8) as u8, len as u8],
+    }
+}
+
+fn der_integer(value: &[u8]) -> Vec<u8> {
+    let mut out = vec![0x02];
+    out.extend(der_length(value.len()));
+    out.extend_from_slice(value);
+    out
+}
+
+fn rsa_case(seed: u64) -> CaseResult {
+    let mut g = Gen::new(seed);
+    let armor = *g.pick(&["RSA PUBLIC KEY", "PUBLIC KEY", "CERTIFICATE"]);
+    let pem = match g.below(5) {
+        0 => {
+            let mut pem = format!("-----BEGIN RSA PUBLIC KEY-----\n{PRODUCTION_KEY_DER}\n-----END RSA PUBLIC KEY-----")
+                .into_bytes();
+            for _ in 0..1 + g.below(8) {
+                let index = g.below(pem.len());
+                pem[index] = g.bytes(1)[0];
+            }
+            String::from_utf8_lossy(&pem).into_owned()
+        }
+        1 => {
+            let mut der = base64_decode(PRODUCTION_KEY_DER);
+            match g.below(4) {
+                0 => der.truncate(g.below(der.len())),
+                1 => {
+                    let len = g.small_len();
+                    der.extend(g.bytes(len));
+                }
+                2 => {
+                    for _ in 0..1 + g.below(4) {
+                        let index = g.below(der.len());
+                        der[index] = g.bytes(1)[0];
+                    }
+                }
+                _ => {}
+            }
+            format!("-----BEGIN {armor}-----\n{}\n-----END {armor}-----", base64_encode(&der))
+        }
+        2 => {
+            let len = g.below(600);
+            format!("-----BEGIN {armor}-----\n{}\n-----END {armor}-----", base64_encode(&g.bytes(len)))
+        }
+        3 => {
+            let modulus_len = *g.pick(&[1usize, 16, 128, 255, 256, 257, 512]);
+            let mut modulus = vec![0x00];
+            modulus.extend(g.bytes(modulus_len));
+            if modulus_len == 256 && g.one_in(2) {
+                modulus[1] |= 0x80;
+            }
+            let exponent = g.pick(&[&[0x01, 0x00, 0x01][..], &[0x01], &[0x00], &[0x02], &[0x03], &[]]).to_vec();
+            let mut body = der_integer(&modulus);
+            body.extend(der_integer(&exponent));
+            let mut der = vec![0x30];
+            der.extend(der_length(body.len()));
+            der.extend(body);
+            format!("-----BEGIN RSA PUBLIC KEY-----\n{}\n-----END RSA PUBLIC KEY-----", base64_encode(&der))
+        }
+        _ => String::from_utf8_lossy(&{
+            let len = g.small_len();
+            g.bytes(len)
+        })
+        .into_owned(),
+    };
+    let parsed = catch_unwind(AssertUnwindSafe(|| RsaPublicKey::from_pem(&pem)))
+        .map_err(|_| format!("RSA PEM parsing panicked on {pem:?}"))?;
+    if let Ok(key) = parsed {
+        ensure(key.modulus_be().len() == 256, || format!("accepted a {}-byte modulus", key.modulus_be().len()))?;
+        let exponent = key.exponent_be();
+        ensure(exponent.last().is_some_and(|byte| byte & 1 == 1) && exponent != [1], || {
+            format!("accepted exponent {exponent:?}")
+        })?;
+        let mut rng = XorShiftRandom::new(seed ^ 0x5eed);
+        let len = g.below(145);
+        let data = g.bytes(len);
+        let started = std::time::Instant::now();
+        key.encrypt_pad(&data, &mut rng).map_err(|error| format!("RSA_PAD failed: {error}"))?;
+        ensure(started.elapsed() < std::time::Duration::from_secs(2), || "RSA_PAD took too long".to_string())?;
     }
     Ok(())
 }

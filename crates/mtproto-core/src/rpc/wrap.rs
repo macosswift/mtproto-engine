@@ -28,6 +28,20 @@ pub struct ApiEnvironment {
     pub disable_updates: bool,
 }
 
+impl ApiEnvironment {
+    pub fn anonymous(&self) -> Self {
+        Self {
+            device_model: "n/a".into(),
+            system_version: "n/a".into(),
+            lang_pack: String::new(),
+            lang_code: String::new(),
+            proxy: None,
+            params: None,
+            ..self.clone()
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub enum Verification {
     Apns { nonce: String, secret: String },

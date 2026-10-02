@@ -320,12 +320,15 @@ fn run_proxy_case(options: ServerOptions, proxy: Option<ProxyConfig>, address_se
     let mut config = setup(&server, &key, SessionRole::Main);
     config.addresses[0].secret = address_secret;
     if let Some(proxy) = proxy {
-        config.proxy = Some(match proxy {
-            ProxyConfig::Socks5 { username, password, .. } => {
-                ProxyConfig::Socks5 { host: "127.0.0.1".into(), port: server.address.port(), username, password }
-            }
+        config.proxy = Some(match &proxy {
+            ProxyConfig::Socks5 { username, password, .. } => ProxyConfig::Socks5 {
+                host: "127.0.0.1".into(),
+                port: server.address.port(),
+                username: username.clone(),
+                password: password.clone(),
+            },
             ProxyConfig::MtProxy { secret, .. } => {
-                ProxyConfig::MtProxy { host: "localhost".into(), port: server.address.port(), secret }
+                ProxyConfig::MtProxy { host: "localhost".into(), port: server.address.port(), secret: secret.clone() }
             }
         });
         config.addresses[0].host = "149.154.167.51".into();

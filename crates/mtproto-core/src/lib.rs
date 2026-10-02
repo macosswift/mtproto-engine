@@ -10,5 +10,7 @@ pub mod session;
 pub mod tl;
 pub mod transport;
 
+pub use zeroize::Zeroize;
+
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;

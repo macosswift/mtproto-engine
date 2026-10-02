@@ -34,7 +34,6 @@ pub const RACE_AFTER: f64 = 1.0;
 pub const RACE_SILENT_AFTER: f64 = 1.5;
 pub const RACE_VERIFY_TIMEOUT: f64 = 4.0;
 pub const RACER_MAX_CHUNKS: usize = 2;
-pub const DIRECT_PADDING_BLOCKS: usize = 4;
 pub const PROXY_PADDING_BLOCKS: usize = 15;
 pub const RACE_RETRY_BASE: f64 = 1.0;
 pub const RACE_RETRY_MAX: f64 = 8.0;
@@ -236,12 +235,12 @@ impl SessionRuntime {
     fn session_config(&self) -> SessionConfig {
         let disguised =
             self.setup.proxy.is_some() || self.setup.addresses.iter().any(|address| address.secret.is_some());
-        let extra_random_blocks = if disguised { PROXY_PADDING_BLOCKS } else { DIRECT_PADDING_BLOCKS };
-        SessionConfig {
-            is_main: self.setup.role == SessionRole::Main,
-            padding: PaddingPolicy { extra_random_blocks },
-            ..SessionConfig::default()
-        }
+        let padding = if disguised {
+            PaddingPolicy { extra_random_blocks: PROXY_PADDING_BLOCKS, size_buckets: false }
+        } else {
+            PaddingPolicy { extra_random_blocks: 0, size_buckets: true }
+        };
+        SessionConfig { is_main: self.setup.role == SessionRole::Main, padding, ..SessionConfig::default() }
     }
 
     fn install_key(&mut self, material: AuthKeyMaterial, now: Now, rng: &mut OsRandom) {
