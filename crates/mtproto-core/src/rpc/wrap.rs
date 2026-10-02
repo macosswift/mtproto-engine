@@ -28,10 +28,19 @@ pub struct ApiEnvironment {
     pub disable_updates: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Verification {
     Apns { nonce: String, secret: String },
     Recaptcha { token: String },
+}
+
+impl core::fmt::Debug for Verification {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Verification::Apns { .. } => f.write_str("Verification::Apns(<redacted>)"),
+            Verification::Recaptcha { .. } => f.write_str("Verification::Recaptcha(<redacted>)"),
+        }
+    }
 }
 
 pub fn wrap_request(

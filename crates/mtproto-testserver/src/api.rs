@@ -46,11 +46,19 @@ pub enum CdnFault {
     EndlessReupload,
     NoHashes,
     TokenInvalid,
+    Truncated,
+    BadRedirectKey,
 }
 
 impl CdnFault {
-    pub const ALL: [CdnFault; 4] =
-        [CdnFault::CorruptData, CdnFault::EndlessReupload, CdnFault::NoHashes, CdnFault::TokenInvalid];
+    pub const ALL: [CdnFault; 6] = [
+        CdnFault::CorruptData,
+        CdnFault::EndlessReupload,
+        CdnFault::NoHashes,
+        CdnFault::TokenInvalid,
+        CdnFault::Truncated,
+        CdnFault::BadRedirectKey,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -59,6 +67,8 @@ impl CdnFault {
             CdnFault::EndlessReupload => "endless-reupload",
             CdnFault::NoHashes => "no-hashes",
             CdnFault::TokenInvalid => "token-invalid",
+            CdnFault::Truncated => "truncated",
+            CdnFault::BadRedirectKey => "bad-redirect-key",
         }
     }
 }
@@ -369,7 +379,11 @@ impl ApiWorld {
             writer.write_i32(self.options.cdn_datacenter_id);
             writer.write_bytes(&token);
             writer.write_bytes(&key);
-            writer.write_bytes(&iv);
+            if self.options.cdn_fault == CdnFault::BadRedirectKey {
+                writer.write_bytes(&iv[..2]);
+            } else {
+                writer.write_bytes(&iv);
+            }
             write_file_hashes(&mut writer, file.id, file.size, offset, MEGABYTE);
             return ApiReply::Result(writer.into_inner());
         }
@@ -419,7 +433,10 @@ impl ApiWorld {
             writer.write_bytes(&request_token);
             return ApiReply::Result(writer.into_inner());
         }
-        let end = (offset + limit).min(file.size);
+        let mut end = (offset + limit).min(file.size);
+        if self.options.cdn_fault == CdnFault::Truncated {
+            end = end.min(MEGABYTE);
+        }
         let length = end.saturating_sub(offset) as usize;
         let mut data = file_content(file.id, offset, length);
         if self.options.cdn_fault == CdnFault::CorruptData && length > 0 {
@@ -734,5 +751,42 @@ mod tests {
         reader.read_i64().unwrap();
         reader.read_i32().unwrap();
         assert_eq!(reader.read_bytes().unwrap(), sha256(&file_content(3, 0, 131_072)));
+
+        let (world, token, _, _) = redirected(CdnFault::Truncated);
+        for offset in [0, MEGABYTE] {
+            let needed = cdn_part(&world, &token, offset);
+            reupload_after(&world, &token, &needed);
+        }
+        let before = cdn_part(&world, &token, MEGABYTE - 131_072);
+        let mut reader = Reader::new(&before);
+        assert_eq!(reader.read_u32().unwrap(), UPLOAD_CDN_FILE);
+        assert_eq!(reader.read_bytes().unwrap().len(), 131_072);
+        let after = cdn_part(&world, &token, MEGABYTE);
+        let mut reader = Reader::new(&after);
+        assert_eq!(reader.read_u32().unwrap(), UPLOAD_CDN_FILE);
+        assert!(reader.read_bytes().unwrap().is_empty());
+    }
+
+    #[test]
+    fn bad_redirect_key_fault_sends_a_short_iv() {
+        let files = [FileSpec { id: 3, datacenter_id: 4, size: MEGABYTE, cdn: true }];
+        let world =
+            ApiWorld::new(WorldOptions { cdn_fault: CdnFault::BadRedirectKey, ..WorldOptions::default() }, &files, 7);
+        let mut export = Writer::new();
+        export.write_i32(4);
+        let exported = result(world.handle(2, 1, AUTH_EXPORT_AUTHORIZATION, export.as_slice()));
+        let mut reader = Reader::new(&exported);
+        reader.read_u32().unwrap();
+        let mut import = Writer::new();
+        import.write_i64(reader.read_i64().unwrap());
+        import.write_bytes(reader.read_bytes().unwrap());
+        result(world.handle(4, 1, AUTH_IMPORT_AUTHORIZATION, import.as_slice()));
+        let redirect = result(world.handle(4, 1, UPLOAD_GET_FILE, &get_file_with_flags(2, 3, 0, 131_072)));
+        let mut reader = Reader::new(&redirect);
+        assert_eq!(reader.read_u32().unwrap(), UPLOAD_FILE_CDN_REDIRECT);
+        reader.read_i32().unwrap();
+        reader.read_bytes().unwrap();
+        assert_eq!(reader.read_bytes().unwrap().len(), 32);
+        assert_eq!(reader.read_bytes().unwrap().len(), 2);
     }
 }

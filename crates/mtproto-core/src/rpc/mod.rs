@@ -24,6 +24,7 @@ pub const MIN_FLOOD_WAIT_SECONDS: i64 = 1;
 pub const MAX_FLOOD_WAIT_SECONDS: i64 = 14 * 24 * 60 * 60;
 pub const TEMPORARY_KEY_RETRY_DELAY: f64 = 1.0;
 pub const TEMPORARY_KEY_MAX_RETRY_DELAY: f64 = 30.0;
+pub const CDN_TEMPORARY_KEY_REJECTIONS: u32 = 2;
 pub const TEMPORARY_KEY_REPORT_INTERVAL: f64 = 30.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -581,6 +582,11 @@ impl RpcClient {
             return;
         }
         if code == 401 && message == "AUTH_KEY_PERM_EMPTY" {
+            let rejections = self.requests.get(&id).map_or(0, |state| state.temporary_key_rejections);
+            if self.role == SessionRole::Cdn && rejections + 1 >= CDN_TEMPORARY_KEY_REJECTIONS {
+                self.surface(id, code, message, response_time, now);
+                return;
+            }
             self.park_for_temporary_key(id, now);
             return;
         }

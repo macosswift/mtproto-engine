@@ -287,7 +287,7 @@ pub struct Session {
     future_salts_requests: VecDeque<i64>,
     awaited_answers: HashMap<i64, AwaitedAnswer>,
     resend_individually: HashSet<i64>,
-    recent_sent: VecDeque<i64>,
+    recent_sent: VecDeque<(i64, f64)>,
     recent_unique_ids: VecDeque<i64>,
     force_send_at: Option<f64>,
 
@@ -964,7 +964,22 @@ impl Session {
     }
 
     fn was_sent_recently(&self, msg_id: i64, now: Now) -> bool {
-        self.was_sent(msg_id) && msg_id_time(msg_id) >= self.server_time(now) - MSG_ID_MAX_PAST_SECONDS
+        self.sent_at(msg_id).is_some_and(|sent_at| now.mono - sent_at <= MSG_ID_MAX_PAST_SECONDS)
+    }
+
+    fn sent_at(&self, msg_id: i64) -> Option<f64> {
+        if let Some(sent_at) = self.pending_pings.get(&msg_id) {
+            return Some(*sent_at);
+        }
+        if let Some(request) = self.service_requests.get(&msg_id) {
+            return Some(request.sent_at());
+        }
+        if let Some(query) = self.by_msg_id.get(&msg_id).and_then(|id| self.queries.get(id))
+            && query.msg_id == msg_id
+        {
+            return Some(query.sent_at);
+        }
+        self.recent_sent.iter().rev().find(|(id, _)| *id == msg_id).map(|(_, sent_at)| *sent_at)
     }
 
     fn was_sent(&self, msg_id: i64) -> bool {
@@ -974,11 +989,11 @@ impl Session {
             || self.pending_pings.contains_key(&msg_id)
             || self.future_salts_requests.contains(&msg_id)
             || self.service_containers.iter().any(|(container, _)| *container == msg_id)
-            || self.recent_sent.contains(&msg_id)
+            || self.recent_sent.iter().any(|(id, _)| *id == msg_id)
     }
 
-    fn remember_sent(&mut self, msg_id: i64) {
-        self.recent_sent.push_back(msg_id);
+    fn remember_sent(&mut self, msg_id: i64, now: Now) {
+        self.recent_sent.push_back((msg_id, now.mono));
         while self.recent_sent.len() > RECENT_SENT_CAPACITY {
             self.recent_sent.pop_front();
         }
@@ -1208,15 +1223,24 @@ impl Session {
             DuplicateCheck::TooOld => Mode::Replay,
         };
         let mut budget = self.config.max_unpacked_bytes;
-        if mode != Mode::AckOnly {
-            self.observe_server_time(header.msg_id, now);
-            if !self.is_within_time_window(header.msg_id, now) {
-                if !self.has_freshness_proof(body, 0, &mut budget, &mut 0, now) {
+        match mode {
+            Mode::Process => {
+                self.observe_server_time(header.msg_id, now);
+                if !self.is_within_time_window(header.msg_id, now) {
+                    if !self.has_freshness_proof(body, 0, &mut budget, &mut 0, now) {
+                        return Ok(());
+                    }
+                    self.reset_server_time(header.msg_id, now);
+                }
+                self.received.check(header.msg_id);
+            }
+            Mode::Replay => {
+                if !self.is_within_time_window(header.msg_id, now) {
                     return Ok(());
                 }
-                self.reset_server_time(header.msg_id, now);
+                self.received.check(header.msg_id);
             }
-            self.received.check(header.msg_id);
+            Mode::AckOnly => {}
         }
         if mode == Mode::Process {
             self.last_read_at = now.mono;
@@ -1291,15 +1315,21 @@ impl Session {
                 .map(|unpacked| self.has_freshness_proof(&unpacked, depth + 1, budget, visited, now))
                 .unwrap_or(false),
             Ok(ServiceMessage::MsgCopy(inner)) => self.has_freshness_proof(inner.body, depth + 1, budget, visited, now),
-            Ok(ServiceMessage::RpcResult { req_msg_id, .. }) => self.by_msg_id.contains_key(&req_msg_id),
-            Ok(ServiceMessage::Pong { msg_id, ping_id }) => {
-                self.pending_pings.contains_key(&msg_id) || self.pending_pings.contains_key(&ping_id)
-            }
+            Ok(ServiceMessage::RpcResult { req_msg_id, .. }) => self.was_sent_recently(req_msg_id, now),
+            Ok(ServiceMessage::Pong { msg_id, ping_id }) => [msg_id, ping_id]
+                .into_iter()
+                .any(|id| self.pending_pings.contains_key(&id) && self.was_sent_recently(id, now)),
             Ok(ServiceMessage::BadMsgNotification { bad_msg_id, .. })
             | Ok(ServiceMessage::BadServerSalt { bad_msg_id, .. }) => self.was_sent_recently(bad_msg_id, now),
-            Ok(ServiceMessage::MsgsStateInfo { req_msg_id, .. }) => self.service_requests.contains_key(&req_msg_id),
-            Ok(ServiceMessage::FutureSalts { req_msg_id, .. }) => self.future_salts_requests.contains(&req_msg_id),
-            Ok(ServiceMessage::MsgDetailedInfo { msg_id, .. }) => self.by_msg_id.contains_key(&msg_id),
+            Ok(ServiceMessage::MsgsStateInfo { req_msg_id, .. }) => {
+                self.service_requests.contains_key(&req_msg_id) && self.was_sent_recently(req_msg_id, now)
+            }
+            Ok(ServiceMessage::FutureSalts { req_msg_id, .. }) => {
+                self.future_salts_requests.contains(&req_msg_id) && self.was_sent_recently(req_msg_id, now)
+            }
+            Ok(ServiceMessage::MsgDetailedInfo { msg_id, .. }) => {
+                self.by_msg_id.contains_key(&msg_id) && self.was_sent_recently(msg_id, now)
+            }
             Ok(ServiceMessage::NewSessionCreated { first_msg_id, .. }) => self.was_sent_recently(first_msg_id, now),
             _ => false,
         }
@@ -2318,7 +2348,7 @@ impl Session {
         }
 
         for message in &messages {
-            self.remember_sent(message.msg_id);
+            self.remember_sent(message.msg_id, now);
         }
 
         let (outer_msg_id, seq_no, body, container_id) = if messages.len() == 1 && !force_container {
@@ -2336,7 +2366,7 @@ impl Session {
             tlm::write_container(&mut writer, &refs);
             (container_id, seq_no, writer.into_inner(), container_id)
         };
-        self.remember_sent(outer_msg_id);
+        self.remember_sent(outer_msg_id, now);
 
         if container_id != 0 {
             let children: Vec<i64> = query_messages.iter().map(|(_, index)| messages[*index].msg_id).collect();

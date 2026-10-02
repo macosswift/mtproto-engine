@@ -1168,9 +1168,40 @@ fn destroying_the_auth_key_on_logout_reaches_the_server() {
 }
 
 #[test]
+fn a_forged_404_keeps_the_session_and_executes_once() {
+    for warm in [false, true] {
+        let key = random_key(if warm { 81 } else { 80 });
+        let server = TestServer::start(vec![key.clone()], ServerOptions::default());
+        let collector = Arc::new(Collector::default());
+        let engine = engine(&collector, 1);
+        let session = engine.create_session(setup(&server, &key, SessionRole::Main));
+        let mut expected = 0;
+        if warm {
+            engine.send(session, request(1, 5));
+            expected += 1;
+            assert!(collector.wait(WAIT, |events| completions(events, session) == expected));
+        }
+        engine.send(session, request(2, TAG_FORGED_404_ONCE));
+        expected += 1;
+        assert!(
+            collector.wait(WAIT, |events| completions(events, session) == expected),
+            "warm {warm}: the request never completed"
+        );
+        assert_eq!(server.executions(TAG_FORGED_404_ONCE), 1, "warm {warm}: executed twice");
+        assert_eq!(
+            collector.count(|event| matches!(event, EngineEvent::AuthKeyInvalid { .. })),
+            0,
+            "warm {warm}: one unconfirmed -404 must not invalidate the key"
+        );
+        assert!(server.with_stats(|stats| stats.connections) >= 2, "warm {warm}: reconnected");
+        engine.shutdown();
+    }
+}
+
+#[test]
 fn trickling_or_noisy_connections_are_abandoned_and_requests_complete() {
     std::thread::scope(|scope| {
-        for mode in [0u64, 1, 2] {
+        for mode in [0u64, 1, 2, 3] {
             scope.spawn(move || {
                 let key = random_key(60 + mode);
                 let server = TestServer::start(vec![key.clone()], ServerOptions::default());
@@ -1186,6 +1217,9 @@ fn trickling_or_noisy_connections_are_abandoned_and_requests_complete() {
                 let elapsed = started.elapsed();
                 if mode == 0 {
                     assert!(elapsed >= Duration::from_secs(10), "mode {mode}: a progressing frame gets its grace");
+                }
+                if mode == 3 {
+                    assert!(elapsed < Duration::from_secs(10), "mode {mode}: an oversized frame gets no grace");
                 }
                 assert!(elapsed < Duration::from_secs(45), "mode {mode}: abandoned after {elapsed:?}");
                 assert!(server.with_stats(|stats| stats.connections) >= 2, "mode {mode}: reconnected");
@@ -1250,4 +1284,17 @@ fn slow_uplink_uploads_complete_without_reconnect_loops() {
     );
     assert!(sim.stats().connections <= 2, "{} connections: the upload was restarted", sim.stats().connections);
     engine.shutdown();
+}
+
+#[test]
+fn debug_output_redacts_proxy_secrets_and_verification_tokens() {
+    let address = DcAddress { host: "149.154.167.51".into(), port: 443, secret: Some(vec![0x5c; 16]) };
+    let text = format!("{address:?}");
+    assert!(!text.contains("92"), "{text}");
+    assert!(text.contains("16 bytes"), "{text}");
+    let recaptcha = mtproto_engine::mtproto_core::rpc::Verification::Recaptcha { token: "TOKEN-XYZ".into() };
+    let apns =
+        mtproto_engine::mtproto_core::rpc::Verification::Apns { nonce: "N".into(), secret: "APNS-SECRET".into() };
+    assert!(!format!("{recaptcha:?}").contains("TOKEN-XYZ"));
+    assert!(!format!("{apns:?}").contains("APNS-SECRET"));
 }

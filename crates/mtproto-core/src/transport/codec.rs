@@ -3,6 +3,7 @@ use super::buffer::InputBuffer;
 use crate::crypto::SecureRandom;
 
 pub const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
+pub const MAX_INBOUND_FRAME_LEN: usize = 4 * 1024 * 1024 + 1024;
 const QUICK_ACK_BIT: u32 = 0x8000_0000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

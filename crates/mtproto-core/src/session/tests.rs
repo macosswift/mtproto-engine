@@ -1204,6 +1204,67 @@ fn future_msg_id_glitch_is_recovered_through_a_freshness_proof() {
 }
 
 #[test]
+fn replays_below_the_window_never_move_the_clock() {
+    let mut h = Harness::new();
+    h.flush();
+    let replayed = msg_id_for_time(h.server.server_time - 200.0) | 1;
+    for _ in 0..2100 {
+        h.deliver(vec![Outgoing::Content(update(0x0101_0101, &[0; 4]))]).unwrap();
+    }
+    h.events();
+    let glitch = msg_id_for_time(h.server.server_time + 1000.0) | 3;
+    h.deliver_sealed(glitch, 1, &update(1, &[0; 4])).unwrap();
+    h.session.send(QueryId(1), query_body(1), QueryOptions::default(), h.now);
+    let packet = h.flush().unwrap();
+    let query = h.sent_query(&packet, 1);
+    let proof = msg_id_for_time(h.server.server_time + 0.01) | 1;
+    h.deliver_sealed(proof, 1, &rpc_result(query, &[3, 0, 0, 0])).unwrap();
+    assert!(has_forced_time_update(&h.events()), "precondition: the clock was reset");
+    let before = h.session.time_difference();
+    h.deliver_sealed(replayed, 1, &update(9, &[0; 4])).unwrap();
+    let events = h.events();
+    assert!(
+        !events.iter().any(|event| matches!(event, SessionEvent::TimeDifferenceUpdated { .. })),
+        "a replay from below the duplicate window must not move the clock"
+    );
+    assert_eq!(h.session.time_difference(), before);
+}
+
+#[test]
+fn a_withheld_pong_cannot_drag_the_clock_back() {
+    let mut h = Harness::new();
+    h.sync();
+    h.advance(45.0);
+    let packet = h.flush().unwrap();
+    let ping = packet.find(ids::PING_DELAY_DISCONNECT).unwrap().clone();
+    let answer = h.server.next_msg_id(false);
+    for _ in 0..8 {
+        h.advance(50.0);
+        h.deliver(vec![Outgoing::Content(update(0x0202_0202, &[0; 4]))]).unwrap();
+    }
+    h.events();
+    h.deliver_sealed(answer, 0, &pong(ping.msg_id, ping_id_of(&ping).unwrap())).unwrap();
+    assert!(!has_forced_time_update(&h.events()), "a pong withheld past the window must not reset the clock");
+}
+
+#[test]
+fn a_withheld_answer_cannot_drag_the_clock_back() {
+    let mut h = Harness::new();
+    h.sync();
+    let query = h.sent_one(1);
+    let answer = h.server.next_msg_id(true);
+    h.advance(400.0);
+    h.events();
+    h.deliver_sealed(answer, 1, &rpc_result(query, &[1, 0, 0, 0])).unwrap();
+    let events = h.events();
+    assert!(!has_forced_time_update(&events), "an answer withheld past the window must not reset the clock");
+    assert!(
+        !events.iter().any(|event| matches!(event, SessionEvent::Result { id: QueryId(1), .. })),
+        "the stale packet is dropped"
+    );
+}
+
+#[test]
 fn wall_clock_jumps_do_not_move_server_time() {
     let mut h = Harness::new();
     h.sync();

@@ -45,6 +45,7 @@ pub const TAG_MSG_COPY: u32 = 1017;
 pub const TAG_GARBAGE_SIBLINGS: u32 = 1018;
 pub const TAG_GZIP: u32 = 1019;
 pub const TAG_TRICKLE_ONCE: u32 = 1020;
+pub const TAG_FORGED_404_ONCE: u32 = 1021;
 pub const SERVER_PING_ID: i64 = 0x5e57_9149;
 pub const LARGE_SIZE: usize = 1024 * 1024;
 pub const SERVER_SALT: i64 = 0x5a17;
@@ -1269,6 +1270,10 @@ fn serve_frames_inner(
                                 TAG_UNAUTHORIZED => {
                                     outgoing.push((sp::rpc_error(message.msg_id, 401, "AUTH_KEY_UNREGISTERED"), true))
                                 }
+                                TAG_FORGED_404_ONCE if count == 1 => {
+                                    outgoing.push((reply, true));
+                                    transport_error = Some(-404);
+                                }
                                 TAG_DROP_CONNECTION_ONCE if count == 1 => {
                                     session.peer.server_time = server_now(session.clock_offset);
                                     let msg_id = session.peer.next_msg_id(true);
@@ -1386,8 +1391,8 @@ fn serve_frames_inner(
 
 fn trickle_forever(wire: &mut Wire, mode: i32, stop: &AtomicBool, rng: &mut XorShiftRandom) -> std::io::Result<()> {
     let started = Instant::now();
-    if mode == 0 {
-        let declared = 8u32 << 20;
+    if mode == 0 || mode == 3 {
+        let declared = if mode == 0 { 2u32 << 20 } else { 8u32 << 20 };
         let header = match wire.framing {
             Framing::Abridged => {
                 let words = declared / 4;
@@ -1402,7 +1407,7 @@ fn trickle_forever(wire: &mut Wire, mode: i32, stop: &AtomicBool, rng: &mut XorS
     while !stop.load(Ordering::Relaxed) && started.elapsed() < Duration::from_secs(90) {
         std::thread::sleep(Duration::from_millis(300));
         let sent = match mode {
-            0 => wire.send_raw_frame(vec![0x55]),
+            0 | 3 => wire.send_raw_frame(vec![0x55]),
             1 => wire.send_frame(&0u32.to_le_bytes()),
             _ => wire.send_quick_ack(rng.next_u64() as u32 & 0x7fff_ffff),
         };

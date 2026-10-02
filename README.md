@@ -84,6 +84,12 @@ Telegram-Mac repo builds `MTProtoEngineFFI.xcframework` (arm64 + x86_64, macOS 1
   end-to-end tests that drive `MTContext` → `RustNetworkSession` → the engine → the
   `mtproto-testserver` binary (build it first with `cargo build --release -p mtproto-testserver`).
 
+### Security bench
+
+`security/requirements.tsv` maps every documented MTProto security requirement and every tdlib check to
+the tests that pin it; `./scripts/security-bench.py` runs the workspace tests and reports each
+requirement as pass, fail or untested. See `security/README.md`.
+
 ### Hostile input, fuzzing and soak
 
 - `crates/mtproto-fuzz`: stable-toolchain, seed-reproducible fuzzer with structure-aware generators for every

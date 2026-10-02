@@ -1,6 +1,6 @@
 use super::TransportError;
 use super::buffer::InputBuffer;
-use super::codec::{FrameDecoder, Framing, Incoming, encode_frame};
+use super::codec::{FrameDecoder, Framing, Incoming, MAX_INBOUND_FRAME_LEN, encode_frame};
 use super::obfuscation::obfuscated_init;
 use super::proxy_secret::ProxySecret;
 use super::tls::{TlsRecordReader, TlsRecordWriter, client_hello, verify_server_hello};
@@ -63,7 +63,7 @@ impl TransportStream {
             TlsState::Disabled
         };
         Self {
-            decoder: FrameDecoder::new(framing),
+            decoder: FrameDecoder::with_max_len(framing, MAX_INBOUND_FRAME_LEN),
             encryptor: init.encryptor,
             decryptor: init.decryptor,
             pending_header: Some(init.header),
@@ -283,6 +283,42 @@ mod tests {
         assert_eq!(client.next_incoming().unwrap(), Some(Incoming::Packet(second)));
         assert_eq!(client.next_incoming().unwrap(), Some(Incoming::QuickAck(0x1234)));
         assert_eq!(client.next_incoming().unwrap(), None);
+    }
+
+    #[test]
+    fn inbound_frames_above_four_mib_are_rejected_from_the_header() {
+        for framing in [Framing::Abridged, Framing::Intermediate, Framing::PaddedIntermediate] {
+            let config = TransportConfig { framing, dc_id: 2, secret: None, unix_time: 0 };
+            let mut rng = XorShiftRandom::new(7);
+            let mut client = TransportStream::new(&config, &mut rng);
+            client.send_packet(&encrypted_payload(1, 1), false, &mut rng);
+            let header: [u8; 64] = client.take_outgoing()[..64].try_into().unwrap();
+            let mut server = accept_obfuscated_header(&header, None).expect("header");
+            let frame_header = |len: usize| -> Vec<u8> {
+                match framing {
+                    Framing::Abridged => {
+                        let words = (len / 4) as u32;
+                        let mut out = vec![0x7f];
+                        out.extend_from_slice(&words.to_le_bytes()[..3]);
+                        out
+                    }
+                    _ => (len as u32).to_le_bytes().to_vec(),
+                }
+            };
+            let mut accepted = frame_header(MAX_INBOUND_FRAME_LEN - MAX_INBOUND_FRAME_LEN % 16);
+            server.encryptor.apply(&mut accepted);
+            client.receive(&accepted).unwrap();
+            assert_eq!(client.next_incoming().unwrap(), None);
+
+            let mut client = TransportStream::new(&config, &mut rng);
+            client.send_packet(&encrypted_payload(1, 1), false, &mut rng);
+            let header: [u8; 64] = client.take_outgoing()[..64].try_into().unwrap();
+            let mut server = accept_obfuscated_header(&header, None).expect("header");
+            let mut oversized = frame_header(MAX_INBOUND_FRAME_LEN + 16);
+            server.encryptor.apply(&mut oversized);
+            client.receive(&oversized).unwrap();
+            assert!(client.next_incoming().is_err(), "{framing:?}");
+        }
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use super::codec::Framing;
 use crate::crypto::{AesCtr, SecureRandom, sha256_parts};
+use zeroize::Zeroize;
 
 pub const OBFUSCATED_HEADER_LEN: usize = 64;
 
@@ -49,13 +50,16 @@ pub fn obfuscated_init(
             None => key.try_into().expect("32 bytes"),
         }
     };
-    let encrypt_key = derive(&header[8..40]);
+    let mut encrypt_key = derive(&header[8..40]);
     let encrypt_iv: [u8; 16] = header[40..56].try_into().expect("16");
-    let decrypt_key = derive(&reversed[8..40]);
+    let mut decrypt_key = derive(&reversed[8..40]);
     let decrypt_iv: [u8; 16] = reversed[40..56].try_into().expect("16");
 
     let mut encryptor = AesCtr::new(&encrypt_key, &encrypt_iv);
     let decryptor = AesCtr::new(&decrypt_key, &decrypt_iv);
+    encrypt_key.zeroize();
+    decrypt_key.zeroize();
+    reversed.zeroize();
     let mut encrypted = header;
     encryptor.apply(&mut encrypted);
     header[56..].copy_from_slice(&encrypted[56..]);

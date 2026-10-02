@@ -17,6 +17,12 @@ pub struct ProxySecret {
     raw: Vec<u8>,
 }
 
+impl Drop for ProxySecret {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.raw);
+    }
+}
+
 impl core::fmt::Debug for ProxySecret {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let kind = if self.emulate_tls() {
@@ -32,12 +38,14 @@ impl core::fmt::Debug for ProxySecret {
 
 impl ProxySecret {
     pub fn from_link(encoded: &str, truncate_if_needed: bool) -> Result<Self, ProxySecretError> {
-        let decoded = decode_hex(encoded)
+        let mut decoded = decode_hex(encoded)
             .or_else(|| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(encoded.trim_end_matches('=')).ok())
             .or_else(|| base64::engine::general_purpose::STANDARD.decode(encoded).ok())
             .or_else(|| base64::engine::general_purpose::STANDARD_NO_PAD.decode(encoded).ok())
             .ok_or(ProxySecretError::Wrong)?;
-        Self::from_binary(&decoded, truncate_if_needed)
+        let secret = Self::from_binary(&decoded, truncate_if_needed);
+        zeroize::Zeroize::zeroize(&mut decoded);
+        secret
     }
 
     pub fn from_binary(raw: &[u8], truncate_if_needed: bool) -> Result<Self, ProxySecretError> {

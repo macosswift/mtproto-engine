@@ -7,11 +7,21 @@ use mtproto_core::transport::{Framing, ProxySecret};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SessionHandle(pub u64);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct DcAddress {
     pub host: String,
     pub port: u16,
     pub secret: Option<Vec<u8>>,
+}
+
+impl core::fmt::Debug for DcAddress {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DcAddress")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("secret", &self.secret.as_ref().map(|secret| format!("<{} bytes>", secret.len())))
+            .finish()
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]

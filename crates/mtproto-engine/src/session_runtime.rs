@@ -26,6 +26,7 @@ use crate::types::{
 const PROGRESS_THRESHOLD: usize = 4096;
 pub const FRAME_PROGRESS_GRACE: f64 = 15.0;
 pub const FRAME_MIN_RATE: f64 = 512.0;
+pub const KEY_REJECTION_RETRY_DELAY: f64 = 0.5;
 const PROGRESS_HEAD: usize = 128;
 const HANDSHAKE_TIMEOUT: f64 = 10.0;
 pub const READ_BUDGET_PER_TURN: usize = 512 * 1024;
@@ -51,6 +52,7 @@ pub const RESOLVE_RETRY_MAX: f64 = 8.0;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CloseReason {
     ServerRejected,
+    KeyRejectionUnconfirmed,
     AddressRejected,
     TransportFlood,
     HandshakeFailed,
@@ -155,6 +157,7 @@ pub struct SessionRuntime {
     close_reason: Option<CloseReason>,
     transport_floods: u32,
     rejections: u32,
+    key_rejections: u32,
     handshake_started_at: Option<f64>,
     jitter_state: u64,
 }
@@ -202,6 +205,7 @@ impl SessionRuntime {
             close_reason: None,
             transport_floods: 0,
             rejections: 0,
+            key_rejections: 0,
             handshake_started_at: None,
             jitter_state: rng.next_u64() | 1,
             setup,
@@ -245,6 +249,7 @@ impl SessionRuntime {
         match &mut self.rpc {
             Some(rpc) => {
                 if rpc.session().auth_key_id() != material.key.id() {
+                    self.key_rejections = 0;
                     rpc.session_mut().replace_auth_key(material.key, &material.salts, now);
                     rpc.reset_session(now, rng);
                     rpc.set_stored_init_hash(init_hash);
@@ -253,6 +258,7 @@ impl SessionRuntime {
                 }
             }
             None => {
+                self.key_rejections = 0;
                 let mut session = Session::new(
                     self.session_config(),
                     material.key,
@@ -1102,8 +1108,12 @@ impl SessionRuntime {
             self.log(callbacks, LogLevel::Info, &format!("connection closed: {error}"));
             let established = self.connection.as_ref().is_some_and(Connection::is_established);
             let reason = self.close_reason.take();
-            let reachable = matches!(reason, Some(CloseReason::ServerRejected) | Some(CloseReason::TransportFlood))
-                || (matches!(reason, Some(CloseReason::AddressRejected)) && self.rejections < 2);
+            let reachable = matches!(
+                reason,
+                Some(CloseReason::ServerRejected)
+                    | Some(CloseReason::KeyRejectionUnconfirmed)
+                    | Some(CloseReason::TransportFlood)
+            ) || (matches!(reason, Some(CloseReason::AddressRejected)) && self.rejections < 2);
             if let Some((index, success)) = self
                 .connection
                 .as_ref()
@@ -1116,7 +1126,7 @@ impl SessionRuntime {
                 Some(CloseReason::ServerRejected)
                 | Some(CloseReason::AddressRejected)
                 | Some(CloseReason::HandshakeFailed) => true,
-                Some(CloseReason::TransportFlood) => false,
+                Some(CloseReason::TransportFlood) | Some(CloseReason::KeyRejectionUnconfirmed) => false,
                 None => !established || !received,
             };
             self.close_dropped_connection(registry, now, failed);
@@ -1258,6 +1268,7 @@ impl SessionRuntime {
                             {
                                 connection.received_packet = true;
                                 self.failures = 0;
+                                self.key_rejections = 0;
                                 let index = connection.address_index;
                                 self.report_address(index, true, now, callbacks);
                                 self.drop_racer(registry);
@@ -1311,6 +1322,14 @@ impl SessionRuntime {
         }
         match kind {
             TransportErrorKind::AuthKeyNotFound => {
+                let proven = self.connection.as_ref().is_some_and(|connection| connection.received_packet);
+                if proven || self.key_rejections == 0 {
+                    self.key_rejections = self.key_rejections.saturating_add(1);
+                    self.next_attempt_at = self.next_attempt_at.max(now.mono + KEY_REJECTION_RETRY_DELAY);
+                    self.close_reason = Some(CloseReason::KeyRejectionUnconfirmed);
+                    return;
+                }
+                self.key_rejections = 0;
                 callbacks.on_event(self.handle, EngineEvent::AuthKeyInvalid { code });
                 if let Some(rpc) = self.rpc.take() {
                     for request in rpc_pending_requests(rpc) {

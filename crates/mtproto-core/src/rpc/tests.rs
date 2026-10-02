@@ -276,6 +276,25 @@ fn main_session_401_requires_authorization_and_surfaces() {
 }
 
 #[test]
+fn cdn_auth_key_perm_empty_surfaces_after_one_retry() {
+    let mut h = Harness::new(SessionRole::Cdn, None);
+    h.send(1, RequestFlags::default());
+    let calls = h.flush_calls();
+    h.reply(vec![Outgoing::Content(rpc_error(calls[0].0, 401, "AUTH_KEY_PERM_EMPTY"))]);
+    let events = h.events();
+    assert!(events.contains(&RpcEvent::TemporaryKeyRejected), "the host is asked for a fresh CDN key");
+    assert!(!events.iter().any(|e| matches!(e, RpcEvent::Failed { .. })), "the first rejection is retried");
+    h.advance(TEMPORARY_KEY_RETRY_DELAY);
+    let calls = h.flush_calls();
+    assert_eq!(calls.len(), 1);
+    h.reply(vec![Outgoing::Content(rpc_error(calls[0].0, 401, "AUTH_KEY_PERM_EMPTY"))]);
+    assert!(
+        h.events().iter().any(|e| matches!(e, RpcEvent::Failed { id: RequestId(1), code: 401, .. })),
+        "a CDN that keeps rejecting fails the request so the download falls back to the master DC"
+    );
+}
+
+#[test]
 fn auth_key_perm_empty_never_surfaces() {
     let mut h = Harness::new(SessionRole::Main, Some("h1"));
     h.send(1, RequestFlags::default());
