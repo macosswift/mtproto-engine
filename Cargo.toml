@@ -1,0 +1,50 @@
+[workspace]
+members = ["crates/mtproto-core", "crates/mtproto-engine", "crates/mtproto-testserver", "crates/mtproto-ffi", "crates/mtproto-netsim", "crates/mtproto-bench", "crates/mtproto-fuzz"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96.1"
+license = "GPL-2.0-or-later"
+publish = false
+
+[workspace.dependencies]
+aes = { version = "=0.8.4", features = ["zeroize"] }
+sha1 = "0.10"
+sha2 = "=0.10.9"
+hmac = "=0.12.1"
+num-bigint = "=0.4.8"
+num-traits = "=0.2.19"
+num-integer = "=0.1.47"
+getrandom = "=0.3.4"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+zeroize = "=1.9.0"
+thiserror = "=2.0.17"
+hex = "=0.4.3"
+proptest = "=1.11.0"
+
+[profile.release]
+opt-level = 3
+codegen-units = 1
+lto = "thin"
+panic = "abort"
+debug = false
+
+[profile.fuzz]
+inherits = "release"
+panic = "unwind"
+debug-assertions = true
+overflow-checks = true
+lto = false
+codegen-units = 16
+
+[profile.test]
+opt-level = 1
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+future_incompatible = { level = "deny", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }

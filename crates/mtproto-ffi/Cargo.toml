@@ -1,0 +1,18 @@
+[package]
+name = "mtproto-ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "mtproto_engine_ffi"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+mtproto-engine = { path = "../mtproto-engine" }
+zeroize.workspace = true
+
+[dev-dependencies]
+mtproto-testserver = { path = "../mtproto-testserver" }

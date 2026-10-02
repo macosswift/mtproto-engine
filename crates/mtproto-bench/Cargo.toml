@@ -1,0 +1,20 @@
+[package]
+name = "mtproto-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "mtproto-bench"
+path = "src/main.rs"
+
+[dependencies]
+mtproto-engine = { path = "../mtproto-engine" }
+mtproto-testserver = { path = "../mtproto-testserver" }
+mtproto-netsim = { path = "../mtproto-netsim" }
+libc = "=0.2.189"
+
+[lints]
+workspace = true

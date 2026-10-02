@@ -1,0 +1,13 @@
+[package]
+name = "mtproto-testserver"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+mtproto-core = { path = "../mtproto-core", features = ["test-support"] }
+
+[lints]
+workspace = true

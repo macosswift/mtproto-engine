@@ -1,0 +1,13 @@
+[package]
+name = "mtproto-netsim"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+libc = "=0.2.189"
+
+[lints]
+workspace = true

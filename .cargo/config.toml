@@ -1,0 +1,8 @@
+[target.aarch64-apple-darwin]
+rustflags = ["--cfg", "aes_armv8"]
+
+[target.aarch64-apple-ios]
+rustflags = ["--cfg", "aes_armv8"]
+
+[target.aarch64-apple-ios-sim]
+rustflags = ["--cfg", "aes_armv8"]

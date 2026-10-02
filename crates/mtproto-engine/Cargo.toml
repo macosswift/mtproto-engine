@@ -1,0 +1,20 @@
+[package]
+name = "mtproto-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+mtproto-core = { path = "../mtproto-core" }
+mio = { version = "=1.2.2", features = ["os-poll", "net"] }
+libc = "=0.2.189"
+
+[dev-dependencies]
+mtproto-core = { path = "../mtproto-core", features = ["test-support"] }
+mtproto-testserver = { path = "../mtproto-testserver" }
+mtproto-netsim = { path = "../mtproto-netsim" }
+
+[lints]
+workspace = true
