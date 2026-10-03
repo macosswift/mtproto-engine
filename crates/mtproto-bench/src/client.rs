@@ -12,7 +12,7 @@ use mtproto_engine::{
     AuthKeyMaterial, DcAddress, Engine, EngineCallbacks, EngineConfig, EngineEvent, KeyGeneration, ProxyConfig,
     SessionHandle, SessionSetup, unix_seconds,
 };
-use mtproto_testserver::{TAG_SIZED, call, parse_result, sized_call};
+use mtproto_testserver::{TAG_SIZED, TAG_UPLOAD, call, parse_result, sized_call};
 
 use crate::args::{ClientArgs, unhex};
 use crate::report::{ClientReport, Latency};
@@ -41,6 +41,7 @@ impl EngineCallbacks for Forwarder {
 enum Kind {
     Small { tag: u32 },
     Sized { size: u32 },
+    Upload { size: u32 },
     Real,
 }
 
@@ -74,6 +75,7 @@ impl Driver {
         let body = match kind {
             Kind::Small { tag } => call(tag, &(index as u64).to_le_bytes()),
             Kind::Sized { size } => sized_call(size),
+            Kind::Upload { size } => call(TAG_UPLOAD, &upload_payload(index as u64, size)),
             Kind::Real => {
                 let mut writer = Writer::new();
                 writer.write_u32(if index.is_multiple_of(2) { 0xc4f9186b } else { 0x1fb33026 });
@@ -117,12 +119,14 @@ impl Driver {
                     Kind::Small { tag } => parse_result(&body).is_some_and(|(result, _)| result == tag),
                     Kind::Sized { size } => parse_result(&body)
                         .is_some_and(|(result, payload)| result == TAG_SIZED && payload.len() == size as usize),
+                    Kind::Upload { size } => parse_result(&body)
+                        .is_some_and(|(result, payload)| result == TAG_UPLOAD && payload == size.to_le_bytes()),
                     Kind::Real => body.len() >= 4,
                 };
                 if valid {
                     self.completed += 1;
                     self.records[pending.index].1 = Some(self.elapsed());
-                    if let Kind::Sized { size } = pending.kind {
+                    if let Kind::Sized { size } | Kind::Upload { size } = pending.kind {
                         self.bytes += u64::from(size);
                     }
                 } else {
@@ -141,7 +145,7 @@ impl Driver {
 
     fn report(&self, args: &ClientArgs, elapsed: f64) -> ClientReport {
         let latency_indices: Vec<usize> =
-            if args.workload == "mixed" { self.probes.clone() } else { (0..self.records.len()).collect() };
+            if args.workload.starts_with("mixed") { self.probes.clone() } else { (0..self.records.len()).collect() };
         let samples: Vec<f64> = latency_indices
             .iter()
             .filter_map(|index| {
@@ -163,6 +167,19 @@ impl Driver {
             transfers_elapsed: None,
         }
     }
+}
+
+/// An upload part that does not compress: the engines gzip what does.
+fn upload_payload(seed: u64, size: u32) -> Vec<u8> {
+    let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+    (0..size)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u8
+        })
+        .collect()
 }
 
 fn environment() -> ApiEnvironment {
@@ -193,6 +210,7 @@ fn setup(args: &ClientArgs, role: SessionRole) -> SessionSetup {
     setup.environment = Some(environment());
     setup.keep_connected = true;
     setup.idle_disconnect_after = None;
+    setup.online = args.online && role == SessionRole::Main;
     if args.mode == "real" {
         setup.key_generation = Some(KeyGeneration {
             public_keys: vec![RsaPublicKey::from_pem(PRODUCTION_KEY).expect("key")],
@@ -257,7 +275,8 @@ pub fn run(args: ClientArgs) -> ClientReport {
                 driver.pump(Duration::from_millis(100));
             }
         }
-        "media" | "mixed" => {
+        "media" | "mixed" | "upload" | "mixed-upload" => {
+            let upload = args.workload.contains("upload");
             let workers: Vec<SessionHandle> = (0..args.sessions)
                 .map(|_| engine.create_session(setup(&args, SessionRole::Worker { requires_auth_token: false })))
                 .collect();
@@ -269,12 +288,17 @@ pub fn run(args: ClientArgs) -> ClientReport {
             while Instant::now() < deadline {
                 for worker in &workers {
                     while issued < parts && driver.outstanding(*worker) < args.session_concurrency {
-                        driver.issue(*worker, Kind::Sized { size: args.part_size }, false, media_flags);
+                        let kind = if upload {
+                            Kind::Upload { size: args.part_size }
+                        } else {
+                            Kind::Sized { size: args.part_size }
+                        };
+                        driver.issue(*worker, kind, false, media_flags);
                         issued += 1;
                     }
                 }
                 let media_done = issued >= parts && workers.iter().all(|worker| driver.outstanding(*worker) == 0);
-                if args.workload == "mixed" && !media_done && driver.elapsed() >= next_probe {
+                if args.workload.starts_with("mixed") && !media_done && driver.elapsed() >= next_probe {
                     driver.issue(main, Kind::Small { tag: tag(probe_count) }, true, small_flags);
                     probe_count += 1;
                     next_probe += probe_interval;
@@ -282,7 +306,12 @@ pub fn run(args: ClientArgs) -> ClientReport {
                 if media_done && driver.outstanding(main) == 0 {
                     break;
                 }
-                driver.pump(Duration::from_millis(10));
+                let wait = if args.workload.starts_with("mixed") && !media_done {
+                    (next_probe - driver.elapsed()).max(0.0)
+                } else {
+                    0.1
+                };
+                driver.pump(Duration::from_secs_f64(wait.clamp(0.0005, 0.1)));
             }
         }
         "steady" => {
@@ -299,7 +328,8 @@ pub fn run(args: ClientArgs) -> ClientReport {
                 if now >= args.duration && driver.outstanding(main) == 0 {
                     break;
                 }
-                driver.pump(Duration::from_millis(5));
+                let wait = if now < args.duration { (next - driver.elapsed()).max(0.0) } else { 0.1 };
+                driver.pump(Duration::from_secs_f64(wait.clamp(0.0005, 0.1)));
             }
         }
         other => panic!("unknown workload {other}"),

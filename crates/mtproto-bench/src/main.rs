@@ -7,6 +7,7 @@ mod orchestrator;
 mod replay;
 mod report;
 mod soak;
+mod triage;
 
 use args::ClientArgs;
 use orchestrator::EngineBinary;
@@ -24,6 +25,8 @@ fn main() {
         }
         Some("run") => {
             let mut mtprotokit: Option<String> = None;
+            let mut tdlib: Option<String> = None;
+            let mut online = false;
             let mut suite_name = "quick".to_string();
             let mut include_real = false;
             let mut out: Option<String> = None;
@@ -33,6 +36,8 @@ fn main() {
             while let Some(flag) = iter.next() {
                 match flag.as_str() {
                     "--mtprotokit" => mtprotokit = iter.next().cloned(),
+                    "--tdlib" => tdlib = iter.next().cloned(),
+                    "--online" => online = true,
                     "--suite" => suite_name = iter.next().cloned().expect("suite"),
                     "--real" => include_real = true,
                     "--out" => out = iter.next().cloned(),
@@ -46,8 +51,14 @@ fn main() {
             if let Some(path) = mtprotokit {
                 engines.push(EngineBinary { label: "mtprotokit".into(), path, prefix: Vec::new() });
             }
+            if let Some(path) = tdlib {
+                engines.push(EngineBinary { label: "tdlib".into(), path, prefix: Vec::new() });
+            }
             let mut results = Vec::new();
-            let scenarios = orchestrator::suite(&suite_name, include_real);
+            let mut scenarios = orchestrator::suite(&suite_name, include_real);
+            for scenario in &mut scenarios {
+                scenario.args.online = online;
+            }
             for (index, scenario) in scenarios.iter().enumerate() {
                 if let Some(filter) = &only
                     && !scenario.name.contains(filter.as_str())
@@ -56,6 +67,18 @@ fn main() {
                 }
                 for round in 0..repeat {
                     for engine in &engines {
+                        if let Some(reason) = engine.unsupported(scenario) {
+                            if round == 0 {
+                                eprintln!(
+                                    "[{}/{}] {} — {} skipped: {reason}",
+                                    index + 1,
+                                    scenarios.len(),
+                                    scenario.name,
+                                    engine.label
+                                );
+                            }
+                            continue;
+                        }
                         eprintln!(
                             "[{}/{}] {} — {} (round {})",
                             index + 1,
@@ -82,6 +105,7 @@ fn main() {
         }
         Some("serve") => soak::serve(),
         Some("replay") => replay::run(replay::ReplayArgs::parse(&arguments[2..])),
+        Some("triage") => triage::run(triage::TriageArgs::parse(&arguments[2..])),
         Some("proxy") => {
             let mut profile = "perfect".to_string();
             let mut bind = "127.0.0.1:1080".to_string();

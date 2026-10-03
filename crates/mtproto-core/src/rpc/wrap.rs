@@ -115,6 +115,10 @@ pub fn wrap_request(
 }
 
 pub const GZIP_MIN_REQUEST_SIZE: usize = 256;
+/// From this size on, a request is gzipped only if a sample from its middle compresses: random or
+/// encrypted bytes (upload parts of media, secret chat payloads) would be packed for nothing.
+pub const GZIP_SAMPLE_FROM: usize = 16 * 1024;
+pub const GZIP_SAMPLE_SIZE: usize = 1024;
 pub const UPLOAD_SAVE_FILE_PART: u32 = 0xb304_a621;
 pub const UPLOAD_SAVE_BIG_FILE_PART: u32 = 0xde7b_673d;
 
@@ -125,6 +129,13 @@ pub fn compressed_payload(payload: &[u8]) -> Option<Vec<u8>> {
     let constructor = u32::from_le_bytes(payload[..4].try_into().ok()?);
     if matches!(constructor, UPLOAD_SAVE_FILE_PART | UPLOAD_SAVE_BIG_FILE_PART | ids::GZIP_PACKED) {
         return None;
+    }
+    if payload.len() >= GZIP_SAMPLE_FROM {
+        let start = (payload.len() - GZIP_SAMPLE_SIZE) / 2;
+        let sample = &payload[start..start + GZIP_SAMPLE_SIZE];
+        if tlm::gzip(sample).len() * 10 >= GZIP_SAMPLE_SIZE * 9 {
+            return None;
+        }
     }
     let packed = tlm::gzip(payload);
     let mut writer = Writer::with_capacity(packed.len() + 8);
@@ -147,6 +158,41 @@ pub fn flood_wait_seconds(message: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn noise(length: usize) -> Vec<u8> {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        (0..length)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            })
+            .collect()
+    }
+
+    fn text_with_noisy_middle(length: usize) -> Vec<u8> {
+        let mut payload = vec![b'a'; length];
+        let start = (length - GZIP_SAMPLE_SIZE) / 2;
+        payload[start..start + GZIP_SAMPLE_SIZE].copy_from_slice(&noise(GZIP_SAMPLE_SIZE));
+        payload[..4].copy_from_slice(&0x7e57_0001u32.to_le_bytes());
+        payload
+    }
+
+    #[test]
+    fn a_large_request_whose_middle_does_not_compress_is_sent_as_it_is() {
+        assert_eq!(compressed_payload(&text_with_noisy_middle(64 * 1024)), None, "the sample decides alone");
+        assert!(
+            compressed_payload(&text_with_noisy_middle(GZIP_SAMPLE_FROM - 1)).is_some(),
+            "below the sampling size the whole request is tried"
+        );
+        let mut noisy = noise(64 * 1024);
+        noisy[..4].copy_from_slice(&0x7e57_0001u32.to_le_bytes());
+        assert_eq!(compressed_payload(&noisy), None);
+        let mut text = vec![b'a'; 64 * 1024];
+        text[..4].copy_from_slice(&0x7e57_0001u32.to_le_bytes());
+        assert!(compressed_payload(&text).is_some_and(|packed| packed.len() < 1024));
+    }
 
     #[test]
     fn large_requests_are_gzipped_but_file_parts_and_small_ones_are_not() {

@@ -283,7 +283,7 @@ const LARGE_UPLOAD: u64 = 2 * 256 * 1024 + 4096;
 const LARGE_PART_MIN: usize = 128 * 1024;
 
 /// How long a run must last for every periodic event of the profile to have struck at least once.
-fn longest_quiet_spell(profile: &Profile) -> f64 {
+pub fn longest_quiet_spell(profile: &Profile) -> f64 {
     let tunnel = profile.tunnel.map_or(0.0, |tunnel| (tunnel.every_max + tunnel.length).as_secs_f64());
     let reset = profile.reset_after.map_or(0.0, |(_, latest)| latest.as_secs_f64());
     let blackhole = profile.blackhole.map_or(0.0, |blackhole| (blackhole.after_max + blackhole.duration).as_secs_f64());

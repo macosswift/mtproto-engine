@@ -1450,6 +1450,17 @@ impl Session {
         }
     }
 
+    /// A large packet carrying a query sent under a fresh msg_id is confirmed by that answer anyway,
+    /// and by any later quick ack, as one connection is an ordered stream. For such packets one quick
+    /// ack at a time keeps a confirmation at receipt time coming while sparing the server a packet of
+    /// its own per part, which on a lossy downlink holds up the answers queued behind it. A packet
+    /// carrying only resent queries still asks, as their answers may be the ones to earlier copies, and
+    /// so does one dropping an answer while large packets wait, as a cancelled query's answer confirms
+    /// nothing.
+    fn awaits_large_quick_ack(&self) -> bool {
+        self.quick_acks.iter().any(|(_, _, seq)| self.unconfirmed_large.iter().any(|packet| packet.seq == *seq))
+    }
+
     /// True when the token is one of ours: only the server holding the key can have computed it, so
     /// it shows the connection alive like any packet read.
     pub fn handle_quick_ack(&mut self, token: u32, now: Now) -> bool {
@@ -2683,6 +2694,7 @@ impl Session {
         if has_salt {
             let room = MAX_CONTAINER_MESSAGES_OUT.saturating_sub(messages.len() + CONTAINER_RESERVED_SLOTS);
             let drops: Vec<i64> = self.to_drop_answer.drain(..room.min(self.to_drop_answer.len())).collect();
+            wants_quick_ack |= !drops.is_empty() && !self.unconfirmed_large.is_empty();
             for msg_id in drops {
                 let mut writer = Writer::new();
                 tlm::write_rpc_drop_answer(&mut writer, msg_id);
@@ -2823,7 +2835,10 @@ impl Session {
         if let Some(ping) = self.pending_pings.get_mut(&ping_msg_id) {
             ping.behind_large = !self.unconfirmed_large.is_empty();
         }
-        let quick_ack_token = if wants_quick_ack || large {
+        let answer_confirms = query_messages
+            .iter()
+            .any(|(id, _)| self.queries.get(id).is_some_and(|query| query.arrival_seq == Some(packet_seq)));
+        let quick_ack_token = if wants_quick_ack || (large && (!answer_confirms || !self.awaits_large_quick_ack())) {
             let token = packet.quick_ack_token & 0x7fff_ffff;
             let ids: Vec<QueryId> = query_messages
                 .iter()

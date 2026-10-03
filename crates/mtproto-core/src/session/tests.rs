@@ -2803,6 +2803,84 @@ fn small_messages_never_extend_the_grace() {
 }
 
 #[test]
+fn large_packets_ask_for_one_quick_ack_at_a_time() {
+    let mut h = Harness::new();
+    answer_probe(&mut h);
+    let (first, transmit) = send_large(&mut h, 1, 64 * 1024);
+    let token = transmit.quick_ack_token.expect("the first part asks for a quick ack");
+    let (second, transmit) = send_large(&mut h, 2, 64 * 1024);
+    assert!(transmit.quick_ack_token.is_none(), "one quick ack is already on its way");
+    let (_, transmit) = send_large(&mut h, 3, 64 * 1024);
+    assert!(transmit.quick_ack_token.is_none());
+    assert!(h.session.handle_quick_ack(token, h.now));
+    let (_, transmit) = send_large(&mut h, 4, 64 * 1024);
+    assert!(transmit.quick_ack_token.is_some(), "the next part asks once the last quick ack came");
+    h.deliver(vec![Outgoing::Content(rpc_result(first, &[1, 2, 3, 4]))]).unwrap();
+    h.deliver(vec![Outgoing::Content(rpc_result(second, &[1, 2, 3, 4]))]).unwrap();
+    let (_, transmit) = send_large(&mut h, 5, 64 * 1024);
+    assert!(transmit.quick_ack_token.is_none(), "the fourth part's quick ack is still on its way");
+    h.session.send(
+        QueryId(6),
+        large_query_body(6, 64 * 1024),
+        QueryOptions { quick_ack: true, invoke_after: None },
+        h.now,
+    );
+    h.advance(0.002);
+    let transmit = h.session.poll_transmit(h.now, &mut h.rng).expect("packet");
+    assert!(transmit.quick_ack_token.is_some(), "a query that asks for a quick ack gets one");
+}
+
+#[test]
+fn resent_parts_each_ask_for_a_quick_ack() {
+    let mut h = Harness::new();
+    answer_probe(&mut h);
+    for tag in 1..=3 {
+        send_large(&mut h, tag, 64 * 1024);
+    }
+    h.session.connection_closed();
+    h.session.connection_opened(h.now);
+    answer_probe(&mut h);
+    h.advance(0.002);
+    let mut resent = 0;
+    while let Some(transmit) = h.session.poll_transmit(h.now, &mut h.rng) {
+        if transmit.data.len() >= TRANSMIT_GRACE_MIN_SIZE {
+            resent += 1;
+            assert!(transmit.quick_ack_token.is_some(), "an answer to a resent part may be the one to its first copy");
+        }
+    }
+    assert_eq!(resent, 3);
+}
+
+#[test]
+fn dropping_the_answer_to_a_part_asks_for_a_quick_ack_in_its_place() {
+    let mut h = Harness::new();
+    answer_probe(&mut h);
+    send_large(&mut h, 1, 64 * 1024);
+    let (_, transmit) = send_large(&mut h, 2, 64 * 1024);
+    assert!(transmit.quick_ack_token.is_none());
+    let CancelOutcome::RemovedInFlight { msg_id } = h.session.cancel(QueryId(2)) else {
+        panic!("the part is in flight");
+    };
+    h.session.drop_answer(msg_id, h.now);
+    let transmit = h.session.poll_transmit(h.now, &mut h.rng).expect("the drop goes out");
+    let token = transmit.quick_ack_token.expect("its answer will confirm nothing");
+    h.advance(1.0);
+    assert!(h.session.handle_quick_ack(token, h.now));
+    assert!(!h.session.is_transmitting(h.now), "both parts are confirmed");
+}
+
+#[test]
+fn an_answer_lets_the_next_part_ask_for_a_quick_ack_when_its_own_never_came() {
+    let mut h = Harness::new();
+    answer_probe(&mut h);
+    let (first, transmit) = send_large(&mut h, 1, 64 * 1024);
+    assert!(transmit.quick_ack_token.is_some());
+    h.deliver(vec![Outgoing::Content(rpc_result(first, &[1, 2, 3, 4]))]).unwrap();
+    let (_, transmit) = send_large(&mut h, 2, 64 * 1024);
+    assert!(transmit.quick_ack_token.is_some(), "a confirmed packet's missing quick ack blocks nothing");
+}
+
+#[test]
 fn a_quick_ack_for_the_last_part_keeps_the_connection_until_its_answer() {
     let mut h = Harness::new();
     answer_probe(&mut h);

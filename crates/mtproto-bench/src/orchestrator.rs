@@ -16,6 +16,19 @@ pub struct EngineBinary {
     pub prefix: Vec<String>,
 }
 
+impl EngineBinary {
+    /// Why this engine's client cannot run the scenario: the MtProtoKit client has no upload
+    /// workloads and no online flag, the tdlib client no real-server mode.
+    pub fn unsupported(&self, scenario: &Scenario) -> Option<&'static str> {
+        match self.label.as_str() {
+            "mtprotokit" if scenario.args.workload.contains("upload") => Some("no upload workload"),
+            "mtprotokit" if scenario.args.online => Some("no online flag"),
+            "tdlib" if scenario.args.mode == "real" => Some("no real-server mode"),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Scenario {
     pub name: String,
@@ -51,7 +64,71 @@ fn scenario(name: &str, args: ClientArgs, profile: &str) -> Scenario {
 
 const FAKE_TLS_SECRET: &str = "ee3131313131313131313131313131313177772e6578616d706c652e636f6d";
 
+/// The weak links of the TelegramCore weak suite, raw: calls long enough for every periodic event
+/// of the link, calls under downloads, uploads in three parallel parts as TelegramCore sends them,
+/// and calls during uploads, transfers sized to about 20 s of the link.
+pub fn weak_suite() -> Vec<Scenario> {
+    let links: [(&str, u64, u64); 12] = [
+        ("gprs", 6_000, 6_000),
+        ("edge", 8_000, 8_000),
+        ("edge-flaky", 8_000, 8_000),
+        ("3g", 187_500, 187_500),
+        ("satellite", 500_000, 500_000),
+        ("lossy-heavy", 250_000, 250_000),
+        ("train", 125_000, 125_000),
+        ("handover", 1_250_000, 1_250_000),
+        ("uplink-starved", 1_000_000, 8_000),
+        ("blackholes", 1_250_000, 1_250_000),
+        ("bufferbloat", 500_000, 32_000),
+        ("bufferbloat-down", 125_000, 64_000),
+    ];
+    let mut scenarios = Vec::new();
+    for (link, down, up) in links {
+        let quiet = Profile::by_name(link).map_or(0.0, |profile| crate::cluster::longest_quiet_spell(&profile));
+        let duration = quiet.max(26.0) + 4.0;
+        scenarios.push(scenario(
+            &format!("weak/{link}/steady"),
+            ClientArgs { rate: 4.0, duration, deadline: duration + 150.0, ..base("steady") },
+            link,
+        ));
+        let part = |rate: u64| if rate < 64_000 { 16 * 1024 } else { 128 * 1024 };
+        let bytes = |rate: u64| (rate * 20).clamp(64 * 1024, 16 * 1024 * 1024);
+        scenarios.push(scenario(
+            &format!("weak/{link}/mixed"),
+            ClientArgs {
+                total_bytes: bytes(down),
+                part_size: part(down),
+                sessions: 2,
+                session_concurrency: 2,
+                rate: 4.0,
+                deadline: 300.0,
+                ..base("mixed")
+            },
+            link,
+        ));
+        for (workload, rate) in [("upload", 0.0), ("mixed-upload", 2.0)] {
+            scenarios.push(scenario(
+                &format!("weak/{link}/{workload}"),
+                ClientArgs {
+                    total_bytes: bytes(up),
+                    part_size: part(up),
+                    sessions: 1,
+                    session_concurrency: 3,
+                    rate,
+                    deadline: 300.0,
+                    ..base(workload)
+                },
+                link,
+            ));
+        }
+    }
+    scenarios
+}
+
 pub fn suite(name: &str, include_real: bool) -> Vec<Scenario> {
+    if name == "weak" {
+        return weak_suite();
+    }
     let mut scenarios = Vec::new();
     let quick = name == "quick";
     let scale = |full: u64, quick_value: u64| if quick { quick_value } else { full };

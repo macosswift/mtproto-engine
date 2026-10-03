@@ -118,12 +118,24 @@ requirement as pass, fail or untested. See `security/README.md`.
 
 ```sh
 cargo build --release -p mtproto-bench
-./target/release/mtproto-bench run --suite quick [--real] [--mtprotokit bench/mtprotokit-client/.build/release/mtprotokit-bench] --out report
+./target/release/mtproto-bench run --suite quick|full|weak [--online] [--real] [--repeat N] \
+    [--mtprotokit bench/mtprotokit-client/.build/release/mtprotokit-bench] [--tdlib TDLIB_BENCH] --out report
 ```
 
 Each engine's client runs as a separate process against the fake server (or a real DC with `--real`)
 behind `mtproto-netsim`, so CPU time, peak RSS, latency percentiles, throughput, server-side
-duplicate executions and recovery after outages are measured identically for both engines.
+duplicate executions and recovery after outages are measured identically for every engine. Rounds
+of a scenario use the same link seed for every engine.
+
+- `--suite weak` is the raw form of the TelegramCore weak suite below: its twelve links, each with
+  steady calls, calls during a download, an upload in three parallel parts and calls during it.
+- `--online` marks the user online, as an app in the foreground does: the main session keeps its
+  short, round-trip-based keepalive (and tdlib its foreground timers).
+- `--tdlib` adds tdlib's own `Session` stack, built with `bench/tdlib-client/build.sh <tdlib source>
+  <tdlib CMake build with target tdcore> <OpenSSL prefix> <output>`. Its connector follows tdlib's
+  `ConnectionCreator::client_loop` for one address; it has no real-server mode.
+- An engine whose client cannot run a scenario is skipped with a note: the MtProtoKit client has no
+  upload workloads and no `--online`.
 
 ### Through TelegramCore
 
@@ -200,8 +212,11 @@ enables it (`network_telemetry_enabled`). `replay` turns such records back into 
 
 - Input: `failures.jsonl` from an account directory (`network-telemetry/`), a JSON array of records,
   reported `{"records": [...]}` chunks, or an array of app log events.
-- Records are grouped by failure class, session role and API method. Each group gets a simulated
-  link (latency and jitter from the requests' p50/p90, a cellular link when the records were
+- Records are grouped by failure class, session role, API method and link class (the round trip
+  rounded up to a power of two, or for a transfer without one the rate it moved at; cellular;
+  proxy), so users on different networks are not averaged. Each group gets a simulated link
+  (latency and jitter from the round trip: the main session's p50/p90 when the record carries it,
+  the record's own for small calls, never a transfer's, which is mostly the bytes; a cellular link when the records were
   cellular, the reconnect cadence and connect time from the connection timelines, an outage when the
   connection was down at the failure, a SOCKS5 proxy when one was used, the user online when they
   mostly were), a workload with as many requests in flight as the records estimated (`in_flight`),
@@ -225,6 +240,31 @@ enables it (`network_telemetry_enabled`). `replay` turns such records back into 
   and how many requests failed or hung.
 - `--plan` prints the derived cases without running them. Faults are injected on the main DC only;
   4xx answers (`client`, `auth`, `migrate`) are server decisions, so their cases replay only the link.
+
+### Triage of many reports
+
+```sh
+./target/release/mtproto-bench triage --records DIR_OR_FILE [--records …] --telegramcore BIN [--engines rust,mtprotokit] [--max-cases 10] [--save CASES_DIR] [--plan]
+./target/release/mtproto-bench triage --check CASES_DIR --telegramcore BIN [--engines rust,mtprotokit]
+```
+
+- `--records` takes files or directories of them (any input `replay` reads), each record marked
+  with the `report_id` of the chunk it came in or the path of the file it was read from.
+- Cases are ranked by how many reports share them, then by records, and the table gives the records
+  per engine and the drops the Rust engine reported.
+- Each of the top cases replays explanation by explanation, network alone first, until every engine
+  reproduced it or none is left; the verdict says whether it reproduced on Rust only, MtProtoKit only,
+  both or neither, and with what.
+- `--save` writes each reproduced case to `CASES_DIR`, named after the case without `replay/` and
+  with every character but ASCII letters, digits, `.` and `-` turned into `_`. It holds the records and,
+  per engine, the outcome with the explanation and seed it was replayed with (`"expect": {"rust":
+  {"reproduces": true, "explanation": "network only", "seed": 9000}, …}`); an engine that did not
+  reproduce the case keeps the explanation that reproduced it on another engine. An existing file is
+  kept, so expectations edited by hand survive.
+- `--check` replays every saved case on each engine with that engine's explanation and seed and
+  compares: a case that reproduces where it is expected not to is a REGRESSION (exit status 1); one
+  that no longer reproduces where it is expected to is reported as fixed, or flaky. Set the engine's
+  `"reproduces"` to false once its failure is fixed, so the case guards the fix from then on.
 
 `telegramcore-bench` also takes `TC_BENCH_TELEMETRY=0|1`, `TC_BENCH_STALLED_AFTER=SECONDS`,
 `TC_BENCH_WATCH_EVERY=N` (a power of two) and `TC_BENCH_TELEMETRY_DUMP=PATH` (the records plus

@@ -1,7 +1,8 @@
 //! Replays failures recorded in the field by TelegramCore's `NetworkTelemetry` against the test
 //! server, to reproduce them locally.
 //!
-//! Records are grouped by failure class, session role and API method. Each group becomes a case: a
+//! Records are grouped by failure class, session role, API method and link class (round trip,
+//! cellular, proxy), so users on different networks are not averaged. Each group becomes a case: a
 //! simulated network derived from what the records saw (latency, jitter, cellular link, reconnect
 //! cadence, outages, proxy) and a set of candidate server faults for the failure class. Every
 //! candidate runs on each engine with the client's own telemetry switched on, and the failure
@@ -63,9 +64,17 @@ pub struct FailureRecord {
     pub in_flight: Option<u64>,
     pub latency_p50: Option<f64>,
     pub latency_p90: Option<f64>,
+    /// Latency of the main session's latest successful requests, which are small calls: the
+    /// link's round trip even on a record of a transfer session.
+    pub main_latency_p50: Option<f64>,
+    pub main_latency_p90: Option<f64>,
     /// Bytes per second recent uploads and downloads moved at, rounded up to a power of two.
     pub uplink_rate: Option<f64>,
     pub downlink_rate: Option<f64>,
+    /// Where the record came from: the report it was sent in, or the file it was read from.
+    pub source: String,
+    /// The record as it was read, to save with a case.
+    pub raw: Value,
 }
 
 impl FailureRecord {
@@ -129,26 +138,76 @@ impl FailureRecord {
             latency_p90: number("latency_p90"),
             uplink_rate: number("uplink_rate"),
             downlink_rate: number("downlink_rate"),
+            main_latency_p50: number("main_latency_p50"),
+            main_latency_p90: number("main_latency_p90"),
+            source: String::new(),
+            raw: value.clone(),
         })
+    }
+
+    /// A request of an upload or download session: its latency is mostly the time the bytes took.
+    pub fn is_transfer(&self) -> bool {
+        matches!(self.role.as_str(), "media" | "cdn") || self.method.starts_with("upload.")
+    }
+
+    /// The link's round trip (p50, p90): the main session's latency when the record has it, the
+    /// record's own when its role makes small calls, unknown for a transfer.
+    pub fn round_trip(&self) -> (Option<f64>, Option<f64>) {
+        if self.main_latency_p50.is_some() {
+            (self.main_latency_p50, self.main_latency_p90)
+        } else if self.is_transfer() {
+            (None, None)
+        } else {
+            (self.latency_p50, self.latency_p90)
+        }
+    }
+
+    /// The network the record was made on, coarsely enough that records of one user on one
+    /// network land together: the round trip rounded up to a power of two (for a transfer without
+    /// one, the rate it moved at), cellular and proxy.
+    pub fn link_class(&self) -> String {
+        let bucket = |value: f64| (value.ceil().max(1.0) as u64).next_power_of_two();
+        let rate = if self.method.starts_with("upload.save") { self.uplink_rate } else { self.downlink_rate };
+        let rtt = match (self.round_trip().0, rate) {
+            (Some(seconds), _) if seconds > 0.0 => format!("rtt≤{}ms", bucket(seconds * 1000.0)),
+            (_, Some(rate)) if self.is_transfer() && rate > 0.0 => {
+                format!("rate≤{}kbit/s", bucket(rate * 8.0 / 1000.0))
+            }
+            _ => "rtt?".to_string(),
+        };
+        let cellular = if self.cellular == Some(true) { "-cellular" } else { "" };
+        let proxy = if self.via_proxy { "-proxy" } else { "" };
+        format!("{rtt}{cellular}{proxy}")
     }
 }
 
 /// Reads records from `failures.jsonl` (one record per line), a JSON array of records, a reported
 /// chunk (`{"records": [...]}`) or an array of reported chunks or app log events.
 pub fn load_records(text: &str) -> Vec<FailureRecord> {
-    fn collect(value: &Value, out: &mut Vec<FailureRecord>) {
+    load_records_from(text, "")
+}
+
+/// `load_records`, marking each record with the `report_id` of the chunk it came in, or `source`.
+pub fn load_records_from(text: &str, source: &str) -> Vec<FailureRecord> {
+    fn collect(value: &Value, source: &str, out: &mut Vec<FailureRecord>) {
         match value {
             Value::Array(items) => {
                 for item in items {
-                    collect(item, out);
+                    collect(item, source, out);
                 }
             }
             Value::Object(_) => {
+                let report = match value.get("report_id") {
+                    Some(Value::String(id)) => id.clone(),
+                    Some(Value::Number(id)) => format!("{id}"),
+                    _ => source.to_string(),
+                };
                 if let Some(records) = value.get("records") {
-                    collect(records, out);
+                    collect(records, &report, out);
                 } else if let Some(data) = value.get("data") {
-                    collect(data, out);
-                } else if let Some(record) = FailureRecord::from_value(value) {
+                    collect(data, &report, out);
+                } else if let Some(mut record) = FailureRecord::from_value(value) {
+                    record.source = report;
                     out.push(record);
                 }
             }
@@ -157,13 +216,13 @@ pub fn load_records(text: &str) -> Vec<FailureRecord> {
     }
     let mut out = Vec::new();
     if let Some(value) = json::parse(text.trim()) {
-        collect(&value, &mut out);
+        collect(&value, source, &mut out);
         return out;
     }
     let mut skipped = 0;
     for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
         match json::parse(line) {
-            Some(value) => collect(&value, &mut out),
+            Some(value) => collect(&value, source, &mut out),
             None => skipped += 1,
         }
     }
@@ -250,8 +309,8 @@ pub fn link_history(records: &[&FailureRecord]) -> LinkHistory {
 
 /// A simulated link that matches what the records measured.
 pub fn derive_profile(name: &str, records: &[&FailureRecord], history: &LinkHistory) -> Profile {
-    let p50 = median(records.iter().filter_map(|record| record.latency_p50).collect());
-    let p90 = median(records.iter().filter_map(|record| record.latency_p90).collect());
+    let p50 = median(records.iter().filter_map(|record| record.round_trip().0).collect());
+    let p90 = median(records.iter().filter_map(|record| record.round_trip().1).collect());
     let cellular = records.iter().filter(|record| record.cellular == Some(true)).count() * 2 > records.len();
     let mut profile = Profile::perfect();
     profile.name = name.to_string();
@@ -363,18 +422,32 @@ pub struct ReplayCase {
     /// Requests kept in flight, from the records' estimates.
     pub concurrency: usize,
     pub candidates: Vec<Vec<(Fault, f64)>>,
+    /// The reports or files the records came from.
+    pub sources: Vec<String>,
+    /// Records per engine.
+    pub engine_records: BTreeMap<String, usize>,
 }
 
 /// Groups records into cases, the most frequent first.
 pub fn cases(records: &[FailureRecord]) -> Vec<ReplayCase> {
-    let mut groups: BTreeMap<(String, String, String), Vec<&FailureRecord>> = BTreeMap::new();
+    let mut groups: BTreeMap<(String, String, String, String), Vec<&FailureRecord>> = BTreeMap::new();
     for record in records {
-        groups.entry((record.failure.clone(), record.role.clone(), record.method.clone())).or_default().push(record);
+        groups
+            .entry((record.failure.clone(), record.role.clone(), record.method.clone(), record.link_class()))
+            .or_default()
+            .push(record);
     }
     let mut result: Vec<ReplayCase> = groups
         .into_iter()
-        .map(|((failure, role, method), group)| {
-            let name = format!("replay/{failure}/{role}/{method}");
+        .map(|((failure, role, method, link), group)| {
+            let name = format!("replay/{failure}/{role}/{method}/{link}");
+            let mut sources: Vec<String> = group.iter().map(|record| record.source.clone()).collect();
+            sources.sort();
+            sources.dedup();
+            let mut engine_records = BTreeMap::new();
+            for record in &group {
+                *engine_records.entry(record.engine.clone()).or_insert(0) += 1;
+            }
             let history = link_history(&group);
             let profile = derive_profile(&name, &group, &history);
             let outage = history.down_at_failure.map(|down| (3.0, down.clamp(1.0, 30.0)));
@@ -393,6 +466,8 @@ pub fn cases(records: &[FailureRecord]) -> Vec<ReplayCase> {
             ReplayCase {
                 name,
                 candidates,
+                sources,
+                engine_records,
                 failure,
                 role,
                 method,
@@ -422,7 +497,7 @@ pub fn cases(records: &[FailureRecord]) -> Vec<ReplayCase> {
     result
 }
 
-fn faults_label(faults: &[(Fault, f64)]) -> String {
+pub fn faults_label(faults: &[(Fault, f64)]) -> String {
     if faults.is_empty() {
         "network only".into()
     } else {
@@ -571,18 +646,19 @@ impl ReplayArgs {
 /// Drops by reason, each counted once although every failure in the window after it lists it: a
 /// drop an earlier record listed has the same reason and age there, at the same uptime give or take
 /// the whole-second uptime. Each earlier drop stands for one drop of a later record, so drops one
-/// record lists twice (sessions cut together) both count. Records carry no source, so identical
-/// drops of different users at the same uptime count once.
+/// record lists twice (sessions cut together) both count. Only records of the same report share
+/// drops: identical drops of different users at the same uptime are different drops.
 fn drop_counts(group: &[&FailureRecord]) -> Vec<(String, usize)> {
-    let mut seen: Vec<(f64, &RecordedDrop)> = Vec::new();
+    let mut seen: Vec<(f64, &str, &RecordedDrop)> = Vec::new();
     for record in group {
         let earlier = seen.len();
         let mut claimed = vec![false; earlier];
         for drop in &record.drops {
             let at = record.uptime - drop.ago;
             let matched = (0..earlier).find(|&index| {
-                let (time, other) = seen[index];
+                let (time, source, other) = seen[index];
                 !claimed[index]
+                    && source == record.source
                     && other.reason == drop.reason
                     && other.answered == drop.answered
                     && other.age == drop.age
@@ -590,12 +666,12 @@ fn drop_counts(group: &[&FailureRecord]) -> Vec<(String, usize)> {
             });
             match matched {
                 Some(index) => claimed[index] = true,
-                None => seen.push((at, drop)),
+                None => seen.push((at, record.source.as_str(), drop)),
             }
         }
     }
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
-    for (_, drop) in seen {
+    for (_, _, drop) in seen {
         let key = if drop.answered { drop.reason.clone() } else { format!("{} (unanswered)", drop.reason) };
         *counts.entry(key).or_insert(0) += 1;
     }
@@ -604,7 +680,7 @@ fn drop_counts(group: &[&FailureRecord]) -> Vec<(String, usize)> {
     counts
 }
 
-fn describe(case: &ReplayCase) -> String {
+pub fn describe(case: &ReplayCase) -> String {
     let profile = &case.profile;
     format!(
         "{}: {} records of `{}` ({}), engines {:?}, {} in flight\n  link: one-way latency {} ms ±{} ms, bandwidth {}{}, chunk {} B, stalls {:.0}%, resets {}, connect delay {} ms, refuse {:.0}%{}{}{}",
@@ -668,9 +744,42 @@ pub fn reproduced(case: &ReplayCase, local: &[FailureRecord]) -> bool {
     })
 }
 
+/// Every explanation tried for a case: the network alone, then each server fault.
+pub fn hypotheses(case: &ReplayCase) -> Vec<Vec<(Fault, f64)>> {
+    std::iter::once(Vec::new()).chain(case.candidates.iter().cloned()).collect()
+}
+
+/// Runs one explanation of a case on one engine, with the client's telemetry on, and says whether
+/// the client recorded the case's failure.
+pub fn replay_once(
+    case: &ReplayCase,
+    faults: &[(Fault, f64)],
+    engine: &str,
+    seed: u64,
+    binary: &str,
+) -> CandidateResult {
+    let dump = std::env::temp_dir().join(format!("replay-{}-{seed}-{engine}.json", std::process::id()));
+    let dump = dump.to_string_lossy().to_string();
+    let _ = std::fs::remove_file(&dump);
+    let result = cluster::run(&scenario(case, faults, seed, &dump), binary, engine, seed);
+    let local = std::fs::read_to_string(&dump).map(|text| load_records(&text)).unwrap_or_default();
+    let _ = std::fs::remove_file(&dump);
+    let mut classes = BTreeMap::new();
+    for record in &local {
+        *classes.entry(record.failure.clone()).or_insert(0) += 1;
+    }
+    CandidateResult {
+        faults: faults_label(faults),
+        engine: engine.to_string(),
+        reproduced: reproduced(case, &local) && (!stuck(case) || unfinished(&result)),
+        classes,
+        result,
+    }
+}
+
 pub fn run(args: ReplayArgs) {
     let text = std::fs::read_to_string(&args.records).expect("read records");
-    let records = load_records(&text);
+    let records = load_records_from(&text, &args.records);
     let mut all = cases(&records);
     if let Some(filter) = &args.only {
         all.retain(|case| case.name.contains(filter.as_str()));
@@ -688,14 +797,10 @@ pub fn run(args: ReplayArgs) {
         }
         out.push_str("| Candidate | Engine | Reproduced | Local failures | Done/Issued | Failed or hung | p50 ms | p99 ms | Conns |\n");
         out.push_str("|---|---|---|---|---|---|---|---|---|\n");
-        for (candidate_index, faults) in std::iter::once(Vec::new()).chain(case.candidates.iter().cloned()).enumerate()
-        {
+        for (candidate_index, faults) in hypotheses(case).into_iter().enumerate() {
             for round in 0..args.rounds {
                 for engine in &args.engines {
                     let seed = 7000 + case_index as u64 * 101 + candidate_index as u64 * 7 + round as u64;
-                    let dump = std::env::temp_dir().join(format!("replay-{}-{seed}-{engine}.json", std::process::id()));
-                    let dump = dump.to_string_lossy().to_string();
-                    let _ = std::fs::remove_file(&dump);
                     eprintln!(
                         "[{}/{}] {} — {} — tc-{engine}",
                         case_index + 1,
@@ -703,20 +808,7 @@ pub fn run(args: ReplayArgs) {
                         case.name,
                         faults_label(&faults)
                     );
-                    let result = cluster::run(&scenario(case, &faults, seed, &dump), &args.binary, engine, seed);
-                    let local = std::fs::read_to_string(&dump).map(|text| load_records(&text)).unwrap_or_default();
-                    let _ = std::fs::remove_file(&dump);
-                    let mut classes = BTreeMap::new();
-                    for record in &local {
-                        *classes.entry(record.failure.clone()).or_insert(0) += 1;
-                    }
-                    let row = CandidateResult {
-                        faults: faults_label(&faults),
-                        engine: engine.clone(),
-                        reproduced: reproduced(case, &local) && (!stuck(case) || unfinished(&result)),
-                        classes,
-                        result,
-                    };
+                    let row = replay_once(case, &faults, engine, seed, &args.binary);
                     let line = markdown_row(&row);
                     eprintln!("{line}");
                     out.push_str(&line);
@@ -728,7 +820,7 @@ pub fn run(args: ReplayArgs) {
     println!("{out}");
 }
 
-fn markdown_row(row: &CandidateResult) -> String {
+pub fn markdown_row(row: &CandidateResult) -> String {
     let classes = if row.classes.is_empty() {
         "none".to_string()
     } else {
@@ -831,6 +923,21 @@ mod tests {
     }
 
     #[test]
+    fn records_on_different_links_are_different_cases() {
+        let base = load_records(STALLED).remove(0);
+        let mut cellular = base.clone();
+        cellular.cellular = Some(true);
+        cellular.latency_p50 = Some(0.6);
+        let mut unknown = base.clone();
+        unknown.latency_p50 = None;
+        unknown.via_proxy = true;
+        assert_eq!(base.link_class(), "rtt≤128ms");
+        assert_eq!(cellular.link_class(), "rtt≤1024ms-cellular");
+        assert_eq!(unknown.link_class(), "rtt?-proxy");
+        assert_eq!(cases(&[base, cellular, unknown]).len(), 3);
+    }
+
+    #[test]
     fn groups_by_class_role_and_method() {
         let base = load_records(STALLED).remove(0);
         let mut flood = base.clone();
@@ -845,9 +952,9 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "replay/stalled/main/messages.getHistory",
-                "replay/flood/main/messages.getHistory",
-                "replay/stalled/media/upload.getFile"
+                "replay/stalled/main/messages.getHistory/rtt≤128ms",
+                "replay/flood/main/messages.getHistory/rtt≤128ms",
+                "replay/stalled/media/upload.getFile/rtt?"
             ]
         );
         assert!(all[1].candidates.iter().any(|faults| faults.contains(&(Fault::FloodWait, 0.05))));
@@ -927,6 +1034,14 @@ mod tests {
         );
         let case = cases(&load_records(&together)).remove(0);
         assert_eq!(case.drops, vec![("connect_timeout (unanswered)".into(), 2)], "two sessions cut together");
+        let mut two_users = load_records(&format!("[{first},{first}]"));
+        two_users[1].source = "another report".into();
+        let case = cases(&two_users).remove(0);
+        assert_eq!(
+            case.drops,
+            vec![("probe_timeout".into(), 2), ("racer_won (unanswered)".into(), 2)],
+            "the same drop in two reports is two drops"
+        );
     }
 
     #[test]

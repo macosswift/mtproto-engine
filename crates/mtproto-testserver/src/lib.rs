@@ -46,6 +46,8 @@ pub const TAG_GARBAGE_SIBLINGS: u32 = 1018;
 pub const TAG_GZIP: u32 = 1019;
 pub const TAG_TRICKLE_ONCE: u32 = 1020;
 pub const TAG_FORGED_404_ONCE: u32 = 1021;
+/// An upload part: the answer carries only the number of bytes received.
+pub const TAG_UPLOAD: u32 = 1022;
 pub const SERVER_PING_ID: i64 = 0x5e57_9149;
 pub const LARGE_SIZE: usize = 1024 * 1024;
 pub const SERVER_SALT: i64 = 0x5a17;
@@ -1314,6 +1316,10 @@ fn serve_frames_inner(
                                     let data = vec![(count & 0xff) as u8; size];
                                     outgoing.push((sp::rpc_result(message.msg_id, &result_body(tag, &data)), true));
                                 }
+                                TAG_UPLOAD => {
+                                    let received = (payload.len() as u32).to_le_bytes();
+                                    outgoing.push((sp::rpc_result(message.msg_id, &result_body(tag, &received)), true));
+                                }
                                 TAG_UPDATE_PUSH => {
                                     outgoing.push((sp::update(0x74ae4240, &tag.to_le_bytes()), true));
                                     outgoing.push((reply, true));
@@ -1515,7 +1521,7 @@ fn unwrap_wrappers(body: &[u8]) -> (Option<Inner>, WrapperFlags) {
                     let _ = reader.read_bytes();
                     let _ = reader.read_i32();
                 }
-                if flag_bits & 2 != 0 {
+                if flag_bits & 2 != 0 && skip_json_value(&mut reader, 0).is_none() {
                     return (None, flags);
                 }
             }
@@ -1549,6 +1555,49 @@ fn unwrap_wrappers(body: &[u8]) -> (Option<Inner>, WrapperFlags) {
             _ => return (None, flags),
         }
     }
+}
+
+/// Skips the JSONValue `initConnection` carries as `params`, which tdlib sends.
+fn skip_json_value(reader: &mut Reader<'_>, depth: usize) -> Option<()> {
+    const JSON_NULL: u32 = 0x3f6d_7b68;
+    const JSON_BOOL: u32 = 0xc734_5e6a;
+    const JSON_NUMBER: u32 = 0x2be0_dfa4;
+    const JSON_STRING: u32 = 0xb71e_767a;
+    const JSON_ARRAY: u32 = 0xf744_4763;
+    const JSON_OBJECT: u32 = 0x99c1_d49d;
+    const JSON_OBJECT_VALUE: u32 = 0xc0de_1bd9;
+    const VECTOR: u32 = 0x1cb5_c415;
+    if depth > 16 {
+        return None;
+    }
+    match reader.read_u32().ok()? {
+        JSON_NULL => {}
+        JSON_BOOL => {
+            reader.read_u32().ok()?;
+        }
+        JSON_NUMBER => {
+            reader.read_i64().ok()?;
+        }
+        JSON_STRING => {
+            reader.read_bytes().ok()?;
+        }
+        JSON_ARRAY => {
+            (reader.read_u32().ok()? == VECTOR).then_some(())?;
+            for _ in 0..reader.read_u32().ok()? {
+                skip_json_value(reader, depth + 1)?;
+            }
+        }
+        JSON_OBJECT => {
+            (reader.read_u32().ok()? == VECTOR).then_some(())?;
+            for _ in 0..reader.read_u32().ok()? {
+                (reader.read_u32().ok()? == JSON_OBJECT_VALUE).then_some(())?;
+                reader.read_bytes().ok()?;
+                skip_json_value(reader, depth + 1)?;
+            }
+        }
+        _ => return None,
+    }
+    Some(())
 }
 
 pub fn random_key(seed: u64) -> AuthKey {

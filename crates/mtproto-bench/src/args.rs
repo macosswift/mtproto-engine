@@ -17,6 +17,8 @@ pub struct ClientArgs {
     pub rate: f64,
     pub duration: f64,
     pub deadline: f64,
+    /// The user is online: the main session keeps the short, round-trip-based keepalive.
+    pub online: bool,
 }
 
 impl Default for ClientArgs {
@@ -39,6 +41,7 @@ impl Default for ClientArgs {
             rate: 10.0,
             duration: 10.0,
             deadline: 120.0,
+            online: false,
         }
     }
 }
@@ -67,6 +70,7 @@ impl ClientArgs {
                 "--rate" => args.rate = value().parse().expect("rate"),
                 "--duration" => args.duration = value().parse().expect("duration"),
                 "--deadline" => args.deadline = value().parse().expect("deadline"),
+                "--online" => args.online = value() == "1",
                 other => panic!("unknown argument {other}"),
             }
         }
@@ -113,6 +117,10 @@ impl ClientArgs {
         if let Some(secret) = &self.secret {
             out.push("--secret".into());
             out.push(secret.clone());
+        }
+        if self.online {
+            out.push("--online".into());
+            out.push("1".into());
         }
         out
     }
