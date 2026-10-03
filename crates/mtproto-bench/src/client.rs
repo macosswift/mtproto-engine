@@ -159,6 +159,8 @@ impl Driver {
             bytes: self.bytes,
             throughput_mbps: if elapsed > 0.0 { self.bytes as f64 / 1e6 / elapsed } else { 0.0 },
             requests: self.records.clone(),
+            transfers_done: None,
+            transfers_elapsed: None,
         }
     }
 }

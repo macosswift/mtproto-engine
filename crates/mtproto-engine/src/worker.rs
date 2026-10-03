@@ -14,6 +14,7 @@ use crate::session_runtime::{Resolution, Resolve, SessionRuntime};
 use crate::types::{
     AuthKeyMaterial, DcAddress, EngineCallbacks, EngineConfig, EngineEvent, ProxyConfig, SessionHandle, SessionSetup,
 };
+use crate::uploads::Uploads;
 
 pub const WAKER_TOKEN: Token = Token(usize::MAX);
 const MAX_POLL_WAIT: f64 = 60.0;
@@ -95,6 +96,7 @@ pub struct Worker {
     network_available: bool,
     last_shrink: f64,
     more_readable: VecDeque<SessionHandle>,
+    uploads: Arc<Uploads>,
 }
 
 impl Worker {
@@ -122,7 +124,14 @@ impl Worker {
             network_available: true,
             last_shrink: clock::monotonic_seconds(),
             more_readable: VecDeque::new(),
+            uploads: Arc::default(),
         }
+    }
+
+    /// Lets the sessions see what other workers' sessions are uploading.
+    pub fn sharing_uploads(mut self, uploads: Arc<Uploads>) -> Self {
+        self.uploads = uploads;
+        self
     }
 
     pub fn run(mut self) {
@@ -235,6 +244,7 @@ impl Worker {
                     let token = Token(self.next_token);
                     self.next_token += 2;
                     let mut runtime = SessionRuntime::new(handle, *setup, token, now, &mut self.rng);
+                    runtime.share_uploads(self.uploads.clone());
                     runtime.set_network_available(self.network_available, now, self.poll.registry());
                     self.tokens.insert(token, handle);
                     self.tokens.insert(runtime.race_token(), handle);

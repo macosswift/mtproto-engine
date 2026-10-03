@@ -28,6 +28,11 @@ pub struct ClientReport {
     pub bytes: u64,
     pub throughput_mbps: f64,
     pub requests: Vec<(f64, Option<f64>)>,
+    /// Files downloaded or uploaded in full, when the client counts them apart from its calls.
+    pub transfers_done: Option<usize>,
+    /// When the last of those files was done. Calls still in flight after it say nothing about how
+    /// fast the files went.
+    pub transfers_elapsed: Option<f64>,
 }
 
 fn number(value: f64) -> String {
@@ -35,6 +40,13 @@ fn number(value: f64) -> String {
 }
 
 impl ClientReport {
+    /// Bytes a second the files went at: up to the last one done when the client says when that
+    /// was and nothing failed or hung, over the whole run otherwise.
+    pub fn transfer_rate(&self) -> f64 {
+        let span = self.transfers_elapsed.filter(|at| *at > 0.0 && self.failed == 0).unwrap_or(self.elapsed);
+        if span > 0.0 { self.bytes as f64 / span } else { 0.0 }
+    }
+
     pub fn to_json(&self) -> String {
         let requests: Vec<String> = self
             .requests
@@ -89,6 +101,30 @@ impl ClientReport {
             bytes: value.get("bytes").and_then(|v| v.as_f64()).unwrap_or(0.0) as u64,
             throughput_mbps: value.get("throughput_mbps").and_then(|v| v.as_f64()).unwrap_or(0.0),
             requests,
+            transfers_done: value.get("transfers_done").and_then(|v| v.as_f64()).map(|v| v as usize),
+            transfers_elapsed: value.get("transfers_elapsed").and_then(|v| v.as_f64()),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn report(failed: usize) -> ClientReport {
+        let text = format!(
+            "{{\"engine\":\"tc-rust\",\"workload\":\"tc-mixed\",\"completed\":40,\"failed\":{failed},\"elapsed\":12.0,\"bytes\":48000,\"transfers_done\":4,\"transfers_elapsed\":9.6,\"requests\":[]}}"
+        );
+        ClientReport::from_json(&text).expect("report")
+    }
+
+    #[test]
+    fn calls_answered_after_the_last_file_do_not_lower_its_rate() {
+        assert_eq!(report(0).transfer_rate(), 5000.0);
+    }
+
+    #[test]
+    fn a_run_where_something_failed_is_rated_over_its_whole_length() {
+        assert_eq!(report(1).transfer_rate(), 4000.0);
     }
 }

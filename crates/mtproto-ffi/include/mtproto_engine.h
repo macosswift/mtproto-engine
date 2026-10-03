@@ -155,6 +155,7 @@ typedef enum {
     MTEventKindClosed = 26,
     MTEventKindRetryDecisionRequired = 27,
     MTEventKindAuthKeyDestroyed = 28,
+    MTEventKindConnectionDropped = 29,
 } MTEventKind;
 
 enum {

@@ -294,6 +294,13 @@ impl EngineCallbacks for Bridge {
                 event.code = i32::from(success);
                 self.emit(session, event, None);
             }
+            EngineEvent::ConnectionDropped { reason, answered, age } => {
+                let mut event = blank(29);
+                event.text = string_ref(reason.name());
+                event.flags = u32::from(answered);
+                event.value1 = age;
+                self.emit(session, event, None);
+            }
             EngineEvent::Closed => self.emit(session, blank(26), None),
         }
     }

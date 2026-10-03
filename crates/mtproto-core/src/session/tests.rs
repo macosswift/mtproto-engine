@@ -362,6 +362,7 @@ fn reconnect_without_ack_retransmits_with_original_msg_ids() {
 #[test]
 fn retransmissions_respect_container_limits_and_keep_order() {
     let mut h = Harness::new();
+    h.sync();
     let part = vec![0x55u8; DEFAULT_CONTAINER_BYTES / 2 + 4];
     let mut originals = Vec::new();
     for index in 0..6u32 {
@@ -395,7 +396,7 @@ fn retransmissions_respect_container_limits_and_keep_order() {
 }
 
 #[test]
-fn large_answers_are_acknowledged_at_once_small_ones_are_batched() {
+fn large_answers_are_acknowledged_within_a_second_small_ones_are_batched() {
     let mut h = Harness::new();
     h.sync();
     h.session.send(QueryId(1), query_body(1), QueryOptions::default(), h.now);
@@ -407,8 +408,12 @@ fn large_answers_are_acknowledged_at_once_small_ones_are_batched() {
     h.deliver(vec![Outgoing::Content(rpc_result(small, &[1, 2, 3, 4]))]).unwrap();
     assert!(h.flush_all().iter().all(|packet| packet.find(ids::MSGS_ACK).is_none()), "small answers wait for company");
     h.deliver(vec![Outgoing::Content(rpc_result(large, &vec![7u8; IMMEDIATE_ACK_SIZE]))]).unwrap();
+    h.advance(LARGE_ANSWER_ACK_DELAY);
     let packets = h.flush_all();
-    let ack = packets.iter().find_map(|packet| packet.find(ids::MSGS_ACK)).expect("large answer acknowledged at once");
+    let ack = packets
+        .iter()
+        .find_map(|packet| packet.find(ids::MSGS_ACK))
+        .expect("large answer acknowledged within a second");
     assert!(read_vector_after_constructor(&ack.body).len() >= 2, "pending small acks ride along");
 }
 
@@ -456,17 +461,21 @@ fn draining_backlog_is_progress_and_never_trips_the_probe() {
         backlog -= 50_000;
         h.session.note_bytes_received(h.now);
     }
-    busy_with_unanswered_ping(&mut h);
     let mut stalled = Ok(());
-    for _ in 0..80 {
+    for _ in 0..120 {
         h.advance(0.1);
+        while h.session.poll_transmit(h.now, &mut h.rng).is_some() {}
         h.session.note_outbound_backlog(Some(backlog), h.now);
         stalled = h.session.handle_timeout(h.now);
         if stalled.is_err() {
             break;
         }
     }
-    assert_eq!(stalled, Err(SessionError::ProbeTimeout), "a backlog that stops draining is a dead path");
+    assert_eq!(
+        stalled,
+        Err(SessionError::ProbeTimeout),
+        "once reading goes quiet a ping goes out, and a backlog that stops draining is a dead path"
+    );
 }
 
 #[test]
@@ -767,9 +776,9 @@ fn quick_ack_marks_query_acknowledged() {
     h.advance(0.01);
     let transmit = h.session.poll_transmit(h.now, &mut h.rng).unwrap();
     let token = transmit.quick_ack_token.expect("quick ack requested");
-    h.session.handle_quick_ack(token | 0x8000_0000);
+    h.session.handle_quick_ack(token | 0x8000_0000, h.now);
     assert_eq!(h.events(), vec![SessionEvent::Acknowledged { id: QueryId(7) }]);
-    h.session.handle_quick_ack(token);
+    h.session.handle_quick_ack(token, h.now);
     assert!(h.events().is_empty());
 }
 
@@ -2233,7 +2242,7 @@ mod fuzz {
                 let _ = h.session.handle_packet(&sealed, h.now, &mut h.rng);
                 h.events();
                 if index % 3 == 0 {
-                    h.session.handle_quick_ack(packet.seq as u32);
+                    h.session.handle_quick_ack(packet.seq as u32, h.now);
                 }
                 h.advance(f64::from(packet.advance) * 0.05);
                 if h.session.handle_timeout(h.now).is_err() {
@@ -2574,4 +2583,1007 @@ fn a_failed_batched_answer_request_is_retried_one_by_one_before_any_query_is_res
     let resent: Vec<u32> = packet.queries().iter().filter_map(|message| query_tag(&message.body)).collect();
     assert_eq!(resent, vec![2], "only the query whose answer is gone is resent");
     assert_eq!(h.results(), vec![(QueryId(1), vec![1, 1, 1, 1])]);
+}
+
+fn large_query_body(tag: u32, size: usize) -> Vec<u8> {
+    let mut body = query_body(tag);
+    body.resize(size, 0);
+    body
+}
+
+/// Opens the path: the first ping goes out alone and its pong comes straight back.
+fn answer_probe(h: &mut Harness) {
+    let probe = h.flush().expect("probe");
+    assert!(probe.messages.iter().all(|message| query_tag(&message.body).is_none()), "{:x?}", probe.constructors());
+    h.advance(0.2);
+    h.answer_pings(&probe);
+}
+
+fn send_large(h: &mut Harness, tag: u32, size: usize) -> (i64, Transmit) {
+    h.session.send(QueryId(u64::from(tag)), large_query_body(tag, size), QueryOptions::default(), h.now);
+    h.advance(0.002);
+    let transmit = h.session.poll_transmit(h.now, &mut h.rng).expect("packet");
+    let packet = h.server.decode(&transmit.data);
+    (h.sent_query(&packet, tag), transmit)
+}
+
+#[test]
+fn a_fresh_connection_pings_alone_before_a_large_query() {
+    let mut h = Harness::new();
+    h.session.send(QueryId(1), large_query_body(1, 128 * 1024), QueryOptions::default(), h.now);
+    let probe = h.flush().expect("probe");
+    assert!(
+        probe
+            .messages
+            .iter()
+            .any(|message| message.constructor() == ids::PING_DELAY_DISCONNECT || message.constructor() == ids::PING)
+    );
+    assert!(probe.messages.iter().all(|message| query_tag(&message.body).is_none()));
+    let part = h.flush().expect("the part follows at once");
+    h.sent_query(&part, 1);
+    assert!(!h.session.is_transmitting(h.now), "no grace before the server answered on this connection");
+    h.answer_pings(&probe);
+    assert!(h.session.is_transmitting(h.now));
+}
+
+#[test]
+fn a_large_message_on_an_unmeasured_uplink_gets_time_to_arrive() {
+    let mut h = Harness::new();
+    answer_probe(&mut h);
+    let (msg_id, _) = send_large(&mut h, 1, 128 * 1024);
+    let grace = h.session.transmit_grace_until() - h.now.mono;
+    assert!((32.0..36.0).contains(&grace), "128 KB at the initial 4 KB/s: {grace}");
+    for _ in 0..32 {
+        h.advance(1.0);
+        assert!(h.session.handle_timeout(h.now).is_ok(), "no timeout while the part may still be on its way");
+        assert!(h.session.is_transmitting(h.now));
+    }
+    h.advance(1.0);
+    h.deliver(vec![Outgoing::Content(rpc_result(msg_id, &[1, 2, 3, 4]))]).unwrap();
+    assert_eq!(h.results(), vec![(QueryId(1), vec![1, 2, 3, 4])]);
+    assert!(!h.session.is_transmitting(h.now));
+    let rate = h.session.uplink_rate().expect("measured");
+    assert!((3500.0..4500.0).contains(&rate), "{rate}");
+    assert_eq!(h.session.transmit_grace_rate(), TRANSMIT_GRACE_RATE_MIN);
+}
+
+#[test]
+fn parts_flushed_together_keep_their_grace_until_each_arrives() {
+    let mut h = Harness::new();
+    answer_probe(&mut h);
+    let parts: Vec<i64> = (1..=3).map(|tag| send_large(&mut h, tag, 128 * 1024).0).collect();
+    for (index, msg_id) in parts.iter().enumerate() {
+        for _ in 0..16 {
+            h.advance(1.0);
+            assert!(h.session.handle_timeout(h.now).is_ok());
+            assert!(h.session.is_transmitting(h.now), "part {} is still on its way", index + 1);
+        }
+        h.deliver(vec![Outgoing::Content(rpc_result(*msg_id, &[1, 2, 3, 4]))]).unwrap();
+        let rate = h.session.uplink_rate().expect("measured");
+        assert!((7000.0..9000.0).contains(&rate), "8 KB/s, measured from deliveries: {rate}");
+    }
+    assert!(!h.session.is_transmitting(h.now));
+}
+
+#[test]
+fn a_pong_riding_with_a_part_measures_the_uplink_not_the_network() {
+    let mut h = Harness::new();
+    answer_probe(&mut h);
+    let rtt = h.session.smoothed_rtt().expect("measured");
+    h.advance(100.0);
+    let (msg_id, transmit) = send_large(&mut h, 1, 128 * 1024);
+    let packet = h.server.decode(&transmit.data);
+    let ping = packet
+        .messages
+        .iter()
+        .find(|message| message.constructor() == ids::PING_DELAY_DISCONNECT || message.constructor() == ids::PING)
+        .expect("a ping rides with the part");
+    let pong = pong(ping.msg_id, i64::from_le_bytes(ping.body[4..12].try_into().unwrap()));
+    h.advance(16.0);
+    h.deliver(vec![Outgoing::Service(pong), Outgoing::Content(rpc_result(msg_id, &[1, 2, 3, 4]))]).unwrap();
+    let rate = h.session.uplink_rate().expect("measured");
+    assert!((7000.0..9000.0).contains(&rate), "{rate}");
+    assert_eq!(h.session.smoothed_rtt(), Some(rtt), "the pong waited for the part, it measured no round trip");
+    send_large(&mut h, 2, 128 * 1024);
+    let grace = h.session.transmit_grace_until() - h.now.mono;
+    assert!(grace > 30.0, "the next part gets the time it needs: {grace}");
+}
+
+#[test]
+fn a_quick_ack_confirms_a_large_packet_before_its_answer() {
+    let mut h = Harness::new();
+    answer_probe(&mut h);
+    let (_, transmit) = send_large(&mut h, 1, 64 * 1024);
+    let token = transmit.quick_ack_token.expect("large packets ask for a quick ack");
+    h.advance(8.0);
+    assert!(h.session.is_transmitting(h.now));
+    h.session.handle_quick_ack(token, h.now);
+    assert!(!h.session.is_transmitting(h.now), "the server has the packet");
+    let rate = h.session.uplink_rate().expect("measured");
+    assert!((7000.0..9000.0).contains(&rate), "{rate}");
+}
+
+#[test]
+fn a_dead_connection_under_many_parts_is_noticed_within_one_part() {
+    let mut h = Harness::new();
+    answer_probe(&mut h);
+    for tag in 1..=30 {
+        send_large(&mut h, tag, 512 * 1024);
+    }
+    let grace = h.session.transmit_grace_until() - h.now.mono;
+    assert!(grace <= TRANSMIT_GRACE_MAX + 0.01, "only the oldest part's time, capped: {grace}");
+    let started = h.now.mono;
+    let failed_at = loop {
+        h.advance(1.0);
+        if h.session.handle_timeout(h.now).is_err() {
+            break h.now.mono;
+        }
+        assert!(h.now.mono - started < 600.0, "never noticed");
+    };
+    assert!(failed_at - started <= TRANSMIT_GRACE_MAX + 10.0, "noticed after {} s", failed_at - started);
+}
+
+#[test]
+fn a_fast_measured_uplink_shortens_the_grace() {
+    let mut h = Harness::new();
+    answer_probe(&mut h);
+    let (msg_id, _) = send_large(&mut h, 1, 64 * 1024);
+    h.advance(0.1);
+    h.deliver(vec![Outgoing::Content(rpc_result(msg_id, &[1, 2, 3, 4]))]).unwrap();
+    assert!(h.session.transmit_grace_rate() > 100.0 * 1024.0, "{}", h.session.transmit_grace_rate());
+    h.advance(5.0);
+    send_large(&mut h, 2, 64 * 1024);
+    let grace = h.session.transmit_grace_until() - h.now.mono;
+    assert!(grace < 3.0, "a dead connection is still noticed quickly on a fast uplink: {grace}");
+}
+
+#[test]
+fn an_answer_to_a_retransmitted_part_does_not_confirm_arrival() {
+    let mut h = Harness::new();
+    answer_probe(&mut h);
+    let (msg_id, _) = send_large(&mut h, 1, 128 * 1024);
+    h.advance(1.0);
+    h.session.connection_closed();
+    h.session.connection_opened(h.now);
+    let packets = h.flush_all();
+    let probe = packets.first().expect("probe");
+    h.answer_pings(probe);
+    assert!(
+        packets.iter().any(|packet| packet.messages.iter().any(|message| message.msg_id == msg_id)),
+        "the part is sent again"
+    );
+    h.advance(0.1);
+    h.deliver(vec![Outgoing::Content(rpc_result(msg_id, &[1, 2, 3, 4]))]).unwrap();
+    assert!(h.session.is_transmitting(h.now), "the answer may be for the copy on the old connection");
+    assert_eq!(h.session.uplink_rate(), None);
+}
+
+#[test]
+fn a_silent_fresh_connection_gets_no_grace() {
+    let mut h = Harness::new();
+    h.session.send(QueryId(1), large_query_body(1, 512 * 1024), QueryOptions::default(), h.now);
+    h.flush_all();
+    let started = h.now.mono;
+    loop {
+        h.advance(0.5);
+        if h.session.handle_timeout(h.now).is_err() {
+            break;
+        }
+        assert!(h.now.mono - started < 15.0, "a blackholed connection must not wait out the transfer");
+    }
+}
+
+#[test]
+fn a_stuck_send_queue_does_not_wait_out_the_grace() {
+    let mut h = Harness::new();
+    answer_probe(&mut h);
+    h.advance(10.0);
+    send_large(&mut h, 1, 512 * 1024);
+    assert!(h.session.is_transmitting(h.now));
+    let started = h.now.mono;
+    let error = loop {
+        while h.session.poll_transmit(h.now, &mut h.rng).is_some() {}
+        h.session.note_outbound_backlog(Some(300_000), h.now);
+        h.advance(0.5);
+        if let Err(error) = h.session.handle_timeout(h.now) {
+            break error;
+        }
+        assert!(h.now.mono - started < 20.0, "the probe is held back by the grace");
+    };
+    assert_eq!(error, SessionError::ProbeTimeout);
+}
+
+#[test]
+fn small_messages_never_extend_the_grace() {
+    let mut h = Harness::new();
+    h.session.send(QueryId(1), query_body(1), QueryOptions::default(), h.now);
+    let packet = h.flush().expect("packet");
+    h.answer_pings(&packet);
+    assert!(!h.session.is_transmitting(h.now));
+}
+
+#[test]
+fn a_quick_ack_for_the_last_part_keeps_the_connection_until_its_answer() {
+    let mut h = Harness::new();
+    answer_probe(&mut h);
+    let (msg_id, transmit) = send_large(&mut h, 1, 64 * 1024);
+    for _ in 0..20 {
+        h.advance(1.0);
+        assert!(h.session.handle_timeout(h.now).is_ok());
+    }
+    assert!(h.session.handle_quick_ack(transmit.quick_ack_token.expect("requested"), h.now));
+    assert!(!h.session.is_transmitting(h.now));
+    for _ in 0..4 {
+        while h.session.poll_transmit(h.now, &mut h.rng).is_some() {}
+        h.advance(1.0);
+        assert!(h.session.handle_timeout(h.now).is_ok(), "the server has the part; its answer is on the way");
+    }
+    h.deliver(vec![Outgoing::Content(rpc_result(msg_id, &[1, 2, 3, 4]))]).unwrap();
+    assert_eq!(h.results(), vec![(QueryId(1), vec![1, 2, 3, 4])]);
+    assert!(!h.session.handle_quick_ack(transmit.quick_ack_token.unwrap(), h.now), "a token counts once");
+}
+
+#[test]
+fn a_part_slower_than_its_grace_stretches_it_instead_of_timing_out() {
+    let mut h = Harness::new();
+    answer_probe(&mut h);
+    let (msg_id, _) = send_large(&mut h, 1, 128 * 1024);
+    let first = h.session.transmit_grace_until() - h.now.mono;
+    for _ in 0..43 {
+        h.advance(1.0);
+        assert!(h.session.handle_timeout(h.now).is_ok(), "a 3 KB/s share of the uplink is slow, not dead");
+    }
+    assert!(h.session.transmit_grace_until() - h.now.mono > 0.0);
+    assert!(
+        h.session.uplink_rate().is_some_and(|rate| rate < 4096.0),
+        "{:?} after {first:.0} s",
+        h.session.uplink_rate()
+    );
+    h.deliver(vec![Outgoing::Content(rpc_result(msg_id, &[1, 2, 3, 4]))]).unwrap();
+    assert_eq!(h.results(), vec![(QueryId(1), vec![1, 2, 3, 4])]);
+}
+
+#[test]
+fn a_reopened_connection_gets_time_for_its_first_round_trip() {
+    let mut h = Harness::new();
+    h.session.send(QueryId(1), query_body(1), QueryOptions::default(), h.now);
+    let packet = h.flush().expect("packet");
+    h.advance(1.0);
+    h.answer_pings(&packet);
+    let query = h.sent_query(&packet, 1);
+    h.deliver(vec![Outgoing::Content(rpc_result(query, &[1, 2, 3, 4]))]).unwrap();
+    h.events();
+    let steady = h.session.probe_timeout();
+    assert!(steady < PROBE_TIMEOUT_INITIAL - 0.5, "a measured 1 s round trip probes after {steady:.2} s");
+
+    h.session.connection_closed();
+    h.session.connection_opened(h.now);
+    h.session.send(QueryId(10), query_body(10), QueryOptions::default(), h.now);
+    h.flush_all();
+    let since = h.session.unanswered_ping_since().expect("a ping went out with the query");
+    let outcome = loop {
+        h.advance(0.1);
+        h.session.note_outbound_backlog(Some(0), h.now);
+        if let Err(error) = h.session.handle_timeout(h.now) {
+            break error;
+        }
+        assert!(h.now.mono - since < 10.0);
+    };
+    assert_eq!(outcome, SessionError::ProbeTimeout);
+    let cut = h.now.mono - since;
+    assert!(
+        (PROBE_TIMEOUT_INITIAL..=PROBE_TIMEOUT_INITIAL + 0.25).contains(&cut),
+        "the first round trip on a new connection is cut after {cut:.2} s"
+    );
+}
+
+#[test]
+fn fresh_connections_cut_silent_get_longer_each_time_and_learn_from_slow_first_answers() {
+    let mut h = Harness::new();
+    let mut cuts = Vec::new();
+    for _ in 0..3 {
+        h.session.send(QueryId(cuts.len() as u64 + 1), query_body(1), QueryOptions::default(), h.now);
+        h.flush_all();
+        let since = h.session.unanswered_ping_since().expect("a ping went out");
+        loop {
+            h.advance(0.1);
+            h.session.note_outbound_backlog(Some(0), h.now);
+            if h.session.handle_timeout(h.now).is_err() {
+                break;
+            }
+            assert!(h.now.mono - since < 40.0);
+        }
+        cuts.push(h.now.mono - since);
+        h.session.connection_closed();
+        h.session.connection_opened(h.now);
+    }
+    assert!(
+        cuts[1] > cuts[0] * 1.5 && cuts[2] > cuts[1] * 1.5,
+        "a link that never answers in time is given longer: {cuts:.1?}"
+    );
+
+    let mut h = Harness::new();
+    h.session.send(QueryId(1), query_body(1), QueryOptions::default(), h.now);
+    let packet = h.flush().expect("packet");
+    h.advance(6.0);
+    h.answer_pings(&packet);
+    h.session.connection_closed();
+    h.session.connection_opened(h.now);
+    h.session.send(QueryId(2), query_body(2), QueryOptions::default(), h.now);
+    h.flush_all();
+    let since = h.session.unanswered_ping_since().expect("a ping went out");
+    for _ in 0..85 {
+        h.advance(0.1);
+        h.session.note_outbound_backlog(Some(0), h.now);
+        assert!(
+            h.session.handle_timeout(h.now).is_ok(),
+            "cut after {:.1} s though the last first answer took 6 s",
+            h.now.mono - since
+        );
+    }
+}
+
+#[test]
+fn a_dead_connection_on_a_fast_uplink_gets_no_stretched_grace() {
+    let mut h = Harness::new();
+    answer_probe(&mut h);
+    let (msg_id, _) = send_large(&mut h, 1, 64 * 1024);
+    h.advance(0.2);
+    h.deliver(vec![Outgoing::Content(rpc_result(msg_id, &[1, 2, 3, 4]))]).unwrap();
+    assert!(h.session.uplink_rate().is_some_and(|rate| rate > 100.0 * 1024.0));
+    send_large(&mut h, 2, 16 * 1024);
+    let started = h.now.mono;
+    let failed_at = loop {
+        while h.session.poll_transmit(h.now, &mut h.rng).is_some() {}
+        h.advance(0.5);
+        if h.session.handle_timeout(h.now).is_err() {
+            break h.now.mono;
+        }
+        assert!(h.now.mono - started < 30.0, "never noticed");
+    };
+    assert!(failed_at - started < 9.0, "a 16 KB part on a 300 KB/s uplink was waited for {} s", failed_at - started);
+}
+
+#[test]
+fn an_uplink_that_dropped_far_below_its_peak_costs_one_cut_not_a_loop() {
+    let mut h = Harness::new();
+    answer_probe(&mut h);
+    let (msg_id, _) = send_large(&mut h, 1, 512 * 1024);
+    h.advance(0.25);
+    h.deliver(vec![Outgoing::Content(rpc_result(msg_id, &[1, 2, 3, 4]))]).unwrap();
+    assert!(h.session.uplink_rate().is_some_and(|rate| rate > 1_000_000.0));
+    let (part, _) = send_large(&mut h, 2, 512 * 1024);
+    let started = h.now.mono;
+    let cut = loop {
+        while h.session.poll_transmit(h.now, &mut h.rng).is_some() {}
+        h.session.note_outbound_backlog(Some(0), h.now);
+        h.advance(0.1);
+        if h.session.handle_timeout(h.now).is_err() {
+            break h.now.mono - started;
+        }
+        assert!(h.now.mono - started < 4.0, "the first cut is expected: a dead connection looks the same");
+    };
+    assert!(cut < 4.0, "{cut}");
+    h.session.connection_closed();
+    h.session.connection_opened(h.now);
+    answer_probe(&mut h);
+    let resent = h.now.mono;
+    while h.now.mono - resent < 4.0 {
+        while h.session.poll_transmit(h.now, &mut h.rng).is_some() {}
+        h.session.note_outbound_backlog(Some(0), h.now);
+        h.advance(0.1);
+        assert!(h.session.handle_timeout(h.now).is_ok(), "cut again {:.1} s into the resent part", h.now.mono - resent);
+    }
+    h.deliver(vec![Outgoing::Content(rpc_result(part, &[1, 2, 3, 4]))]).unwrap();
+    assert!(h.results().iter().any(|(id, _)| *id == QueryId(2)));
+}
+
+#[test]
+fn a_slow_first_answer_raises_the_fresh_allowance_only_so_far() {
+    let mut h = Harness::new();
+    h.session.send(QueryId(1), query_body(1), QueryOptions::default(), h.now);
+    let packet = h.flush().expect("packet");
+    h.advance(30.0);
+    h.answer_pings(&packet);
+    h.session.connection_closed();
+    h.session.connection_opened(h.now);
+    h.session.send(QueryId(2), query_body(2), QueryOptions::default(), h.now);
+    h.flush_all();
+    let since = h.session.unanswered_ping_since().expect("a ping went out");
+    let cut = loop {
+        h.advance(0.1);
+        h.session.note_outbound_backlog(Some(0), h.now);
+        if h.session.handle_timeout(h.now).is_err() {
+            break h.now.mono - since;
+        }
+        assert!(h.now.mono - since < 60.0);
+    };
+    assert!(cut <= FRESH_ALLOWANCE_MAX + 0.5, "a dead fresh connection was held {cut:.1} s");
+    h.session.forget_link_measurements();
+    h.session.connection_closed();
+    h.session.connection_opened(h.now);
+    h.session.send(QueryId(3), query_body(3), QueryOptions::default(), h.now);
+    h.flush_all();
+    let since = h.session.unanswered_ping_since().expect("a ping went out");
+    let cut = loop {
+        h.advance(0.1);
+        h.session.note_outbound_backlog(Some(0), h.now);
+        if h.session.handle_timeout(h.now).is_err() {
+            break h.now.mono - since;
+        }
+        assert!(h.now.mono - since < 60.0);
+    };
+    let probe = h.session.probe_timeout().max(PROBE_TIMEOUT_INITIAL);
+    assert!(cut <= probe + 0.5, "a new network starts from scratch: {cut:.1} s against a {probe:.1} s probe");
+}
+
+fn measure_fast_uplink(h: &mut Harness) {
+    let (msg_id, _) = send_large(h, 1, 512 * 1024);
+    h.advance(0.25);
+    h.deliver(vec![Outgoing::Content(rpc_result(msg_id, &[1, 2, 3, 4]))]).unwrap();
+    assert!(h.session.uplink_rate().is_some_and(|rate| rate > 1_000_000.0));
+}
+
+fn time_to_cut(h: &mut Harness, limit: f64) -> Option<f64> {
+    let started = h.now.mono;
+    while h.now.mono - started < limit {
+        while h.session.poll_transmit(h.now, &mut h.rng).is_some() {}
+        h.session.note_outbound_backlog(Some(0), h.now);
+        h.advance(0.1);
+        if h.session.handle_timeout(h.now).is_err() {
+            return Some(h.now.mono - started);
+        }
+    }
+    None
+}
+
+#[test]
+fn after_one_forgiven_cut_a_dead_connection_is_still_noticed_quickly() {
+    let mut h = Harness::new();
+    answer_probe(&mut h);
+    measure_fast_uplink(&mut h);
+    send_large(&mut h, 2, 512 * 1024);
+    assert!(time_to_cut(&mut h, 4.0).is_some());
+    h.session.connection_closed();
+    h.session.connection_opened(h.now);
+    answer_probe(&mut h);
+    let cut = time_to_cut(&mut h, 130.0).expect("noticed");
+    assert!(cut < 20.0, "the second dead connection was held {cut:.1} s");
+}
+
+#[test]
+fn a_cut_that_does_not_close_the_connection_keeps_the_peak() {
+    let mut h = Harness::new();
+    answer_probe(&mut h);
+    measure_fast_uplink(&mut h);
+    let peak_cut = {
+        send_large(&mut h, 2, 512 * 1024);
+        time_to_cut(&mut h, 4.0).expect("cut")
+    };
+    assert!(peak_cut < 4.0);
+    h.deliver(vec![Outgoing::Content(update(0x0bad_cafe, &[0; 4]))]).unwrap();
+    h.session.connection_closed();
+    h.session.connection_opened(h.now);
+    answer_probe(&mut h);
+    let cut = time_to_cut(&mut h, 130.0).expect("noticed");
+    assert!(cut < 4.0, "the connection answered after the cut, so the uplink was not slow: cut after {cut:.1} s");
+}
+
+#[test]
+fn a_deep_uplink_drop_costs_the_resent_part_one_cut() {
+    for slowdown in [16.0, 32.0, 64.0] {
+        let mut h = Harness::new();
+        answer_probe(&mut h);
+        measure_fast_uplink(&mut h);
+        let rate = h.session.uplink_rate().expect("measured");
+        let transfer = 512.0 * 1024.0 / (rate / slowdown);
+        let (part, _) = send_large(&mut h, 2, 512 * 1024);
+        assert!(time_to_cut(&mut h, transfer).is_some(), "the first cut is expected");
+        h.session.connection_closed();
+        h.session.connection_opened(h.now);
+        answer_probe(&mut h);
+        let resent = h.now.mono;
+        while h.now.mono - resent < transfer {
+            while h.session.poll_transmit(h.now, &mut h.rng).is_some() {}
+            h.session.note_outbound_backlog(Some(0), h.now);
+            h.advance(0.1);
+            assert!(
+                h.session.handle_timeout(h.now).is_ok(),
+                "×{slowdown}: cut again {:.1} s into a {transfer:.1} s resend",
+                h.now.mono - resent
+            );
+        }
+        h.deliver(vec![Outgoing::Content(rpc_result(part, &[1, 2, 3, 4]))]).unwrap();
+    }
+}
+
+#[test]
+fn a_small_packet_cut_says_nothing_about_the_uplink() {
+    let mut h = Harness::new();
+    answer_probe(&mut h);
+    measure_fast_uplink(&mut h);
+    let (small, _) = send_large(&mut h, 2, 8 * 1024);
+    assert!(time_to_cut(&mut h, 30.0).is_some());
+    h.session.connection_closed();
+    h.session.connection_opened(h.now);
+    answer_probe(&mut h);
+    h.advance(0.002);
+    let resent = h.session.poll_transmit(h.now, &mut h.rng).expect("the small packet is resent");
+    assert!(h.session.handle_quick_ack(resent.quick_ack_token.expect("large enough for a quick ack"), h.now));
+    h.deliver(vec![Outgoing::Content(rpc_result(small, &[1, 2, 3, 4]))]).unwrap();
+    send_large(&mut h, 3, 512 * 1024);
+    let cut = time_to_cut(&mut h, 130.0).expect("noticed");
+    assert!(cut < 5.0, "a dead connection carrying a part on a fast uplink was held {cut:.1} s");
+}
+
+fn dead_connection_after_a_cut(h: &mut Harness, tag: u32) -> f64 {
+    h.session.connection_closed();
+    h.session.connection_opened(h.now);
+    answer_probe(h);
+    while h.session.poll_transmit(h.now, &mut h.rng).is_some() {}
+    send_large(h, tag, 512 * 1024);
+    time_to_cut(h, 130.0).expect("noticed")
+}
+
+#[test]
+fn a_run_of_dead_upload_connections_is_noticed_ever_later_but_bounded() {
+    let mut h = Harness::new();
+    answer_probe(&mut h);
+    measure_fast_uplink(&mut h);
+    send_large(&mut h, 2, 512 * 1024);
+    let first = time_to_cut(&mut h, 30.0).expect("noticed");
+    let second = dead_connection_after_a_cut(&mut h, 3);
+    let third = dead_connection_after_a_cut(&mut h, 4);
+    assert!(first < 4.0 && second < 20.0 && third < 45.0, "cuts after {first:.1}, {second:.1}, {third:.1} s");
+}
+
+#[test]
+fn a_lowered_peak_lapses() {
+    let mut h = Harness::new();
+    answer_probe(&mut h);
+    measure_fast_uplink(&mut h);
+    send_large(&mut h, 2, 512 * 1024);
+    assert!(time_to_cut(&mut h, 30.0).is_some());
+    h.session.connection_closed();
+    h.advance(PEAK_LOWERING_LIFETIME + 10.0);
+    h.session.connection_opened(h.now);
+    answer_probe(&mut h);
+    let resent = h.session.poll_transmit(h.now, &mut h.rng).expect("the part is resent");
+    assert!(h.session.handle_quick_ack(resent.quick_ack_token.expect("quick ack"), h.now));
+    send_large(&mut h, 3, 512 * 1024);
+    let cut = time_to_cut(&mut h, 130.0).expect("noticed");
+    assert!(cut < 5.0, "a dead connection {PEAK_LOWERING_LIFETIME} s after a cut was held {cut:.1} s");
+}
+
+#[test]
+fn a_fast_delivery_after_a_cut_restores_the_peak() {
+    let mut h = Harness::new();
+    answer_probe(&mut h);
+    measure_fast_uplink(&mut h);
+    send_large(&mut h, 2, 512 * 1024);
+    assert!(time_to_cut(&mut h, 30.0).is_some());
+    h.session.connection_closed();
+    h.session.connection_opened(h.now);
+    answer_probe(&mut h);
+    let resent = h.session.poll_transmit(h.now, &mut h.rng).expect("the part is resent");
+    h.advance(0.25);
+    assert!(h.session.handle_quick_ack(resent.quick_ack_token.expect("quick ack"), h.now), "it arrives at full speed");
+    send_large(&mut h, 3, 512 * 1024);
+    let cut = time_to_cut(&mut h, 130.0).expect("noticed");
+    assert!(cut < 5.0, "the link proved fast again, yet a dead connection was held {cut:.1} s");
+}
+
+#[test]
+fn a_run_of_dead_upload_connections_leaves_no_slow_rate_behind() {
+    let mut h = Harness::new();
+    answer_probe(&mut h);
+    measure_fast_uplink(&mut h);
+    send_large(&mut h, 2, 512 * 1024);
+    assert!(time_to_cut(&mut h, 30.0).is_some());
+    for tag in 3..=4 {
+        dead_connection_after_a_cut(&mut h, tag);
+    }
+    h.session.connection_closed();
+    h.advance(PEAK_LOWERING_LIFETIME + 10.0);
+    h.session.connection_opened(h.now);
+    answer_probe(&mut h);
+    while let Some(resent) = h.session.poll_transmit(h.now, &mut h.rng) {
+        if let Some(token) = resent.quick_ack_token {
+            h.session.handle_quick_ack(token, h.now);
+        }
+    }
+    send_large(&mut h, 5, 512 * 1024);
+    let cut = time_to_cut(&mut h, 130.0).expect("noticed");
+    assert!(cut < 5.0, "after three dead connections and a pause a dead one was held {cut:.1} s");
+}
+
+#[test]
+fn a_large_answer_is_acknowledged_with_the_request_it_prompts() {
+    let mut h = Harness::new();
+    h.sync();
+    h.session.send(QueryId(1), query_body(1), QueryOptions::default(), h.now);
+    let packet = h.flush().unwrap();
+    let part = h.sent_query(&packet, 1);
+    h.flush_all();
+    h.deliver(vec![Outgoing::Content(rpc_result(part, &vec![7u8; IMMEDIATE_ACK_SIZE]))]).unwrap();
+    assert!(h.flush_all().is_empty(), "the acknowledgement waits a moment for company");
+    h.session.send(QueryId(2), query_body(2), QueryOptions::default(), h.now);
+    let packets = h.flush_all();
+    assert_eq!(packets.len(), 1, "the next part's request and the acknowledgement share a packet");
+    assert!(packets[0].find(ids::MSGS_ACK).is_some());
+    h.sent_query(&packets[0], 2);
+}
+
+fn pings_while_reading(online: bool) -> (usize, f64) {
+    let mut h = Harness::new();
+    h.sync();
+    h.session.set_online(online, h.now);
+    let mut pings = 0;
+    for _ in 0..200 {
+        h.advance(0.1);
+        h.session.note_bytes_received(h.now);
+        while let Some(transmit) = h.session.poll_transmit(h.now, &mut h.rng) {
+            let packet = h.server.decode(&transmit.data);
+            pings += usize::from(packet.find(ids::PING_DELAY_DISCONNECT).is_some());
+        }
+        assert!(h.session.handle_timeout(h.now).is_ok());
+    }
+    (pings, (h.session.ping_disconnect_delay() + 2.0) / 2.0)
+}
+
+#[test]
+fn a_session_receiving_answers_pings_no_more_than_the_server_needs() {
+    let (pings, interval) = pings_while_reading(false);
+    assert!(pings <= (20.0 / interval).ceil() as usize + 1, "{pings} pings in 20 s while answers kept arriving");
+    let (online, _) = pings_while_reading(true);
+    assert!(online >= 8, "the online main session keeps its round-trip cadence: {online} pings in 20 s");
+}
+
+#[test]
+fn the_server_hears_a_ping_within_the_delay_it_was_given_when_the_round_trip_grows() {
+    let mut h = Harness::new();
+    h.sync();
+    h.session.set_online(true, h.now);
+    let mut held: Vec<(i64, i64)> = Vec::new();
+    let mut last: Option<(f64, f64)> = None;
+    let mut worst = f64::INFINITY;
+    for step in 0..600 {
+        h.advance(0.05);
+        h.session.note_bytes_received(h.now);
+        if step == 300 {
+            let pongs: Vec<Outgoing> =
+                held.drain(..).map(|(msg_id, ping_id)| Outgoing::Service(pong(msg_id, ping_id))).collect();
+            h.deliver(pongs).unwrap();
+        }
+        while let Some(transmit) = h.session.poll_transmit(h.now, &mut h.rng) {
+            let packet = h.server.decode(&transmit.data);
+            for message in packet.messages.iter().filter(|message| message.constructor() == ids::PING_DELAY_DISCONNECT)
+            {
+                let ping_id = i64::from_le_bytes(message.body[4..12].try_into().unwrap());
+                let given = f64::from(i32::from_le_bytes(message.body[12..16].try_into().unwrap()));
+                if let Some((at, before)) = last {
+                    worst = worst.min(at + before - h.now.mono);
+                }
+                last = Some((h.now.mono, given));
+                if step < 300 {
+                    held.push((message.msg_id, ping_id));
+                }
+            }
+        }
+        assert!(h.session.handle_timeout(h.now).is_ok());
+    }
+    assert!(worst > 0.0, "a ping went out {:.2} s after the delay the last one gave the server ran out", -worst);
+}
+
+mod wakeups {
+    use super::*;
+    use proptest::prelude::*;
+
+    #[derive(Debug, Clone)]
+    enum Step {
+        Wait(u16),
+        Read,
+        Query { large: bool },
+        Cancel(u8),
+        Online(bool),
+        Path { up: u8, down: u8 },
+        Backlog(Option<u16>),
+        Hold(u8),
+        Warp,
+        Reconnect,
+        Gap(u8),
+        Blackhole(u8),
+        UplinkQueue(u8),
+        NetworkChange,
+    }
+
+    fn step() -> impl Strategy<Value = Step> {
+        prop_oneof![
+            6 => (1u16..400).prop_map(Step::Wait),
+            2 => Just(Step::Read),
+            2 => any::<bool>().prop_map(|large| Step::Query { large }),
+            1 => any::<u8>().prop_map(Step::Cancel),
+            1 => any::<bool>().prop_map(Step::Online),
+            2 => (0u8..100, 0u8..255).prop_map(|(up, down)| Step::Path { up, down }),
+            1 => proptest::option::of(0u16..512).prop_map(Step::Backlog),
+            1 => (0u8..40).prop_map(Step::Hold),
+            2 => Just(Step::Warp),
+            1 => Just(Step::Reconnect),
+            1 => (1u8..30).prop_map(Step::Gap),
+            1 => (1u8..60).prop_map(Step::Blackhole),
+            1 => (0u8..20).prop_map(Step::UplinkQueue),
+            1 => Just(Step::NetworkChange),
+        ]
+    }
+
+    enum Reply {
+        Pong(i64, i64),
+        Answer(i64, usize),
+        QuickAck(u32),
+        Stale(i64),
+    }
+
+    /// A server behind a path whose delays change: it answers every ping and query, in order, after
+    /// the uplink and downlink delays the path has when the packet goes out. A blackhole holds what
+    /// goes out until it ends, as TCP keeps resending it. After a clock warp it refuses every packet
+    /// of the session with bad_msg 17 (msg_id too high), pings included, until the session resets.
+    struct World {
+        h: Harness,
+        replies: Vec<(f64, i64, Reply)>,
+        last_reply_at: f64,
+        up: f64,
+        down: f64,
+        backlog: Option<usize>,
+        tag: u32,
+        live: Vec<u32>,
+        warped: Option<i64>,
+        drain: Option<(f64, f64)>,
+        idle_wakes: Vec<f64>,
+        last_ping: Option<(f64, f64)>,
+        late_ping: Option<String>,
+        blackhole_until: f64,
+    }
+
+    impl World {
+        fn new() -> Self {
+            let mut h = Harness::new();
+            h.sync();
+            let now = h.now.mono;
+            Self {
+                h,
+                replies: Vec::new(),
+                last_reply_at: now,
+                up: 0.05,
+                down: 0.05,
+                backlog: Some(0),
+                tag: 0,
+                live: Vec::new(),
+                warped: None,
+                drain: None,
+                idle_wakes: Vec::new(),
+                last_ping: None,
+                late_ping: None,
+                blackhole_until: 0.0,
+            }
+        }
+
+        fn disconnect(&mut self) {
+            self.h.session.connection_closed();
+            self.replies.clear();
+            self.last_ping = None;
+        }
+
+        fn reconnect(&mut self) {
+            self.disconnect();
+            self.h.session.connection_opened(self.h.now);
+        }
+
+        fn schedule(&mut self, at: f64, reply: Reply) {
+            let at = at.max(self.last_reply_at);
+            self.last_reply_at = at;
+            self.replies.push((at, self.h.server.session_id, reply));
+        }
+
+        fn deliver_due(&mut self) -> bool {
+            let now = self.h.now.mono;
+            let mut delivered = false;
+            while let Some(position) = self.replies.iter().position(|(at, _, _)| *at <= now) {
+                let (_, session, reply) = self.replies.remove(position);
+                delivered = true;
+                self.h.server.session_id = session;
+                let result = match reply {
+                    Reply::Pong(msg_id, ping_id) => self.h.deliver(vec![Outgoing::Service(pong(msg_id, ping_id))]),
+                    Reply::Answer(msg_id, size) => {
+                        self.h.deliver(vec![Outgoing::Content(rpc_result(msg_id, &vec![7u8; size]))])
+                    }
+                    Reply::QuickAck(token) => {
+                        self.h.session.handle_quick_ack(token, self.h.now);
+                        Ok(())
+                    }
+                    Reply::Stale(msg_id) => {
+                        self.h.deliver(vec![Outgoing::Service(bad_msg_notification(msg_id, 1, 17))])
+                    }
+                };
+                self.h.events();
+                if result.is_err() && result != Err(SessionError::ForeignSession) {
+                    self.reconnect();
+                    break;
+                }
+            }
+            delivered
+        }
+
+        fn sample_backlog(&mut self) {
+            if self.h.session.wants_outbound_backlog() {
+                self.h.session.note_outbound_backlog(self.backlog, self.h.now);
+            }
+        }
+
+        /// What the runtime does on every wake-up. Returns whether anything went out.
+        fn wake(&mut self) -> bool {
+            self.sample_backlog();
+            if self.h.session.handle_timeout(self.h.now).is_err() {
+                self.reconnect();
+            }
+            let mut sent = false;
+            for _ in 0..64 {
+                let Some(transmit) = self.h.session.poll_transmit(self.h.now, &mut self.h.rng) else {
+                    break;
+                };
+                sent = true;
+                let t = self.h.now.mono;
+                let packet = self.h.server.decode(&transmit.data);
+                let back = t.max(self.blackhole_until) + self.up + self.down;
+                if self.warped.is_some_and(|session| session != packet.header.session_id) {
+                    self.warped = None;
+                }
+                if self.warped == Some(packet.header.session_id) {
+                    self.last_ping = None;
+                    self.schedule(back, Reply::Stale(packet.header.msg_id));
+                    continue;
+                }
+                if let Some(token) = transmit.quick_ack_token {
+                    self.schedule(back, Reply::QuickAck(token));
+                }
+                for message in &packet.messages {
+                    let constructor = message.constructor();
+                    if constructor == ids::PING_DELAY_DISCONNECT || constructor == ids::PING {
+                        let ping_id = i64::from_le_bytes(message.body[4..12].try_into().unwrap());
+                        if constructor == ids::PING_DELAY_DISCONNECT {
+                            let delay = f64::from(i32::from_le_bytes(message.body[12..16].try_into().unwrap()));
+                            if let Some((at, given)) = self.last_ping
+                                && t - at > given
+                            {
+                                self.late_ping.get_or_insert(format!(
+                                    "a ping {:.2} s after the previous one, which gave the server {given} s",
+                                    t - at
+                                ));
+                            }
+                            self.last_ping = Some((t, delay));
+                        }
+                        self.schedule(back, Reply::Pong(message.msg_id, ping_id));
+                    } else if let Some(tag) = query_tag(&message.body) {
+                        let size = if tag % 3 == 0 { 64 * 1024 } else { 256 };
+                        self.schedule(back + 0.02, Reply::Answer(message.msg_id, size));
+                    }
+                }
+            }
+            self.h.events();
+            self.sample_backlog();
+            sent
+        }
+
+        fn check(&mut self) -> Result<(), TestCaseError> {
+            let now = self.h.now.mono;
+            if let Some(at) = self.h.session.poll_timeout(self.h.now) {
+                prop_assert!(at >= now, "asks to wake {:.3} s in the past with nothing to do", now - at);
+            }
+            prop_assert!(self.late_ping.is_none(), "{}", self.late_ping.as_deref().unwrap_or_default());
+            if let Some(end) = self.h.session.drain_reset_at {
+                prop_assert!(end >= now, "a drain {:.3} s past its end", now - end);
+                let start = match self.drain {
+                    Some((start, seen)) if seen == end => start,
+                    _ => now,
+                };
+                self.drain = Some((start, end));
+                prop_assert!(end - start <= RESET_DRAIN_MAX + 1e-6, "a drain of {:.3} s", end - start);
+            }
+            let storm = self.idle_wakes.iter().rev().take_while(|at| now - **at < 1.0).count();
+            prop_assert!(storm < 100, "{storm} idle wake-ups within a second");
+            Ok(())
+        }
+
+        fn run_for(&mut self, seconds: f64) -> Result<(), TestCaseError> {
+            let until = self.h.now.mono + seconds;
+            while self.h.now.mono < until {
+                let next_reply = self.replies.iter().map(|(at, _, _)| *at).fold(f64::INFINITY, f64::min);
+                let timer = self.h.session.poll_timeout(self.h.now).unwrap_or(f64::INFINITY);
+                let next = timer.min(next_reply).min(until).max(self.h.now.mono + 0.001);
+                self.h.advance(next - self.h.now.mono);
+                let delivered = self.deliver_due();
+                let sent = self.wake();
+                if !delivered && !sent {
+                    self.idle_wakes.push(self.h.now.mono);
+                }
+                self.check()?;
+            }
+            Ok(())
+        }
+
+        fn apply(&mut self, step: &Step) -> Result<(), TestCaseError> {
+            match *step {
+                Step::Wait(centis) => return self.run_for(f64::from(centis) * 0.01),
+                Step::Read => self.h.session.note_bytes_received(self.h.now),
+                Step::Query { large } => {
+                    self.tag += 1;
+                    let body = if large { large_query_body(self.tag, 32 * 1024) } else { query_body(self.tag) };
+                    self.h.session.send(QueryId(u64::from(self.tag)), body, QueryOptions::default(), self.h.now);
+                    self.live.push(self.tag);
+                }
+                Step::Cancel(index) => {
+                    if !self.live.is_empty() {
+                        let tag = self.live.remove(usize::from(index) % self.live.len());
+                        if let CancelOutcome::RemovedInFlight { msg_id } =
+                            self.h.session.cancel(QueryId(u64::from(tag)))
+                        {
+                            self.h.session.drop_answer(msg_id, self.h.now);
+                        }
+                    }
+                }
+                Step::Online(online) => self.h.session.set_online(online, self.h.now),
+                Step::Path { up, down } => {
+                    self.up = 0.05 + f64::from(up) * 0.1;
+                    self.down = 0.05 + f64::from(down) * 0.12;
+                }
+                Step::Backlog(kilobytes) => self.backlog = kilobytes.map(|kb| usize::from(kb) * 1024),
+                Step::Hold(seconds) => {
+                    let at = if seconds == 0 { 0.0 } else { self.h.now.mono + f64::from(seconds) };
+                    self.h.session.hold_liveness_until(at);
+                }
+                Step::Warp => self.warped = Some(self.h.session.session_id()),
+                Step::Reconnect => self.reconnect(),
+                Step::Gap(seconds) => {
+                    self.disconnect();
+                    self.h.advance(f64::from(seconds));
+                    self.h.session.connection_opened(self.h.now);
+                }
+                Step::Blackhole(seconds) => self.blackhole_until = self.h.now.mono + f64::from(seconds),
+                Step::UplinkQueue(seconds) => self.h.session.set_uplink_queue(f64::from(seconds)),
+                Step::NetworkChange => {
+                    self.h.session.forget_link_measurements();
+                    self.reconnect();
+                }
+            }
+            self.deliver_due();
+            self.wake();
+            self.check()
+        }
+    }
+
+    fn play(main: bool, steps: &[Step]) -> Result<(), TestCaseError> {
+        let mut world = World::new();
+        world.h.session.config.is_main = main;
+        for step in steps {
+            world.apply(step)?;
+        }
+        world.run_for(120.0)
+    }
+
+    #[test]
+    fn a_round_trip_grown_past_the_ping_delay_neither_spins_nor_misses_the_server() -> Result<(), TestCaseError> {
+        play(true, &[Step::Path { up: 0, down: 33 }, Step::Online(true)])
+    }
+
+    #[test]
+    fn a_session_draining_before_a_reset_waits_for_the_drain() -> Result<(), TestCaseError> {
+        play(false, &[Step::Warp, Step::Reconnect, Step::Blackhole(1), Step::Query { large: false }, Step::Wait(1)])
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+        #[test]
+        fn a_session_never_asks_to_be_woken_with_nothing_to_do(main in any::<bool>(), steps in proptest::collection::vec(step(), 1..80)) {
+            play(main, &steps)?;
+        }
+    }
 }

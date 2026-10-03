@@ -132,7 +132,9 @@ fn main() {
         while let Some(incoming) = stream.next_incoming().unwrap() {
             match incoming {
                 Incoming::Packet(data) => client.handle_packet(&data, now(start), &mut rng).expect("packet"),
-                Incoming::QuickAck(token) => client.handle_quick_ack(token, now(start)),
+                Incoming::QuickAck(token) => {
+                    client.handle_quick_ack(token, now(start));
+                }
                 other => println!("transport {other:?}"),
             }
         }

@@ -42,6 +42,10 @@ pub const UNKNOWN_QUERIES_STUCK_AFTER: f64 = 60.0;
 pub const RETRANSMIT_WINDOW: f64 = MSG_ID_MAX_PAST_SECONDS - 60.0;
 pub const DROPPED_ANSWER_COUNTED_SIZE: usize = 16 * 1024;
 pub const IMMEDIATE_ACK_SIZE: usize = 16 * 1024;
+/// How long the acknowledgement of a large answer waits for something to ride with, usually the
+/// request for a download's next part: on a starved uplink a packet of its own costs as much as the
+/// request, and the server keeps unacknowledged answers far longer than this.
+pub const LARGE_ANSWER_ACK_DELAY: f64 = 1.0;
 pub const PROBE_TIMEOUT_MIN: f64 = 1.0;
 pub const PROBE_TIMEOUT_MAX: f64 = 8.0;
 pub const PROBE_TIMEOUT_INITIAL: f64 = 4.0;
@@ -57,7 +61,27 @@ pub const MAX_SERVER_RESENDS: u32 = 8;
 pub const TRANSMIT_GRACE_MIN_SIZE: usize = 4 * 1024;
 pub const RESET_DRAIN_MIN: f64 = 1.0;
 pub const RESET_DRAIN_MAX: f64 = 5.0;
-pub const TRANSMIT_GRACE_RATE: f64 = 8.0 * 1024.0;
+/// The uplink rate a large message is assumed to leave at until the session has measured one.
+/// Below EDGE and GPRS uplinks: a wrong guess only delays noticing a dead connection.
+pub const TRANSMIT_GRACE_RATE_INITIAL: f64 = 4.0 * 1024.0;
+/// The slowest uplink rate the grace assumes, whatever was measured.
+pub const TRANSMIT_GRACE_RATE_MIN: f64 = 2.0 * 1024.0;
+/// The longest one large packet keeps the liveness checks waiting for the server to receive it.
+pub const TRANSMIT_GRACE_MAX: f64 = 120.0;
+/// A packet this large is an upload part rather than a container of calls.
+pub const UPLOAD_PACKET_MIN: usize = 16 * 1024;
+/// The longest a connection that has not answered yet is given before its liveness checks cut it.
+pub const FRESH_ALLOWANCE_MAX: f64 = 16.0;
+/// An uplink this many times slower than the best measured lately is more likely a dead connection
+/// than a shared or degraded link, so an expired grace is not stretched that far.
+pub const STRETCH_MAX_SLOWDOWN: f64 = 8.0;
+/// How long a lowering of the uplink peak after a cut holds, unless another cut renews it.
+pub const PEAK_LOWERING_LIFETIME: f64 = 120.0;
+/// Bytes an uplink rate sample must cover: smaller deliveries measure jitter, not the uplink.
+pub const UPLINK_SAMPLE_MIN_BYTES: u64 = 16 * 1024;
+/// How long the kernel may hold unsent bytes without the peer acknowledging any before the transmit
+/// grace stops covering for it. Receive windows open in bursts and weak links stall for seconds.
+pub const SEND_QUEUE_STUCK_AFTER: f64 = 10.0;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Now {
@@ -168,6 +192,26 @@ enum QueryState {
     Unknown,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PendingPing {
+    sent_at: f64,
+    packet_seq: u64,
+    /// The ping went out behind large packets the server had not received yet, so its round trip
+    /// measures their transfer rather than the network.
+    behind_large: bool,
+}
+
+/// A packet of at least `TRANSMIT_GRACE_MIN_SIZE` bytes the server has not yet shown to have received.
+#[derive(Debug, Clone, Copy)]
+struct LargePacket {
+    seq: u64,
+    bytes: usize,
+    sent_at: f64,
+    /// `Session::delivered` and `Session::delivered_at` when the packet was sent.
+    delivered: u64,
+    delivered_at: f64,
+}
+
 #[derive(Debug, Clone)]
 struct Query {
     body: Vec<u8>,
@@ -186,6 +230,9 @@ struct Query {
     server_resends: u32,
     may_have_arrived: bool,
     retransmit_refused: bool,
+    /// The packet that carried the query under its current msg_id on this connection. None once the
+    /// query is retransmitted, as its answer may then be for a transmission on an earlier connection.
+    arrival_seq: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -273,7 +320,7 @@ pub struct Session {
     pending: VecDeque<QueryId>,
     by_msg_id: HashMap<i64, QueryId>,
     containers: HashMap<i64, Vec<i64>>,
-    quick_acks: VecDeque<(u32, Vec<QueryId>)>,
+    quick_acks: VecDeque<(u32, Vec<QueryId>, u64)>,
 
     to_ack: Vec<i64>,
     to_resend_answer: Vec<i64>,
@@ -303,12 +350,24 @@ pub struct Session {
     rtt: f64,
     rtt_var: f64,
     rtt_peak: f64,
+    /// How long recent connections took to give their first answer, decaying like `rtt_peak`.
+    first_answer_peak: f64,
+    /// Connections in a row cut by a liveness check before they ever answered.
+    silent_cuts: u32,
+    /// How long other connections' uploads may hold up this connection's first exchange.
+    uplink_queue: f64,
+    /// The lowered peak and the time of the cut, applied when this connection closes: a liveness
+    /// check cut it while its grace was refused a stretch, see `note_refused_stretch`.
+    peak_after_close: Option<(f64, f64)>,
     last_read_at: f64,
     last_pong_at: f64,
     last_ping_at: Option<f64>,
+    /// The disconnect delay the last ping gave the server: it closes the connection unless the next
+    /// ping arrives within it.
+    last_ping_delay: f64,
     last_ping_msg_id: i64,
     last_ping_container_id: i64,
-    pending_pings: HashMap<i64, f64>,
+    pending_pings: HashMap<i64, PendingPing>,
     outbound_backlog: Option<usize>,
     outbound_progress_at: f64,
     backlog_sampled_at: f64,
@@ -318,6 +377,23 @@ pub struct Session {
     received_on_connection: bool,
     fresh_packets: u64,
     transmit_grace_until: f64,
+    /// Bytes per second large packets reached the server at.
+    uplink_rate: Option<f64>,
+    /// The fastest delivery measured lately, decaying with every sample.
+    uplink_rate_peak: Option<f64>,
+    /// A lower peak a refused stretch left behind, and when its cut came: see `note_refused_stretch`.
+    lowered_peak: Option<(f64, f64)>,
+    /// The rate before stretches on this connection pulled it down, given back if the connection is
+    /// cut and closed before delivering: a stretch that ended in a cut measured nothing.
+    rate_before_stretch: Option<Option<f64>>,
+    packet_seq: u64,
+    /// Large packets sent on this connection the server has not yet shown to have received, oldest first.
+    unconfirmed_large: VecDeque<LargePacket>,
+    /// Bytes of large packets the server has shown to have received, and when it last did.
+    delivered: u64,
+    delivered_at: f64,
+    /// The host keeps a silent connection while a fresh one races it, until then.
+    liveness_hold_until: f64,
     last_future_salts_at: Option<f64>,
     unknown_since: Option<f64>,
     dropped_answer_bytes: usize,
@@ -386,9 +462,14 @@ impl Session {
             rtt: 0.0,
             rtt_var: 0.0,
             rtt_peak: 0.0,
+            first_answer_peak: 0.0,
+            silent_cuts: 0,
+            uplink_queue: 0.0,
+            peak_after_close: None,
             last_read_at: now.mono,
             last_pong_at: now.mono,
             last_ping_at: None,
+            last_ping_delay: f64::INFINITY,
             last_ping_msg_id: 0,
             last_ping_container_id: 0,
             pending_pings: HashMap::new(),
@@ -401,6 +482,15 @@ impl Session {
             received_on_connection: false,
             fresh_packets: 0,
             transmit_grace_until: 0.0,
+            uplink_rate: None,
+            uplink_rate_peak: None,
+            lowered_peak: None,
+            rate_before_stretch: None,
+            packet_seq: 0,
+            unconfirmed_large: VecDeque::new(),
+            delivered: 0,
+            delivered_at: 0.0,
+            liveness_hold_until: 0.0,
             last_future_salts_at: None,
             unknown_since: None,
             dropped_answer_bytes: 0,
@@ -562,6 +652,125 @@ impl Session {
         (self.rtt > 0.0).then_some(self.rtt)
     }
 
+    /// The uplink rate the transmit grace assumes: half the measured rate, never below
+    /// `TRANSMIT_GRACE_RATE_MIN`. Behind carrier proxies, satellite accelerators and bufferbloat the
+    /// socket reports large packets sent long before they reach the server, and the server cannot
+    /// answer before they do, so silence is no sign of a dead connection until they could have.
+    pub fn transmit_grace_rate(&self) -> f64 {
+        self.uplink_rate.map_or(TRANSMIT_GRACE_RATE_INITIAL, |rate| (rate * 0.5).max(TRANSMIT_GRACE_RATE_MIN))
+    }
+
+    /// Until when the oldest large packet the server has not received may still be on its way. Only
+    /// a connection the server has answered on gets the grace: a silent fresh one may be blackholed.
+    pub fn transmit_grace_until(&self) -> f64 {
+        if self.received_on_connection { self.transmit_grace_until } else { 0.0 }
+    }
+
+    pub fn is_transmitting(&self, now: Now) -> bool {
+        now.mono < self.transmit_grace_until()
+    }
+
+    pub fn uplink_rate(&self) -> Option<f64> {
+        self.uplink_rate
+    }
+
+    /// The network changed: what was measured on the old one says nothing about the new one.
+    pub fn forget_link_measurements(&mut self) {
+        self.uplink_rate = None;
+        self.uplink_rate_peak = None;
+        self.lowered_peak = None;
+        self.peak_after_close = None;
+        self.rate_before_stretch = None;
+        self.first_answer_peak = 0.0;
+        self.silent_cuts = 0;
+    }
+
+    /// Bytes of upload-sized packets still crossing the uplink on a connection that answered and
+    /// is within its transmit grace: what other connections' packets may queue behind.
+    pub fn upload_backlog(&self, now: Now) -> u64 {
+        if !self.is_transmitting(now) {
+            return 0;
+        }
+        self.unconfirmed_large
+            .iter()
+            .filter(|packet| packet.bytes >= UPLOAD_PACKET_MIN)
+            .map(|packet| packet.bytes as u64)
+            .sum()
+    }
+
+    pub fn set_uplink_queue(&mut self, seconds: f64) {
+        self.uplink_queue = seconds.clamp(0.0, FRESH_ALLOWANCE_MAX);
+    }
+
+    /// No ping, read or probe timeout until `at`: the host races a fresh connection against this
+    /// silent one and drops whichever loses. 0 ends the hold.
+    pub fn hold_liveness_until(&mut self, at: f64) {
+        self.liveness_hold_until = at;
+    }
+
+    /// The server received packet `seq`. One connection is an ordered stream, so it received every
+    /// packet before it too. Each delivery is a rate sample: bytes delivered since a packet was sent
+    /// over the time since the delivery before it, which, unlike a round trip minus the smoothed
+    /// one, cannot run ahead of the link.
+    fn note_arrived(&mut self, seq: u64, now: Now) {
+        let mut sample = None;
+        while let Some(packet) = self.unconfirmed_large.front().copied().filter(|packet| packet.seq <= seq) {
+            self.unconfirmed_large.pop_front();
+            self.delivered += packet.bytes as u64;
+            let bytes = self.delivered - packet.delivered;
+            let elapsed = now.mono - packet.delivered_at;
+            if bytes >= UPLINK_SAMPLE_MIN_BYTES && elapsed > 0.0 {
+                sample = Some(bytes as f64 / elapsed);
+            }
+            self.delivered_at = now.mono;
+        }
+        if let Some(sample) = sample {
+            self.rate_before_stretch = None;
+            self.uplink_rate = Some(self.uplink_rate.map_or(sample, |rate| rate * 0.7 + sample.min(rate * 4.0) * 0.3));
+            self.uplink_rate_peak = Some(self.uplink_rate_peak.map_or(sample, |peak| sample.max(peak * 0.95)));
+            if self.lowered_peak.is_some_and(|(lowered, _)| sample > lowered) {
+                self.lowered_peak = None;
+            }
+        }
+        self.refresh_transmit_grace();
+    }
+
+    /// The oldest large packet outlived its grace and the connection is otherwise fine: the uplink is
+    /// slower than assumed, or shared with other uploads. It cannot be faster than what could have
+    /// crossed by now, so the grace stretches for the rest, up to `TRANSMIT_GRACE_MAX`, unless that is
+    /// far slower than the uplink measured lately.
+    fn stretch_expired_grace(&mut self, now: Now) {
+        let Some(packet) = self.unconfirmed_large.front().copied() else {
+            return;
+        };
+        if !self.received_on_connection || now.mono < self.transmit_grace_until {
+            return;
+        }
+        let elapsed = now.mono - packet.sent_at.max(self.delivered_at);
+        if elapsed <= 0.0 || elapsed >= TRANSMIT_GRACE_MAX {
+            return;
+        }
+        let bound = packet.bytes as f64 / elapsed;
+        if self.stretch_peak(now).is_some_and(|peak| bound < peak / STRETCH_MAX_SLOWDOWN) {
+            return;
+        }
+        if self.uplink_rate.is_none_or(|rate| rate > bound) {
+            self.rate_before_stretch.get_or_insert(self.uplink_rate);
+            self.uplink_rate = Some(bound.max(TRANSMIT_GRACE_RATE_MIN));
+            self.refresh_transmit_grace();
+        }
+    }
+
+    /// The oldest unconfirmed packet started crossing the bottleneck when it was sent or when the one
+    /// before it arrived, whichever came later; later packets queue behind it and get their grace as
+    /// it arrives, so a dead connection is noticed within one packet's time.
+    fn refresh_transmit_grace(&mut self) {
+        self.transmit_grace_until = self.unconfirmed_large.front().map_or(0.0, |packet| {
+            let transfer = packet.bytes as f64 / self.transmit_grace_rate() + self.rtt_estimate();
+            packet.sent_at.max(self.delivered_at) + transfer.min(TRANSMIT_GRACE_MAX)
+        });
+    }
+
     pub fn probe_timeout(&self) -> f64 {
         let base = if self.rtt == 0.0 {
             PROBE_TIMEOUT_INITIAL
@@ -573,7 +782,7 @@ impl Session {
     }
 
     pub fn unanswered_ping_since(&self) -> Option<f64> {
-        self.pending_pings.values().copied().filter(|sent| *sent >= self.last_read_at).reduce(f64::min)
+        self.pending_pings.values().map(|ping| ping.sent_at).filter(|sent| *sent >= self.last_read_at).reduce(f64::min)
     }
 
     pub fn wants_outbound_backlog(&self) -> bool {
@@ -601,10 +810,89 @@ impl Session {
         self.backlog_sampled_at = now.mono;
     }
 
+    /// The transmit grace holds the probe back while large packets may still be crossing the link,
+    /// but not while the kernel keeps bytes the peer has stopped acknowledging.
+    fn probe_held_until(&self, now: Now) -> f64 {
+        if now.mono < self.liveness_hold_until {
+            return self.liveness_hold_until;
+        }
+        if !self.is_transmitting(now) {
+            return 0.0;
+        }
+        let grace = self.transmit_grace_until();
+        if self.probe_drained { grace } else { grace.min(self.outbound_progress_at + SEND_QUEUE_STUCK_AFTER) }
+    }
+
+    /// How long a connection that has not answered yet is given before its liveness checks cut it:
+    /// its first round trip also carries the connection setup behind proxies and the resent backlog,
+    /// which the round-trip estimate of earlier connections does not cover. Half again as long as
+    /// recent connections took to answer, and twice as long after each one cut silent in a row, as a
+    /// link where no connection answers in time needs more of it.
+    fn fresh_allowance(&self) -> f64 {
+        (PROBE_TIMEOUT_INITIAL * f64::from(1u32 << self.silent_cuts.min(2)))
+            .max(self.first_answer_peak * 1.5)
+            .max(self.uplink_queue)
+            .min(FRESH_ALLOWANCE_MAX)
+    }
+
+    fn note_silent_cut(&mut self, now: Now) {
+        if !self.received_on_connection {
+            self.silent_cuts = self.silent_cuts.saturating_add(1);
+        }
+        self.note_refused_stretch(now);
+    }
+
+    /// The peak a stretch is measured against: the sampled one, or a lowered one while it holds.
+    fn stretch_peak(&self, now: Now) -> Option<f64> {
+        let peak = self.uplink_rate_peak?;
+        Some(match self.lowered_peak {
+            Some((lowered, at)) if now.mono - at < PEAK_LOWERING_LIFETIME => peak.min(lowered),
+            _ => peak,
+        })
+    }
+
+    /// A liveness check cut a connection that answered while its oldest packet, an upload part, was
+    /// refused a stretch, the uplink measured lately being far faster. If the connection then closes,
+    /// the peak comes down 4× for `PEAK_LOWERING_LIFETIME`, so that a drop of up to 32× costs the
+    /// resent part one cut. Behind a TCP-terminating hop nothing tells a slow live connection from a
+    /// dead one, so a run of dead connections pays for it: at a 2 MB/s peak with 512 KB parts they
+    /// are noticed after about 3, 16, 35 and 120 s, the cycle starting over once the lowering lapses;
+    /// on a direct path the stuck kernel queue still cuts them within about 12 s. A packet arriving on
+    /// the connection cancels the lowering, as does a delivery faster than the lowered peak, and only
+    /// the first cut of a connection counts.
+    fn note_refused_stretch(&mut self, now: Now) {
+        let Some(packet) = self.unconfirmed_large.front() else {
+            return;
+        };
+        let elapsed = now.mono - packet.sent_at.max(self.delivered_at);
+        if !self.received_on_connection
+            || elapsed <= 0.0
+            || packet.bytes < UPLOAD_PACKET_MIN
+            || self.peak_after_close.is_some()
+        {
+            return;
+        }
+        let bound = packet.bytes as f64 / elapsed;
+        if let Some(peak) = self.stretch_peak(now)
+            && bound < peak / STRETCH_MAX_SLOWDOWN
+        {
+            self.peak_after_close = Some((peak / 4.0, now.mono));
+        }
+    }
+
+    fn fresh_hold_until(&self) -> f64 {
+        if self.received_on_connection { 0.0 } else { self.connected_at + self.fresh_allowance() }
+    }
+
     fn probe_deadline(&self) -> Option<f64> {
         self.outbound_backlog?;
         let since = self.unanswered_ping_since()?;
-        Some(since.max(self.outbound_progress_at) + self.probe_timeout())
+        let timeout = if self.received_on_connection {
+            self.probe_timeout()
+        } else {
+            self.probe_timeout().max(self.fresh_allowance())
+        };
+        Some(since.max(self.outbound_progress_at) + timeout)
     }
 
     pub fn fresh_packets(&self) -> u64 {
@@ -723,6 +1011,7 @@ impl Session {
                 server_resends: 0,
                 may_have_arrived: false,
                 retransmit_refused: false,
+                arrival_seq: None,
             },
         );
         self.pending_queries += 1;
@@ -763,6 +1052,7 @@ impl Session {
         self.received_on_connection = false;
         self.connection_epoch += 1;
         self.connected_at = now.mono;
+        self.liveness_hold_until = 0.0;
         self.last_read_at = now.mono;
         self.last_pong_at = now.mono;
         self.last_ping_at = None;
@@ -833,6 +1123,15 @@ impl Session {
         self.probe_episode = None;
         self.probe_drained = false;
         self.transmit_grace_until = 0.0;
+        self.unconfirmed_large.clear();
+        self.liveness_hold_until = 0.0;
+        if let Some(lowered) = self.peak_after_close.take() {
+            self.lowered_peak = Some(lowered);
+            if let Some(rate) = self.rate_before_stretch {
+                self.uplink_rate = rate;
+            }
+        }
+        self.rate_before_stretch = None;
     }
 
     pub fn connection_rejected(&mut self, now: Now) {
@@ -968,8 +1267,8 @@ impl Session {
     }
 
     fn sent_at(&self, msg_id: i64) -> Option<f64> {
-        if let Some(sent_at) = self.pending_pings.get(&msg_id) {
-            return Some(*sent_at);
+        if let Some(ping) = self.pending_pings.get(&msg_id) {
+            return Some(ping.sent_at);
         }
         if let Some(request) = self.service_requests.get(&msg_id) {
             return Some(request.sent_at());
@@ -1151,14 +1450,22 @@ impl Session {
         }
     }
 
-    pub fn handle_quick_ack(&mut self, token: u32) {
+    /// True when the token is one of ours: only the server holding the key can have computed it, so
+    /// it shows the connection alive like any packet read.
+    pub fn handle_quick_ack(&mut self, token: u32, now: Now) -> bool {
         let token = token & 0x7fff_ffff;
-        if let Some(position) = self.quick_acks.iter().position(|(stored, _)| *stored == token) {
-            let (_, ids) = self.quick_acks.remove(position).expect("position is valid");
-            for id in ids {
-                self.mark_acknowledged(id);
-            }
+        let Some(position) = self.quick_acks.iter().position(|(stored, _, _)| *stored == token) else {
+            return false;
+        };
+        let (_, ids, seq) = self.quick_acks.remove(position).expect("position is valid");
+        for id in ids {
+            self.mark_acknowledged(id);
         }
+        if self.connected {
+            self.last_read_at = self.last_read_at.max(now.mono);
+        }
+        self.note_arrived(seq, now);
+        true
     }
 
     fn schedule_ack(&mut self, msg_id: i64, now: Now) {
@@ -1243,6 +1550,12 @@ impl Session {
             Mode::AckOnly => {}
         }
         if mode == Mode::Process {
+            if !self.received_on_connection {
+                let took = (now.mono - self.connected_at).max(0.0);
+                self.first_answer_peak = took.max(self.first_answer_peak * 0.9);
+                self.silent_cuts = 0;
+            }
+            self.peak_after_close = None;
             self.last_read_at = now.mono;
             self.last_pong_at = now.mono;
             self.received_on_connection = true;
@@ -1390,7 +1703,7 @@ impl Session {
         if seq_no & 1 == 1 {
             self.schedule_ack(msg_id, now);
             if body.len() >= IMMEDIATE_ACK_SIZE {
-                self.send_before(now.mono);
+                self.send_before(now.mono + LARGE_ANSWER_ACK_DELAY);
             }
         }
         if context.mode != Mode::AckOnly {
@@ -1641,19 +1954,22 @@ impl Session {
 
     fn on_pong(&mut self, context: &mut PacketContext, msg_id: i64, ping_msg_id: i64, ping_id: i64, now: Now) {
         self.last_pong_at = now.mono;
-        let sent_at = self.pending_pings.remove(&ping_msg_id).or_else(|| self.pending_pings.remove(&ping_id));
-        if let Some(sent_at) = sent_at {
+        let ping = self.pending_pings.remove(&ping_msg_id).or_else(|| self.pending_pings.remove(&ping_id));
+        if let Some(ping) = ping {
+            self.note_arrived(ping.packet_seq, now);
             if msg_id < ping_msg_id.wrapping_sub(RESPONSE_TIME_SKEW) {
                 self.reset_server_time(msg_id, now);
             }
-            let rtt = (now.mono - sent_at).max(0.0);
-            self.rtt_peak = rtt.max(self.rtt_peak * 0.9);
-            if self.rtt == 0.0 {
-                self.rtt = rtt;
-                self.rtt_var = rtt / 2.0;
-            } else {
-                self.rtt_var = self.rtt_var * 0.75 + (self.rtt - rtt).abs() * 0.25;
-                self.rtt = self.rtt * 0.7 + rtt * 0.3;
+            let rtt = (now.mono - ping.sent_at).max(0.0);
+            if !ping.behind_large {
+                self.rtt_peak = rtt.max(self.rtt_peak * 0.9);
+                if self.rtt == 0.0 {
+                    self.rtt = rtt;
+                    self.rtt_var = rtt / 2.0;
+                } else {
+                    self.rtt_var = self.rtt_var * 0.75 + (self.rtt - rtt).abs() * 0.25;
+                    self.rtt = self.rtt * 0.7 + rtt * 0.3;
+                }
             }
             if rtt < self.probe_timeout() {
                 self.probe_backoff = (self.probe_backoff * 0.5).max(1.0);
@@ -1700,6 +2016,14 @@ impl Session {
         };
         if msg_id < req_msg_id.wrapping_sub(RESPONSE_TIME_SKEW) {
             self.reset_server_time(msg_id, now);
+        }
+        if let Some(seq) = self
+            .queries
+            .get(&id)
+            .filter(|query| query.msg_id == req_msg_id && query.connection_epoch == self.connection_epoch)
+            .and_then(|query| query.arrival_seq)
+        {
+            self.note_arrived(seq, now);
         }
         let event = match tlm::parse_rpc_result_limited(result, context.budget.min(tlm::MAX_UNPACKED_SIZE)) {
             Ok(RpcResultBody::Error(error)) => {
@@ -1894,18 +2218,63 @@ impl Session {
         self.events.push_back(SessionEvent::SaltsUpdated { salts: self.salts.all() });
     }
 
+    /// A query the next packet would carry is large. A fresh connection then sends its first ping
+    /// alone ahead of it, so the pong shows the path works within a round trip instead of after the
+    /// transfer, and the grace cannot hide a blackholed connection.
+    fn large_query_waiting(&self) -> bool {
+        self.to_retransmit
+            .iter()
+            .chain(self.pending.iter())
+            .take(self.config.max_container_queries.max(1))
+            .any(|id| self.queries.get(id).is_some_and(|query| query.body.len() >= TRANSMIT_GRACE_MIN_SIZE))
+    }
+
+    /// Whether a ping may ride along with what goes out anyway. Except on the online main session,
+    /// while answers keep arriving only once a quarter of the disconnect delay the server was given
+    /// has passed: they show the connection alive, and on a starved uplink every byte counts. Never
+    /// later than half that delay, so a ping that is due always may go.
     fn may_ping(&self, now: Now) -> bool {
-        match self.last_ping_at {
-            None => true,
-            Some(at) => at + self.ping_may_delay() < now.mono,
-        }
+        let Some(at) = self.last_ping_at else {
+            return true;
+        };
+        let every = self.ping_may_delay().min(self.last_ping_delay / 2.0);
+        at + every < now.mono
+            && (!self.reads_excuse_pings()
+                || self.last_read_at + every < now.mono
+                || at + self.server_ping_interval() / 2.0 < now.mono)
+    }
+
+    /// Answers arriving stand in for pings, except on the online main session: its disconnect delay
+    /// is a few round trips, too short to leave room for a queue that builds up between two pings.
+    fn reads_excuse_pings(&self) -> bool {
+        !(self.online && self.config.is_main)
+    }
+
+    /// Half the disconnect delay the server was given with the last ping, or the one the next ping
+    /// would give if that is shorter.
+    fn server_ping_interval(&self) -> f64 {
+        let given = (self.ping_disconnect_delay() + 2.0).min(self.last_ping_delay);
+        (given / 2.0).max(self.ping_must_delay().min(self.last_ping_delay / 2.0))
     }
 
     fn must_ping(&self, now: Now) -> bool {
-        match self.last_ping_at {
-            None => true,
-            Some(at) => at + self.ping_must_delay() < now.mono,
+        self.ping_due_at().is_none_or(|at| at < now.mono)
+    }
+
+    /// When a ping of its own must go out: after the ping-must delay, and no later than half the
+    /// disconnect delay the server was given, after which the server would close the connection.
+    /// Except on the online main session, answers arriving show the connection alive without one, so
+    /// it also waits until reading has been quiet for the ping-may delay. None before the first ping.
+    fn ping_due_at(&self) -> Option<f64> {
+        let at = self.last_ping_at?;
+        let every = self.ping_must_delay();
+        let given = at + self.last_ping_delay / 2.0;
+        if !self.reads_excuse_pings() {
+            return Some((at + every).min(given));
         }
+        let quiet = (self.last_read_at + self.ping_may_delay()).max(at + every);
+        let server = at + self.server_ping_interval();
+        Some(quiet.min(server).min(given))
     }
 
     fn must_flush(&mut self, now: Now) -> bool {
@@ -1938,27 +2307,32 @@ impl Session {
         if !self.connected {
             return None;
         }
-        let mut deadline = f64::INFINITY;
+        let mut transmit = f64::INFINITY;
         let server_time = self.server_time(now);
         let has_salt = self.salts.has_valid_salt(server_time);
         if has_salt {
             if let Some(at) = self.force_send_at {
-                deadline = deadline.min(at);
+                transmit = transmit.min(at);
             }
             match self.last_ping_at {
-                Some(at) => deadline = deadline.min(at + self.ping_must_delay()),
-                None => deadline = deadline.min(now.mono),
+                Some(_) => transmit = transmit.min(self.ping_due_at().unwrap_or(now.mono)),
+                None => transmit = transmit.min(now.mono),
             }
         } else {
             match self.last_future_salts_at {
-                Some(at) => deadline = deadline.min(at + FUTURE_SALTS_RETRY),
-                None => deadline = deadline.min(now.mono),
+                Some(at) => transmit = transmit.min(at + FUTURE_SALTS_RETRY),
+                None => transmit = transmit.min(now.mono),
             }
         }
         if let Some(change) = self.salts.next_change_time() {
-            deadline = deadline.min(now.mono + (change - server_time).max(0.0));
+            transmit = transmit.min(now.mono + (change - server_time).max(0.0));
         }
-        let grace = self.transmit_grace_until;
+        let mut deadline = match self.drain_reset_at {
+            Some(at) => transmit.max(at),
+            None => transmit,
+        };
+        let grace = self.transmit_grace_until();
+        let grace = grace.max(self.liveness_hold_until).max(self.fresh_hold_until());
         deadline = deadline.min((self.liveness_at() + self.ping_disconnect_delay() + 0.002).max(grace));
         deadline = deadline.min((self.last_read_at + self.read_disconnect_delay() + 0.002).max(grace));
         if let Some(since) = self.unknown_since {
@@ -1968,7 +2342,9 @@ impl Session {
             deadline = deadline.min(at);
         }
         if let Some(at) = self.probe_deadline() {
-            deadline = deadline.min((at + 0.002).max(grace)).min(self.backlog_sampled_at + BACKLOG_SAMPLE_INTERVAL);
+            deadline = deadline
+                .min((at + 0.002).max(self.probe_held_until(now)))
+                .min(self.backlog_sampled_at + BACKLOG_SAMPLE_INTERVAL);
         }
         for request in self.service_requests.values() {
             deadline = deadline.min(request.sent_at() + STATE_REQUEST_RETRY + 0.002);
@@ -1982,17 +2358,22 @@ impl Session {
         }
         self.sync_wall_clock(now);
         self.refresh_busy(now);
-        let transmitting = now.mono < self.transmit_grace_until;
+        self.stretch_expired_grace(now);
+        let transmitting =
+            self.is_transmitting(now) || now.mono < self.liveness_hold_until || now.mono < self.fresh_hold_until();
         if !transmitting && self.liveness_at() + self.ping_disconnect_delay() < now.mono {
+            self.note_silent_cut(now);
             return Err(SessionError::PingTimeout);
         }
         if !transmitting && self.last_read_at + self.read_disconnect_delay() < now.mono {
+            self.note_silent_cut(now);
             return Err(SessionError::ReadTimeout);
         }
-        if !transmitting && self.probe_deadline().is_some_and(|at| at < now.mono) {
+        if now.mono >= self.probe_held_until(now) && self.probe_deadline().is_some_and(|at| at < now.mono) {
             if self.received_on_connection {
                 self.probe_backoff = (self.probe_backoff * 2.0).min(PROBE_BACKOFF_MAX);
             }
+            self.note_silent_cut(now);
             return Err(SessionError::ProbeTimeout);
         }
         self.expire_state_requests(now);
@@ -2129,9 +2510,12 @@ impl Session {
         let mut query_messages: Vec<(QueryId, usize)> = Vec::new();
         let mut wants_quick_ack = false;
         let mut force_container = false;
+        self.packet_seq += 1;
+        let packet_seq = self.packet_seq;
+        let probe_first = has_salt && !self.received_on_connection && self.may_ping(now) && self.large_query_waiting();
 
         let mut total = 0usize;
-        if has_salt && !self.to_retransmit.is_empty() {
+        if has_salt && !probe_first && !self.to_retransmit.is_empty() {
             let epoch = self.connection_epoch;
             let mut deferred = Vec::new();
             for id in std::mem::take(&mut self.to_retransmit) {
@@ -2158,6 +2542,7 @@ impl Session {
                 query.state = QueryState::Sent;
                 query.connection_epoch = epoch;
                 query.may_have_arrived = true;
+                query.arrival_seq = None;
                 total += body.len();
                 wants_quick_ack |= query.options.quick_ack;
                 query_messages.push((id, messages.len()));
@@ -2168,7 +2553,7 @@ impl Session {
             self.refresh_unknown_tracking();
         }
 
-        if has_salt && self.to_retransmit.is_empty() {
+        if has_salt && !probe_first && self.to_retransmit.is_empty() {
             let mut sent_now: HashMap<QueryId, i64> = HashMap::new();
             while let Some(&id) = self.pending.front() {
                 if query_messages.len() >= self.config.max_container_queries {
@@ -2206,6 +2591,7 @@ impl Session {
                 query.seq_no = seq_no;
                 query.sent_at = now.mono;
                 query.connection_epoch = epoch;
+                query.arrival_seq = Some(packet_seq);
                 query.acknowledged = false;
                 self.by_msg_id.insert(msg_id, id);
                 sent_now.insert(id, msg_id);
@@ -2220,12 +2606,14 @@ impl Session {
             let seq_no = self.next_seq_no(false);
             let mut writer = Writer::with_capacity(20);
             if self.config.use_ping_delay_disconnect {
-                tlm::write_ping_delay_disconnect(&mut writer, msg_id, (self.ping_disconnect_delay() + 2.0) as i32);
+                let delay = (self.ping_disconnect_delay() + 2.0) as i32;
+                self.last_ping_delay = f64::from(delay);
+                tlm::write_ping_delay_disconnect(&mut writer, msg_id, delay);
             } else {
                 tlm::write_ping(&mut writer, msg_id);
             }
             self.last_ping_at = Some(now.mono);
-            self.pending_pings.insert(msg_id, now.mono);
+            self.pending_pings.insert(msg_id, PendingPing { sent_at: now.mono, packet_seq, behind_large: false });
             if self.pending_pings.len() > MAX_PENDING_PINGS
                 && let Some(oldest) = self.pending_pings.keys().min().copied()
             {
@@ -2418,18 +2806,31 @@ impl Session {
             seq_no,
         };
         let packet = encrypt_message(&self.auth_key, &header, &body, Side::Client, self.config.padding, rng);
-        if packet.data.len() >= TRANSMIT_GRACE_MIN_SIZE {
-            let start = self.transmit_grace_until.max(now.mono);
-            self.transmit_grace_until = start + packet.data.len() as f64 / TRANSMIT_GRACE_RATE;
+        let large = packet.data.len() >= TRANSMIT_GRACE_MIN_SIZE;
+        if large {
+            if self.unconfirmed_large.is_empty() {
+                self.delivered_at = now.mono;
+            }
+            self.unconfirmed_large.push_back(LargePacket {
+                seq: packet_seq,
+                bytes: packet.data.len(),
+                sent_at: now.mono,
+                delivered: self.delivered,
+                delivered_at: self.delivered_at,
+            });
+            self.refresh_transmit_grace();
         }
-        let quick_ack_token = if wants_quick_ack {
+        if let Some(ping) = self.pending_pings.get_mut(&ping_msg_id) {
+            ping.behind_large = !self.unconfirmed_large.is_empty();
+        }
+        let quick_ack_token = if wants_quick_ack || large {
             let token = packet.quick_ack_token & 0x7fff_ffff;
             let ids: Vec<QueryId> = query_messages
                 .iter()
                 .filter(|(id, _)| self.queries.get(id).is_some_and(|query| query.options.quick_ack))
                 .map(|(id, _)| *id)
                 .collect();
-            self.quick_acks.push_back((token, ids));
+            self.quick_acks.push_back((token, ids, packet_seq));
             while self.quick_acks.len() > MAX_RECENT_QUICK_ACKS {
                 self.quick_acks.pop_front();
             }

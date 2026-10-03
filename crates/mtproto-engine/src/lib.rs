@@ -6,6 +6,7 @@ mod interface;
 mod resolver;
 mod session_runtime;
 mod types;
+mod uploads;
 mod worker;
 
 use std::io;
@@ -20,9 +21,10 @@ use mtproto_core::rpc::{ApiEnvironment, RequestId, RpcRequest, SessionRole, Veri
 
 pub use clock::{monotonic_seconds, now, unix_seconds};
 pub use types::{
-    AuthKeyMaterial, ConnectionState, DcAddress, EngineCallbacks, EngineConfig, EngineEvent, KeyGeneration, LogLevel,
-    ProxyConfig, SessionHandle, SessionSetup,
+    AuthKeyMaterial, ConnectionState, DcAddress, DropReason, EngineCallbacks, EngineConfig, EngineEvent, KeyGeneration,
+    LogLevel, ProxyConfig, SessionHandle, SessionSetup,
 };
+use uploads::Uploads;
 use worker::{Command, WAKER_TOKEN, Worker};
 
 struct WorkerHandle {
@@ -63,6 +65,7 @@ impl Engine {
             next_request: AtomicU64::new(1),
             round_robin: AtomicUsize::new(0),
         };
+        let uploads = Arc::new(Uploads::default());
         for index in 0..count {
             let poll = Poll::new()?;
             let waker = Arc::new(Waker::new(poll.registry(), WAKER_TOKEN)?);
@@ -76,7 +79,8 @@ impl Engine {
                 wake_pending.clone(),
                 callbacks.clone(),
                 config.clone(),
-            );
+            )
+            .sharing_uploads(uploads.clone());
             let thread = std::thread::Builder::new()
                 .name(if index == 0 { "mtproto-main".into() } else { format!("mtproto-worker-{index}") })
                 .stack_size(512 * 1024)

@@ -12,7 +12,7 @@ use mtproto_testserver::{SERVER_SALT, ServerOptions, TestServer, random_key};
 use crate::args::hex;
 use crate::report::ClientReport;
 
-const MAIN_DC: i32 = 2;
+pub const MAIN_DC: i32 = 2;
 const FILE_DC: i32 = 4;
 const CDN_DC: i32 = 203;
 
@@ -20,6 +20,8 @@ const CDN_DC: i32 = 203;
 pub enum Route {
     Dead,
     Sim(&'static str),
+    /// The scenario's `custom_profile`.
+    Measured,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,9 +54,13 @@ pub struct ClusterScenario {
     pub proxy: Option<ProxyKind>,
     pub duration: f64,
     pub switch_engine_at: Vec<f64>,
+    /// Replaces the named `profile` on every simulated link.
+    pub custom_profile: Option<Profile>,
+    /// Extra environment for the client process.
+    pub env: Vec<(String, String)>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ClusterResult {
     pub scenario: String,
     pub engine: String,
@@ -83,6 +89,19 @@ pub struct ClusterResult {
     pub loop_rejections: usize,
     pub stalled: bool,
     pub engine_switched: bool,
+    pub upload_parts: usize,
+    /// Upload parts the server received more than once.
+    pub upload_duplicates: usize,
+    /// Upload parts with wrong bytes or in the wrong place.
+    pub upload_bad_parts: usize,
+    /// Uploads the client reported done that the server does not hold completely.
+    pub upload_incomplete: usize,
+    /// The largest upload part the server received.
+    pub upload_largest_part: usize,
+    /// Failure records the client's `NetworkTelemetry` wrote, by class, when the run dumped them.
+    pub telemetry: Vec<(String, usize)>,
+    /// Connections the engine gave up on, by `role/reason`, when the run dumped its telemetry.
+    pub drops: Vec<(String, usize)>,
     pub exit: String,
     pub error: Option<String>,
 }
@@ -99,7 +118,13 @@ fn files(seed: u64, count: usize, datacenter_id: i32, min: u64, max: u64, cdn: b
         .collect()
 }
 
-fn scenario(name: &str, workload: &str, profile: &str, files: Vec<FileSpec>, concurrency: usize) -> ClusterScenario {
+pub fn scenario(
+    name: &str,
+    workload: &str,
+    profile: &str,
+    files: Vec<FileSpec>,
+    concurrency: usize,
+) -> ClusterScenario {
     ClusterScenario {
         name: name.into(),
         workload: workload.into(),
@@ -120,7 +145,311 @@ fn scenario(name: &str, workload: &str, profile: &str, files: Vec<FileSpec>, con
         proxy: None,
         duration: 10.0,
         switch_engine_at: Vec::new(),
+        custom_profile: None,
+        env: Vec::new(),
     }
+}
+
+/// Weak and slow networks as users meet them, each with small calls, calls during downloads and
+/// during an upload, downloads and uploads sized to the link so that every run moves for a
+/// comparable time, an upload in 256 KB parts, which take most of a minute each on the slowest
+/// links, two such uploads sharing the uplink, and calls and downloads after pauses longer than a
+/// carrier NAT remembers an idle connection. Profiles are (name, downlink bytes/s, uplink
+/// bytes/s, round trip s); small uploads go in 16 KB parts three at a time, so they are bound by the
+/// round trip as much as by the uplink.
+pub fn weak_suite(quick: bool) -> Vec<ClusterScenario> {
+    let profiles: [(&'static str, u64, u64, f64); 12] = [
+        ("gprs", 6_000, 6_000, 1.0),
+        ("edge", 8_000, 8_000, 0.9),
+        ("edge-flaky", 8_000, 8_000, 0.9),
+        ("3g", 187_500, 187_500, 0.3),
+        ("satellite", 500_000, 500_000, 0.6),
+        ("lossy-heavy", 250_000, 250_000, 0.2),
+        ("train", 125_000, 125_000, 0.24),
+        ("handover", 1_250_000, 1_250_000, 0.08),
+        ("uplink-starved", 1_000_000, 8_000, 0.12),
+        ("blackholes", 1_250_000, 1_250_000, 0.08),
+        ("bufferbloat", 500_000, 32_000, 0.08),
+        ("bufferbloat-down", 125_000, 64_000, 0.08),
+    ];
+    let seconds = if quick { 12.0 } else { 30.0 };
+    let mut scenarios = Vec::new();
+    for (index, (profile, down, up, rtt)) in profiles.into_iter().enumerate() {
+        let index = index as u64;
+        let mut rpc = scenario(&format!("weak/{profile}/rpc"), "tc-steady", profile, Vec::new(), 8);
+        rpc.rate = 4.0;
+        rpc.duration =
+            Profile::by_name(profile).map_or(seconds, |profile| seconds.max(longest_quiet_spell(&profile) + 4.0));
+        rpc.deadline = rpc.duration + 150.0;
+        rpc.stall_exit = 45.0;
+        scenarios.push(online(&rpc));
+        scenarios.push(rpc);
+
+        let photo = (down * 2).clamp(16_000, 1_500_000);
+        let count = if quick { 4 } else { 10 };
+        let mut loaded = scenario(
+            &format!("weak/{profile}/rpc-under-load"),
+            "tc-mixed",
+            profile,
+            files(200 + index, count, MAIN_DC, photo / 2, photo, false, 60_000 + index as i64 * 100),
+            2,
+        );
+        loaded.rate = 4.0;
+        loaded.deadline = 300.0;
+        loaded.stall_exit = 60.0;
+        scenarios.push(online(&loaded));
+        scenarios.push(loaded);
+
+        let mut photos = scenario(
+            &format!("weak/{profile}/photos"),
+            "tc-download",
+            profile,
+            files(300 + index, count, MAIN_DC, photo / 2, photo, false, 70_000 + index as i64 * 100),
+            4,
+        );
+        photos.deadline = 300.0;
+        photos.stall_exit = 60.0;
+        scenarios.push(photos);
+
+        let upload_rate = (up as f64).min(3.0 * 16_384.0 / rtt);
+        let upload_size = ((upload_rate * if quick { 8.0 } else { 20.0 }) as u64).clamp(64 * 1024, 4 * 1024 * 1024);
+        let uploads = (0..2)
+            .map(|file| FileSpec {
+                id: 80_000 + index as i64 * 10 + file,
+                datacenter_id: MAIN_DC,
+                size: upload_size,
+                cdn: false,
+            })
+            .collect();
+        let mut upload = scenario(&format!("weak/{profile}/upload"), "tc-upload", profile, uploads, 1);
+        upload.deadline = 300.0;
+        upload.stall_exit = 60.0;
+        scenarios.push(upload);
+
+        let sending =
+            vec![FileSpec { id: 82_000 + index as i64, datacenter_id: MAIN_DC, size: upload_size, cdn: false }];
+        let mut chatting =
+            scenario(&format!("weak/{profile}/rpc-during-upload"), "tc-mixed-upload", profile, sending, 1);
+        chatting.rate = 2.0;
+        chatting.deadline = 300.0;
+        chatting.stall_exit = 60.0;
+        scenarios.push(online(&chatting));
+        scenarios.push(chatting);
+
+        let large =
+            vec![FileSpec { id: 85_000 + index as i64, datacenter_id: MAIN_DC, size: LARGE_UPLOAD, cdn: false }];
+        let mut large_upload = scenario(&format!("weak/{profile}/large-parts"), "tc-upload", profile, large, 1);
+        large_upload.deadline = 420.0;
+        large_upload.stall_exit = 150.0;
+        large_upload.env = vec![("TC_BENCH_UPLOAD_LARGE_PARTS".into(), "1".into())];
+        scenarios.push(large_upload);
+
+        let shared = (0..2)
+            .map(|file| FileSpec {
+                id: 86_000 + index as i64 * 10 + file,
+                datacenter_id: MAIN_DC,
+                size: LARGE_UPLOAD / 2,
+                cdn: false,
+            })
+            .collect();
+        let mut shared_upload = scenario(&format!("weak/{profile}/shared-uplink"), "tc-upload", profile, shared, 2);
+        shared_upload.deadline = 420.0;
+        shared_upload.stall_exit = 150.0;
+        shared_upload.env = vec![("TC_BENCH_UPLOAD_LARGE_PARTS".into(), "1".into())];
+        scenarios.push(shared_upload);
+    }
+    let pauses = files(400, if quick { 6 } else { 10 }, MAIN_DC, 32_000, 64_000, false, 90_000);
+    let mut after_pauses = scenario("weak/nat/after-pauses", "tc-idle", "nat", pauses, 1);
+    after_pauses.rate = 1.0 / 45.0;
+    after_pauses.duration = if quick { 240.0 } else { 420.0 };
+    after_pauses.deadline = after_pauses.duration + 120.0;
+    after_pauses.stall_exit = 90.0;
+    scenarios.push(after_pauses);
+    scenarios
+}
+
+/// The same run with the user online, as while the app is in front: the main session then pings
+/// every round trip and gives up on silence after a few, where an offline one waits minutes.
+fn online(scenario: &ClusterScenario) -> ClusterScenario {
+    let mut online = scenario.clone();
+    online.name = format!("{}-online", scenario.name);
+    online.env.push(("TC_BENCH_ONLINE".into(), "1".into()));
+    online
+}
+
+/// Two 256 KB parts and a tail.
+const LARGE_UPLOAD: u64 = 2 * 256 * 1024 + 4096;
+/// The smallest part a large-part upload must have sent.
+const LARGE_PART_MIN: usize = 128 * 1024;
+
+/// How long a run must last for every periodic event of the profile to have struck at least once.
+fn longest_quiet_spell(profile: &Profile) -> f64 {
+    let tunnel = profile.tunnel.map_or(0.0, |tunnel| (tunnel.every_max + tunnel.length).as_secs_f64());
+    let reset = profile.reset_after.map_or(0.0, |(_, latest)| latest.as_secs_f64());
+    let blackhole = profile.blackhole.map_or(0.0, |blackhole| (blackhole.after_max + blackhole.duration).as_secs_f64());
+    tunnel.max(reset).max(blackhole)
+}
+
+pub fn weak_markdown(results: &[ClusterResult]) -> String {
+    let mut out = String::new();
+    out.push_str("| Scenario | Engine | Done/Issued | Failed or hung | Bad data | p50 ms | p95 ms | p99 ms | KB/s | Re-sent parts | Conns | Longest gap s | CPU s | Telemetry | Process |\n");
+    out.push_str("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n");
+    for result in results {
+        let mut telemetry = if result.telemetry.is_empty() {
+            "none".to_string()
+        } else {
+            result.telemetry.iter().map(|(class, count)| format!("{class} {count}")).collect::<Vec<_>>().join(", ")
+        };
+        if !result.drops.is_empty() {
+            telemetry.push_str("; drops ");
+            telemetry.push_str(
+                &result.drops.iter().map(|(reason, count)| format!("{reason} {count}")).collect::<Vec<_>>().join(", "),
+            );
+        }
+        let Some(report) = &result.report else {
+            out.push_str(&format!(
+                "| {} | {} | no report ({}) | | | | | | | | {} | | {:.1} | {} | {} |\n",
+                result.scenario,
+                result.engine,
+                result.error.clone().unwrap_or_default(),
+                result.connections,
+                result.cpu_seconds,
+                telemetry,
+                result.exit
+            ));
+            continue;
+        };
+        let rate = report.transfer_rate() / 1024.0;
+        out.push_str(&format!(
+            "| {} | {} | {}/{} | {} | {} | {:.0} | {:.0} | {:.0} | {:.1} | {} | {} | {:.1} | {:.1} | {} | {} |\n",
+            result.scenario,
+            result.engine,
+            report.completed,
+            result.issued,
+            report.failed + result.issued.saturating_sub(report.completed + report.failed),
+            result.verify_failures + result.upload_bad_parts + result.upload_incomplete,
+            report.latency.p50,
+            report.latency.p95,
+            report.latency.p99,
+            rate,
+            result.upload_duplicates + result.repeated_parts,
+            result.connections,
+            result.longest_gap,
+            result.cpu_seconds,
+            telemetry,
+            result.exit
+        ));
+    }
+    out
+}
+
+/// Fewer latency samples per run make a p95 little more than the slowest one or two.
+const P95_SAMPLES_MIN: f64 = 20.0;
+
+/// Where the Rust engine did worse than MtProtoKit on the same scenario: more failed or hung
+/// requests, any bad data, more failure records with as many failed requests, a p95 latency 25%
+/// and 100 ms worse when both had `P95_SAMPLES_MIN` calls a run, 20% less throughput, or half as
+/// much CPU again and a second more, which is what a worker spinning on a timer looks like. Averages
+/// over rounds.
+pub fn weak_spots(results: &[ClusterResult]) -> String {
+    #[derive(Default)]
+    struct Totals {
+        runs: f64,
+        reporting: f64,
+        completed: f64,
+        /// Completed calls. In runs that mix calls and files the p95 is over the calls only; a run of
+        /// files alone has none, and its p95 is not compared.
+        samples: f64,
+        failed: f64,
+        bad: f64,
+        p95: f64,
+        rate: f64,
+        records: f64,
+        cpu: f64,
+    }
+    let mut by_scenario: std::collections::BTreeMap<String, std::collections::BTreeMap<String, Totals>> =
+        std::collections::BTreeMap::new();
+    for result in results {
+        let totals = by_scenario.entry(result.scenario.clone()).or_default().entry(result.engine.clone()).or_default();
+        totals.runs += 1.0;
+        totals.cpu += result.cpu_seconds;
+        totals.bad += (result.verify_failures + result.upload_bad_parts + result.upload_incomplete) as f64;
+        totals.records +=
+            result.telemetry.iter().filter(|(class, _)| class != "client").map(|(_, count)| *count as f64).sum::<f64>();
+        match &result.report {
+            Some(report) => {
+                totals.reporting += 1.0;
+                totals.completed += report.completed as f64;
+                totals.samples += report.completed.saturating_sub(report.transfers_done.unwrap_or(0)) as f64;
+                totals.failed +=
+                    (report.failed + result.issued.saturating_sub(report.completed + report.failed)) as f64;
+                totals.p95 += report.latency.p95;
+                totals.rate += report.transfer_rate();
+            }
+            None => totals.failed += result.issued.max(1) as f64,
+        }
+    }
+    let mut worse = Vec::new();
+    let mut better = 0;
+    let mut compared = 0;
+    for (scenario, engines) in &by_scenario {
+        let (Some(rust), Some(baseline)) = (engines.get("tc-rust"), engines.get("tc-mtprotokit")) else {
+            continue;
+        };
+        compared += 1;
+        let average = |totals: &Totals, value: f64| value / totals.runs.max(1.0);
+        let mut reasons = Vec::new();
+        if average(rust, rust.failed) > average(baseline, baseline.failed) {
+            reasons.push(format!(
+                "failed or hung {:.1} vs {:.1}",
+                average(rust, rust.failed),
+                average(baseline, baseline.failed)
+            ));
+        }
+        if rust.bad > 0.0 {
+            reasons.push(format!("bad data {:.0}", rust.bad));
+        }
+        if average(rust, rust.failed) == average(baseline, baseline.failed)
+            && average(rust, rust.records) > average(baseline, baseline.records)
+        {
+            reasons.push(format!(
+                "failure records {:.1} vs {:.1}",
+                average(rust, rust.records),
+                average(baseline, baseline.records)
+            ));
+        }
+        let reported = |totals: &Totals, value: f64| value / totals.reporting.max(1.0);
+        let (rust_p95, baseline_p95) = (reported(rust, rust.p95), reported(baseline, baseline.p95));
+        if reported(baseline, baseline.samples) >= P95_SAMPLES_MIN
+            && reported(rust, rust.samples) >= P95_SAMPLES_MIN
+            && rust_p95 > baseline_p95 * 1.25
+            && rust_p95 - baseline_p95 > 100.0
+        {
+            reasons.push(format!("p95 {rust_p95:.0} ms vs {baseline_p95:.0} ms"));
+        }
+        let (rust_rate, baseline_rate) = (reported(rust, rust.rate), reported(baseline, baseline.rate));
+        if baseline_rate > 0.0 && rust_rate < baseline_rate * 0.8 {
+            reasons.push(format!("throughput {:.1} vs {:.1} KB/s", rust_rate / 1024.0, baseline_rate / 1024.0));
+        }
+        let (rust_cpu, baseline_cpu) = (average(rust, rust.cpu), average(baseline, baseline.cpu));
+        if rust_cpu > baseline_cpu * 1.5 && rust_cpu - baseline_cpu > 1.0 {
+            reasons.push(format!("CPU {rust_cpu:.1} s vs {baseline_cpu:.1} s"));
+        }
+        if reasons.is_empty() {
+            better += 1;
+        } else {
+            worse.push(format!("- `{scenario}`: {}", reasons.join("; ")));
+        }
+    }
+    let mut out = format!(
+        "\n### Weak spots: Rust worse than MtProtoKit in {} of {compared} scenarios ({better} not worse)\n\n",
+        worse.len()
+    );
+    for line in worse {
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out
 }
 
 pub fn resilience_suite() -> Vec<ClusterScenario> {
@@ -287,7 +616,13 @@ pub fn killswitch_suite() -> Vec<ClusterScenario> {
         switched(big("killswitch/bigfile-wan", 14, false), &[1.5]),
         switched(big("killswitch/bigfile-cdn-wan", 15, true), &[1.5]),
         switched(
-            scenario("killswitch/photos-lossy", "tc-download", "lossy", files(5, 20, MAIN_DC, 40_000, 400_000, false, 1_000), 8),
+            scenario(
+                "killswitch/photos-lossy",
+                "tc-download",
+                "lossy",
+                files(5, 20, MAIN_DC, 40_000, 400_000, false, 1_000),
+                8,
+            ),
             &[1.0],
         ),
         switched(outage, &[5.0]),
@@ -452,7 +787,10 @@ pub fn run(scenario: &ClusterScenario, binary: &str, engine: &str, seed: u64) ->
     let main_server = start_server(MAIN_DC, main_keys.to_vec());
     let file_server = start_server(FILE_DC, file_keys.to_vec());
     let cdn_server = start_server(CDN_DC, vec![cdn_key.clone()]);
-    let profile = Profile::by_name(&scenario.profile).unwrap_or_else(Profile::perfect);
+    let profile = scenario
+        .custom_profile
+        .clone()
+        .unwrap_or_else(|| Profile::by_name(&scenario.profile).unwrap_or_else(Profile::perfect));
     let mut sims: Vec<NetSim> = [&main_server, &file_server, &cdn_server]
         .iter()
         .enumerate()
@@ -461,8 +799,11 @@ pub fn run(scenario: &ClusterScenario, binary: &str, engine: &str, seed: u64) ->
     let route_address = |route: Route, sims: &mut Vec<NetSim>| -> String {
         match route {
             Route::Dead => format!("{{\"host\":\"{}\",\"port\":{}}}", DEAD_ADDRESS.0, DEAD_ADDRESS.1),
-            Route::Sim(name) => {
-                let profile = Profile::by_name(name).unwrap_or_else(Profile::perfect);
+            Route::Sim(_) | Route::Measured => {
+                let profile = match route {
+                    Route::Sim(name) => Profile::by_name(name).unwrap_or_else(Profile::perfect),
+                    _ => profile.clone(),
+                };
                 let sim = NetSim::start(main_server.address, profile, seed + 100 + sims.len() as u64).expect("netsim");
                 let address = format!("{{\"host\":\"{}\",\"port\":{}}}", sim.address.ip(), sim.address.port());
                 sims.push(sim);
@@ -528,9 +869,11 @@ pub fn run(scenario: &ClusterScenario, binary: &str, engine: &str, seed: u64) ->
     let config_path = std::env::temp_dir().join(format!("tc-bench-{}-{seed}-{engine}.json", std::process::id()));
     std::fs::write(&config_path, config).expect("write config");
 
+    if let Some((_, path)) = scenario.env.iter().find(|(key, _)| key == "TC_BENCH_TELEMETRY_DUMP") {
+        let _ = std::fs::remove_file(path);
+    }
     let label = format!("tc-{engine}");
-    let switch_times =
-        scenario.switch_engine_at.iter().map(|time| time.to_string()).collect::<Vec<_>>().join(",");
+    let switch_times = scenario.switch_engine_at.iter().map(|time| time.to_string()).collect::<Vec<_>>().join(",");
     let switch_times = if switch_times.is_empty() { "0".to_string() } else { switch_times };
     let started = Instant::now();
     let child = Command::new(binary)
@@ -566,6 +909,7 @@ pub fn run(scenario: &ClusterScenario, binary: &str, engine: &str, seed: u64) ->
             "--switch-engine-to",
             "other",
         ])
+        .envs(scenario.env.iter().map(|(key, value)| (key.as_str(), value.as_str())))
         .stdout(Stdio::piped())
         .stderr(if std::env::var_os("TC_BENCH_STDERR").is_some() { Stdio::inherit() } else { Stdio::null() })
         .spawn();
@@ -597,6 +941,13 @@ pub fn run(scenario: &ClusterScenario, binary: &str, engine: &str, seed: u64) ->
         loop_rejections: 0,
         stalled: false,
         engine_switched: false,
+        upload_parts: 0,
+        upload_duplicates: 0,
+        upload_bad_parts: 0,
+        upload_incomplete: 0,
+        upload_largest_part: 0,
+        telemetry: Vec::new(),
+        drops: Vec::new(),
         exit: String::new(),
         error: None,
     };
@@ -648,7 +999,7 @@ pub fn run(scenario: &ClusterScenario, binary: &str, engine: &str, seed: u64) ->
         }
         if std::env::var_os("TC_BENCH_STATS").is_some() {
             eprintln!(
-                "server: packets {} bytes {} pings {} state_requests {} retransmissions {} in_container {} duplicate_msg_ids {} redelivered {} future_salts {} sessions {} bad_msgs {} chaos {:?} dripped {} packets {} bytes calls_per_packet {:?}",
+                "server: packets {} bytes {} pings {} state_requests {} retransmissions {} in_container {} duplicate_msg_ids {} redelivered {} future_salts {} sessions {} bad_msgs {} chaos {:?} dripped {} packets {} bytes calls_per_packet {:?} lone {:x?}",
                 stats.client_packets,
                 stats.client_bytes,
                 stats.pings,
@@ -667,6 +1018,11 @@ pub fn run(scenario: &ClusterScenario, binary: &str, engine: &str, seed: u64) ->
                     let mut histogram: Vec<_> = stats.calls_per_packet.iter().map(|(k, v)| (*k, *v)).collect();
                     histogram.sort();
                     histogram
+                },
+                {
+                    let mut lone: Vec<_> = stats.lone_messages.iter().map(|(k, v)| (*k, *v)).collect();
+                    lone.sort();
+                    lone
                 }
             );
         }
@@ -691,6 +1047,69 @@ pub fn run(scenario: &ClusterScenario, binary: &str, engine: &str, seed: u64) ->
     result.reuploads = stats.reuploads;
     result.redirects = stats.cdn_redirects;
     result.invalid_ranges = stats.invalid_ranges;
+    result.upload_parts = stats.upload_parts;
+    result.upload_duplicates = stats.upload_duplicates;
+    result.upload_bad_parts = stats.upload_bad_parts;
+    result.upload_largest_part = stats.upload_largest_part;
+    if scenario.env.iter().any(|(key, value)| key == "TC_BENCH_UPLOAD_LARGE_PARTS" && value == "1")
+        && result.upload_largest_part < LARGE_PART_MIN
+    {
+        result.exit = format!("{} (parts of {} bytes at most)", result.exit, result.upload_largest_part);
+    }
+    if let Some((_, path)) = scenario.env.iter().find(|(key, _)| key == "TC_BENCH_TELEMETRY_DUMP") {
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        let mut classes: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+        let counts = crate::json::parse(text.trim()).and_then(|value| match value.get("failure_counts") {
+            Some(crate::json::Value::Object(entries)) => Some(entries.clone()),
+            _ => None,
+        });
+        match counts {
+            Some(entries) => {
+                for (class, count) in entries {
+                    classes.insert(class, count.as_f64().unwrap_or(0.0) as usize);
+                }
+            }
+            None => {
+                for record in crate::replay::load_records(&text) {
+                    *classes.entry(record.failure).or_insert(0) += 1;
+                }
+            }
+        }
+        classes.retain(|_, count| *count > 0);
+        result.telemetry = classes.into_iter().collect();
+        if let Some(crate::json::Value::Object(entries)) =
+            crate::json::parse(text.trim()).as_ref().and_then(|value| value.get("drop_counts"))
+        {
+            result.drops = entries
+                .iter()
+                .map(|(key, count)| (key.clone(), count.as_f64().unwrap_or(0.0) as usize))
+                .filter(|(_, count)| *count > 0)
+                .collect();
+        }
+    }
+    if matches!(scenario.workload.as_str(), "tc-upload" | "tc-mixed-upload")
+        && let Some(report) = &result.report
+    {
+        let uploaded = world.uploaded_files();
+        let held = scenario
+            .files
+            .iter()
+            .filter(|spec| {
+                uploaded.iter().any(|file| file.complete && file.bytes == spec.size && file.tag == Some(spec.id as u64))
+            })
+            .count();
+        result.upload_incomplete = report.transfers_done.unwrap_or(report.completed).saturating_sub(held);
+    }
+    if let Some(report) = &result.report
+        && std::env::var_os("TC_BENCH_STATS").is_some()
+    {
+        let mut slowest: Vec<(f64, f64)> =
+            report.requests.iter().filter_map(|(sent, done)| done.map(|done| (done - sent, *sent))).collect();
+        slowest.sort_by(|lhs, rhs| rhs.0.total_cmp(&lhs.0));
+        let slowest: Vec<String> =
+            slowest.iter().take(6).map(|(took, sent)| format!("{:.0} ms at {sent:.2} s", took * 1000.0)).collect();
+        eprintln!("slowest: {}", slowest.join(", "));
+    }
     if let Some(report) = &result.report {
         let mut completions: Vec<f64> = report.requests.iter().filter_map(|(_, done)| *done).collect();
         completions.sort_by(f64::total_cmp);
@@ -844,4 +1263,39 @@ pub fn resilience_markdown(results: &[ClusterResult]) -> String {
         ));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(engine: &str, cpu_seconds: f64) -> ClusterResult {
+        ClusterResult {
+            scenario: "weak/edge/rpc".into(),
+            engine: engine.into(),
+            report: Some(ClientReport { completed: 40, elapsed: 30.0, ..ClientReport::default() }),
+            issued: 40,
+            cpu_seconds,
+            ..ClusterResult::default()
+        }
+    }
+
+    #[test]
+    fn a_worker_spinning_on_a_timer_is_a_weak_spot() {
+        let spinning = weak_spots(&[run("tc-rust", 6.0), run("tc-mtprotokit", 2.0)]);
+        assert!(spinning.contains("CPU 6.0 s vs 2.0 s"), "{spinning}");
+        let noise = weak_spots(&[run("tc-rust", 2.6), run("tc-mtprotokit", 2.0)]);
+        assert!(noise.contains("in 0 of 1"), "{noise}");
+    }
+
+    #[test]
+    fn weak_calls_last_until_every_periodic_event_has_struck() {
+        for scenario in weak_suite(true).iter().filter(|scenario| scenario.workload == "tc-steady") {
+            let profile = Profile::by_name(&scenario.profile).expect("profile");
+            assert!(scenario.duration >= longest_quiet_spell(&profile), "{}", scenario.name);
+            assert!(scenario.deadline > scenario.duration, "{}", scenario.name);
+        }
+        let train = weak_suite(true).into_iter().find(|scenario| scenario.name == "weak/train/rpc").expect("train");
+        assert!(train.duration >= 26.0);
+    }
 }

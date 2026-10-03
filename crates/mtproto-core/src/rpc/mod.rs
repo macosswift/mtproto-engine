@@ -764,9 +764,10 @@ impl RpcClient {
         result
     }
 
-    pub fn handle_quick_ack(&mut self, token: u32, now: Now) {
-        self.session.handle_quick_ack(token);
+    pub fn handle_quick_ack(&mut self, token: u32, now: Now) -> bool {
+        let ours = self.session.handle_quick_ack(token, now);
         self.pump_session_events(now);
+        ours
     }
 
     pub fn connection_opened(&mut self, now: Now) {

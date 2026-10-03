@@ -134,6 +134,8 @@ pub struct Stats {
     pub dripped_packets: usize,
     pub dripped_bytes: usize,
     pub calls_per_packet: HashMap<usize, usize>,
+    /// Packets that carried one message, by its constructor.
+    pub lone_messages: HashMap<u32, usize>,
 }
 
 struct SessionState {
@@ -711,6 +713,9 @@ fn serve_frames_inner(
             stats.client_packets += 1;
             stats.client_bytes += packet.len();
             *stats.calls_per_packet.entry(decoded.messages.len()).or_insert(0) += 1;
+            if let [message] = decoded.messages.as_slice() {
+                *stats.lone_messages.entry(message.constructor()).or_insert(0) += 1;
+            }
             let message_time = msg_id_time(decoded.header.msg_id);
             let server_time = server_now(session.clock_offset);
             let time_error = if !options.validate_msg_id_time {
@@ -1077,10 +1082,16 @@ fn serve_frames_inner(
                                                 packet[index] ^= 0x40;
                                                 hostile_frames.push(packet);
                                             }
-                                            chaos::Fault::HostileTransportCode => {
+                                            chaos::Fault::HostileTransportCode
+                                            | chaos::Fault::HostileTransportCodeThenGarbage => {
                                                 let codes = [-1i32, -2, -100, -500, -9999, i32::MIN];
                                                 let code = codes[chaos_rng.next_u64() as usize % codes.len()];
                                                 hostile_frames.push(code.to_le_bytes().to_vec());
+                                                if fault == chaos::Fault::HostileTransportCodeThenGarbage {
+                                                    let mut junk = vec![0u8; 256];
+                                                    chaos_rng.fill(&mut junk);
+                                                    hostile_frames.push(junk);
+                                                }
                                             }
                                             chaos::Fault::HostileOversized => hostile_raw = Some(RawHostile::Oversized),
                                             _ => hostile_raw = Some(RawHostile::Truncated),

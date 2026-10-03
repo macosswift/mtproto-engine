@@ -4,6 +4,7 @@ mod cluster;
 mod heap;
 mod json;
 mod orchestrator;
+mod replay;
 mod report;
 mod soak;
 
@@ -80,6 +81,7 @@ fn main() {
             }
         }
         Some("serve") => soak::serve(),
+        Some("replay") => replay::run(replay::ReplayArgs::parse(&arguments[2..])),
         Some("proxy") => {
             let mut profile = "perfect".to_string();
             let mut bind = "127.0.0.1:1080".to_string();
@@ -150,6 +152,8 @@ fn main() {
             let mut repeat = 1usize;
             let mut hostile = false;
             let mut killswitch = false;
+            let mut weak = false;
+            let mut telemetry: Option<String> = None;
             let mut engines = vec!["rust".to_string(), "mtprotokit".to_string()];
             let mut iter = arguments[2..].iter();
             while let Some(flag) = iter.next() {
@@ -159,11 +163,13 @@ fn main() {
                         let name = iter.next().cloned().unwrap_or_default();
                         hostile = name.starts_with("hostile");
                         killswitch = name == "killswitch";
+                        weak = name.starts_with("weak");
                         torture = name.starts_with("torture") || hostile || killswitch;
                         resilience = name == "resilience";
                         quick = if torture { name.ends_with("quick") } else { !name.ends_with("full") };
                     }
                     "--jobs" => jobs = iter.next().and_then(|v| v.parse().ok()).expect("jobs"),
+                    "--telemetry" => telemetry = iter.next().cloned(),
                     "--out" => out = iter.next().cloned(),
                     "--only" => only = iter.next().cloned(),
                     "--repeat" => repeat = iter.next().and_then(|v| v.parse().ok()).expect("repeat"),
@@ -174,7 +180,9 @@ fn main() {
                 }
             }
             let binary = binary.expect("--telegramcore PATH");
-            let scenarios = if resilience {
+            let scenarios = if weak {
+                cluster::weak_suite(quick)
+            } else if resilience {
                 cluster::resilience_suite()
             } else if killswitch {
                 cluster::killswitch_suite()
@@ -186,7 +194,9 @@ fn main() {
                 cluster::suite(quick)
             };
             let render = |results: &[cluster::ClusterResult]| {
-                if resilience {
+                if weak {
+                    cluster::weak_markdown(results)
+                } else if resilience {
                     cluster::resilience_markdown(results)
                 } else if torture {
                     cluster::torture_markdown(results)
@@ -226,6 +236,21 @@ fn main() {
                                 engine,
                                 round + 1
                             );
+                            let mut scenario = scenario;
+                            if let Some(directory) = &telemetry {
+                                let _ = std::fs::create_dir_all(directory);
+                                let dump = format!(
+                                    "{directory}/{}-{engine}-r{}.json",
+                                    scenario.name.replace('/', "_"),
+                                    round + 1
+                                );
+                                scenario.env.extend([
+                                    ("TC_BENCH_TELEMETRY".to_string(), "1".to_string()),
+                                    ("TC_BENCH_WATCH_EVERY".to_string(), "1".to_string()),
+                                    ("TC_BENCH_STALLED_AFTER".to_string(), "20".to_string()),
+                                    ("TC_BENCH_TELEMETRY_DUMP".to_string(), dump),
+                                ]);
+                            }
                             let result =
                                 cluster::run(&scenario, &binary, &engine, 5000 + index as u64 * 11 + round as u64);
                             let row = render(std::slice::from_ref(&result));
@@ -238,7 +263,10 @@ fn main() {
             let mut collected = collected.into_inner().unwrap();
             collected.sort_by_key(|(order, _)| *order);
             let results: Vec<cluster::ClusterResult> = collected.into_iter().map(|(_, result)| result).collect();
-            let table = render(&results);
+            let mut table = render(&results);
+            if weak {
+                table.push_str(&cluster::weak_spots(&results));
+            }
             println!("{table}");
             if let Some(path) = out {
                 std::fs::write(format!("{path}.md"), &table).expect("write markdown");
@@ -246,7 +274,7 @@ fn main() {
         }
         _ => {
             eprintln!(
-                "usage: mtproto-bench client <args> | mtproto-bench tc --telegramcore PATH [--suite quick|full] [--only NAME] [--repeat N] [--engines rust,mtprotokit] [--out PREFIX] | mtproto-bench run [--mtprotokit PATH] [--suite quick|full] [--real] [--only NAME] [--repeat N] [--out PREFIX]"
+                "usage: mtproto-bench client <args> | mtproto-bench tc --telegramcore PATH [--suite quick|full|torture|hostile|resilience|killswitch|weak[-full]] [--only NAME] [--repeat N] [--engines rust,mtprotokit] [--jobs N] [--telemetry DIR] [--out PREFIX] | mtproto-bench replay --records FILE --telegramcore PATH [--engines rust,mtprotokit] [--max-cases N] [--rounds N] [--only NAME] [--plan] | mtproto-bench run [--mtprotokit PATH] [--suite quick|full] [--real] [--only NAME] [--repeat N] [--out PREFIX]"
             );
             std::process::exit(2);
         }

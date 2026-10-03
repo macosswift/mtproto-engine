@@ -32,6 +32,9 @@ pub enum Fault {
     HostileUnknownResults,
     HostileDeepNest,
     HostileTransportCode,
+    /// A transport error code followed by bytes that are no packet, as a middlebox injecting into
+    /// the stream might send.
+    HostileTransportCodeThenGarbage,
     HostileOversized,
     HostileTruncated,
     HostileQuickAckNoise,
@@ -130,6 +133,7 @@ impl Fault {
             Fault::HostileUnknownResults => "x-unknown-results",
             Fault::HostileDeepNest => "x-deep-nest",
             Fault::HostileTransportCode => "x-transport-code",
+            Fault::HostileTransportCodeThenGarbage => "x-transport-code-garbage",
             Fault::HostileOversized => "x-oversized",
             Fault::HostileTruncated => "x-truncated",
             Fault::HostileQuickAckNoise => "x-quick-ack-noise",
@@ -151,7 +155,7 @@ impl Fault {
             .chain(Fault::HOSTILE)
             .chain(Fault::LOOPS)
             .chain(Fault::ADAPTIVE)
-            .chain([Fault::AdaptiveTrickle])
+            .chain([Fault::AdaptiveTrickle, Fault::HostileTransportCodeThenGarbage])
             .find(|fault| fault.name() == name)
     }
 
@@ -161,6 +165,7 @@ impl Fault {
             Fault::HostileGarbage
                 | Fault::HostileBadMsgKey
                 | Fault::HostileTransportCode
+                | Fault::HostileTransportCodeThenGarbage
                 | Fault::HostileOversized
                 | Fault::HostileTruncated
         )

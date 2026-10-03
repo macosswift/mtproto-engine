@@ -220,6 +220,11 @@ impl Connection {
         kernel_send_queue(&self.socket).map(|queued| self.written_total.saturating_sub(queued as u64))
     }
 
+    /// Bytes the engine holds for this connection that the kernel has not taken yet.
+    pub fn unsent_bytes(&self) -> usize {
+        self.write_buffer.len() - self.write_offset
+    }
+
     pub fn outbound_backlog(&self) -> Option<usize> {
         let unsent = self.write_buffer.len() - self.write_offset;
         kernel_send_queue(&self.socket).map(|queued| unsent + queued)

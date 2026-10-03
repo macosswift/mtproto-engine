@@ -150,18 +150,114 @@ pub struct ConnectionState {
     pub proxy_has_connection_issues: bool,
 }
 
+/// Why the engine gave up on a connection: which of its checks decided, for the host's diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DropReason {
+    /// The server or something on the path closed it.
+    Closed,
+    /// Reading or writing failed, as after a reset.
+    IoError,
+    /// The transport or the SOCKS5 proxy sent bytes that cannot be right.
+    Protocol,
+    /// It did not connect within the connect timeout.
+    ConnectTimeout,
+    /// The auth key handshake on it did not finish in time.
+    HandshakeTimeout,
+    /// No pong or packet within the ping disconnect delay.
+    PingTimeout,
+    /// Nothing read within the read disconnect delay.
+    ReadTimeout,
+    /// A ping sat unanswered after everything ahead of it had left the socket.
+    ProbeTimeout,
+    /// A request waited past its timeout with nothing arriving.
+    RequestTimeout,
+    /// The session could not take a packet that arrived (msg_key mismatch, malformed message), or
+    /// failed on it in another way.
+    SessionError,
+    /// The server does not know the auth key: a -404 again, on a connection the key had not
+    /// decrypted a packet on, after an earlier -404.
+    KeyInvalid,
+    /// A -404 not believed: the first since the key last worked, or one on a connection where the
+    /// key had decrypted a packet. The connection is retried.
+    KeyRejectedOnce,
+    /// The server refused the connection with a transport error such as a wrong datacenter.
+    AddressRejected,
+    /// The auth key handshake on it failed.
+    HandshakeFailed,
+    /// The server answered -429: too many connections from this address.
+    TransportFlood,
+    /// An alternate connection started while this one was still connecting got through first.
+    SlowConnect,
+    /// A connection raced against this silent one answered first and replaced it.
+    RacerWon,
+}
+
+impl DropReason {
+    pub fn name(self) -> &'static str {
+        match self {
+            DropReason::Closed => "closed",
+            DropReason::IoError => "io_error",
+            DropReason::Protocol => "protocol",
+            DropReason::ConnectTimeout => "connect_timeout",
+            DropReason::HandshakeTimeout => "handshake_timeout",
+            DropReason::PingTimeout => "ping_timeout",
+            DropReason::ReadTimeout => "read_timeout",
+            DropReason::ProbeTimeout => "probe_timeout",
+            DropReason::RequestTimeout => "request_timeout",
+            DropReason::SessionError => "session_error",
+            DropReason::KeyInvalid => "key_invalid",
+            DropReason::KeyRejectedOnce => "key_rejected_once",
+            DropReason::AddressRejected => "address_rejected",
+            DropReason::HandshakeFailed => "handshake_failed",
+            DropReason::TransportFlood => "transport_flood",
+            DropReason::SlowConnect => "slow_connect",
+            DropReason::RacerWon => "racer_won",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum EngineEvent {
     Rpc(RpcEvent),
-    Progress { id: RequestId, progress: f32, packet_length: usize },
-    ConnectionState { state: ConnectionState, proxy_address: Option<String> },
+    Progress {
+        id: RequestId,
+        progress: f32,
+        packet_length: usize,
+    },
+    ConnectionState {
+        state: ConnectionState,
+        proxy_address: Option<String>,
+    },
     AuthKeyRequired,
-    AuthKeyInvalid { code: i32 },
-    AuthKeyCreated { key: Vec<u8>, salt: i64, time_difference: f64, expires_at: Option<i32> },
-    AuthKeyCreationFailed { reason: String },
+    AuthKeyInvalid {
+        code: i32,
+    },
+    AuthKeyCreated {
+        key: Vec<u8>,
+        salt: i64,
+        time_difference: f64,
+        expires_at: Option<i32>,
+    },
+    AuthKeyCreationFailed {
+        reason: String,
+    },
     TransportFlood,
-    NetworkUsage { incoming: u64, outgoing: u64, cellular: bool },
-    AddressResult { index: usize, success: bool },
+    NetworkUsage {
+        incoming: u64,
+        outgoing: u64,
+        cellular: bool,
+    },
+    AddressResult {
+        index: usize,
+        success: bool,
+    },
+    /// The engine dropped a connection; `answered` when the session had taken a packet from it (the
+    /// auth key handshake does not count), `age` in seconds since it started connecting.
+    ConnectionDropped {
+        reason: DropReason,
+        answered: bool,
+        age: f64,
+    },
     Closed,
 }
 

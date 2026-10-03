@@ -8,7 +8,7 @@ use mtproto_core::handshake::{Handshake, HandshakeConfig, HandshakeStep};
 use mtproto_core::message::{PaddingPolicy, decode_plain_message, encode_plain_message};
 use mtproto_core::msg_id::msg_id_for_time;
 use mtproto_core::rpc::{ApiEnvironment, RequestId, RpcClient, RpcEvent, RpcRequest, SessionRole, Verification};
-use mtproto_core::session::{Now, ServerSalt, Session, SessionConfig, SessionError};
+use mtproto_core::session::{Now, SEND_QUEUE_STUCK_AFTER, ServerSalt, Session, SessionConfig, SessionError};
 use mtproto_core::tl::mtproto::ReqPqMulti;
 use mtproto_core::tl::{TlWrite, Writer, ids};
 use mtproto_core::transport::{
@@ -19,9 +19,10 @@ use mtproto_core::transport::{
 use crate::connection::{ChunkStatus, Connection, ConnectionError};
 use crate::resolver::parse_literal;
 use crate::types::{
-    AuthKeyMaterial, ConnectionState, DcAddress, EngineCallbacks, EngineConfig, EngineEvent, LogLevel, ProxyConfig,
-    SessionHandle, SessionSetup,
+    AuthKeyMaterial, ConnectionState, DcAddress, DropReason, EngineCallbacks, EngineConfig, EngineEvent, LogLevel,
+    ProxyConfig, SessionHandle, SessionSetup,
 };
+use crate::uploads::Uploads;
 
 const PROGRESS_THRESHOLD: usize = 4096;
 pub const FRAME_PROGRESS_GRACE: f64 = 15.0;
@@ -38,6 +39,8 @@ pub const PROXY_PADDING_BLOCKS: usize = 15;
 pub const RACE_RETRY_BASE: f64 = 1.0;
 pub const RACE_RETRY_MAX: f64 = 8.0;
 pub const RACER_MAX_BUFFERED: usize = 16 * 1024;
+/// The longest a connection that went silent is kept while fresh ones race it.
+pub const SUSPECT_HOLD: f64 = 30.0;
 pub const RESOLVE_WAIT: f64 = 30.0;
 pub const DNS_TTL: f64 = 299.0;
 pub const REJECTION_MAX_DELAY: f64 = 16.0;
@@ -55,6 +58,9 @@ enum CloseReason {
     AddressRejected,
     TransportFlood,
     HandshakeFailed,
+    /// The session could not take a packet (msg_key mismatch, malformed message): handled as a
+    /// close by the peer, but reported apart, as corruption on the path looks like this.
+    SessionFailed,
 }
 
 pub enum Resolution {
@@ -82,6 +88,9 @@ struct ProgressTracking {
 struct RacerCheck {
     nonce: [u8; 16],
     sent: bool,
+    /// Set once the racer answered: the primary is given until then to answer before the racer
+    /// replaces it.
+    promote_at: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -126,6 +135,9 @@ pub struct SessionRuntime {
     racer_check: Option<RacerCheck>,
     racer_failures: u32,
     racer_retry_at: f64,
+    /// Since when the primary, which worked before, has been silent past a liveness check while a
+    /// fresh connection races it.
+    suspect_since: Option<f64>,
     flaps: u32,
     deliveries: u64,
     deliveries_at_open: u64,
@@ -143,6 +155,14 @@ pub struct SessionRuntime {
     frame_watch: Option<FrameWatch>,
     acknowledged_out: u64,
     outbound_backlog_sample: usize,
+    uploads: Arc<Uploads>,
+    /// The bytes this session counts in `uploads`.
+    published_upload: u64,
+    /// How long the other sessions' uploads may hold up a first exchange, as of the last refresh.
+    others_upload_queue: f64,
+    /// When the kernel last had nothing to send or the peer last acknowledged some of it; always now
+    /// where the send queue cannot be read, as nothing then shows it stuck.
+    kernel_moving_at: f64,
     reported_time_difference: Option<f64>,
     reported_salts: Vec<ServerSalt>,
     reported_in: u64,
@@ -174,6 +194,7 @@ impl SessionRuntime {
             racer_check: None,
             racer_failures: 0,
             racer_retry_at: 0.0,
+            suspect_since: None,
             flaps: 0,
             deliveries: 0,
             deliveries_at_open: 0,
@@ -191,6 +212,10 @@ impl SessionRuntime {
             frame_watch: None,
             acknowledged_out: 0,
             outbound_backlog_sample: 0,
+            uploads: Arc::default(),
+            published_upload: 0,
+            others_upload_queue: 0.0,
+            kernel_moving_at: 0.0,
             reported_time_difference: Some(setup.time_difference),
             reported_salts: Vec::new(),
             reported_in: 0,
@@ -488,6 +513,43 @@ impl SessionRuntime {
         }
     }
 
+    pub fn share_uploads(&mut self, uploads: Arc<Uploads>) {
+        self.uploads.change(self.published_upload, 0);
+        uploads.change(0, self.published_upload);
+        self.uploads = uploads;
+    }
+
+    /// Counts what this session is uploading in the engine's uploads, the part the engine already
+    /// handed to the kernel, and tells it how long the others' may hold up its first exchange on a
+    /// fresh connection. The kernel's queue counts too: it cannot be told apart from bytes in flight,
+    /// and counting too much only lengthens the capped allowance.
+    fn refresh_uploads(&mut self, now: Now) {
+        let mut own = self.rpc.as_ref().map_or(0, |rpc| rpc.session().upload_backlog(now));
+        if own > 0 {
+            own = own.saturating_sub(self.connection.as_ref().map_or(0, Connection::unsent_bytes) as u64);
+            if let Some(rate) = self.rpc.as_ref().and_then(|rpc| rpc.session().uplink_rate()) {
+                self.uploads.note_rate(rate);
+            }
+        }
+        self.uploads.change(self.published_upload, own);
+        self.published_upload = own;
+        self.others_upload_queue = self.uploads.queue_seconds(own);
+        if let Some(rpc) = &mut self.rpc {
+            rpc.session_mut().set_uplink_queue(self.others_upload_queue);
+        }
+    }
+
+    /// How long a fresh connection may stay silent before a racer is tried; its first exchange may
+    /// wait behind other sessions' uploads.
+    fn silent_after(&self) -> f64 {
+        let silent_after = self
+            .rpc
+            .as_ref()
+            .and_then(|rpc| rpc.session().smoothed_rtt())
+            .map_or(RACE_SILENT_AFTER, |rtt| (rtt * 3.0 + 0.3).max(1.0));
+        silent_after.max(self.others_upload_queue)
+    }
+
     pub fn set_network_available(&mut self, available: bool, now: Now, registry: &Registry) {
         if self.network_available != available {
             self.network_available = available;
@@ -500,12 +562,20 @@ impl SessionRuntime {
                 self.flaps = 0;
                 self.rejections = 0;
                 self.next_attempt_at = now.mono;
+                if let Some(rpc) = &mut self.rpc {
+                    rpc.session_mut().forget_link_measurements();
+                }
+                self.uploads.note_rate(0.0);
             }
         }
     }
 
     pub fn reset_connection(&mut self, now: Now, registry: &Registry) {
         self.close_connection(registry, now, false);
+        if let Some(rpc) = &mut self.rpc {
+            rpc.session_mut().forget_link_measurements();
+        }
+        self.uploads.note_rate(0.0);
         self.resolved = None;
         self.failures = 0;
         self.flaps = 0;
@@ -575,7 +645,15 @@ impl SessionRuntime {
             return;
         };
         self.drop_racer(registry);
-        self.report_address(index, false, now, callbacks);
+        if self.suspect_since.is_none() {
+            self.report_address(index, false, now, callbacks);
+        } else {
+            self.note_address(index, false, now);
+        }
+        self.back_off_racing(now);
+    }
+
+    fn back_off_racing(&mut self, now: Now) {
         let backoff = RACE_RETRY_BASE * 2f64.powi(self.racer_failures.min(8) as i32);
         self.racer_failures = self.racer_failures.saturating_add(1);
         self.racer_retry_at = now.mono + backoff.min(RACE_RETRY_MAX);
@@ -591,6 +669,7 @@ impl SessionRuntime {
 
     fn close_connection(&mut self, registry: &Registry, now: Now, failed: bool) {
         self.close_reason = None;
+        self.suspect_since = None;
         self.drop_racer(registry);
         if let Some(mut connection) = self.connection.take() {
             self.account_usage(&connection);
@@ -777,6 +856,36 @@ impl SessionRuntime {
         }
     }
 
+    /// The primary worked and then went silent past a liveness check. A stall or a tunnel ends with
+    /// it intact and a dead one loses to a fresh connection, so it is kept while one races it, for
+    /// up to `SUSPECT_HOLD`. False when there is nothing to race it with or the hold is over.
+    fn suspect(&mut self, now: Now) -> bool {
+        let Some(connection) = &self.connection else {
+            return false;
+        };
+        if !connection.received_packet
+            || self.setup.proxy.is_some()
+            || self.setup.addresses.is_empty()
+            || self.suspect_since.is_some_and(|since| now.mono - since >= SUSPECT_HOLD)
+        {
+            return false;
+        }
+        let since = *self.suspect_since.get_or_insert(now.mono);
+        if let Some(rpc) = &mut self.rpc {
+            rpc.session_mut().hold_liveness_until(since + SUSPECT_HOLD);
+        }
+        true
+    }
+
+    fn clear_suspicion(&mut self, registry: &Registry) {
+        if self.suspect_since.take().is_some() {
+            self.drop_racer(registry);
+            if let Some(rpc) = &mut self.rpc {
+                rpc.session_mut().hold_liveness_until(0.0);
+            }
+        }
+    }
+
     fn start_racer(&mut self, registry: &Registry, now: Now, resolver: &mut dyn Resolve, rng: &mut OsRandom) {
         let Some(primary) = &self.connection else {
             return;
@@ -789,20 +898,22 @@ impl SessionRuntime {
             return;
         }
         let slow_connect = !primary.is_tcp_connected() && now.mono - primary.started_at >= RACE_AFTER;
-        let silent_after = self
-            .rpc
-            .as_ref()
-            .and_then(|rpc| rpc.session().smoothed_rtt())
-            .map_or(RACE_SILENT_AFTER, |rtt| (rtt * 3.0 + 0.3).max(1.0));
+        let silent_after = self.silent_after();
         let silent = primary.is_established()
             && !primary.received_bytes
             && primary.established_at.is_some_and(|at| now.mono - at >= silent_after);
-        if !slow_connect && !silent {
+        let suspect = self.suspect_since.is_some() && primary.is_established();
+        if !slow_connect && !silent && !suspect {
             return;
         }
         let primary_index = primary.address_index;
-        let next = self.best_address(Some(primary_index)).unwrap_or(primary_index);
+        let next = if suspect && self.racer_failures.is_multiple_of(2) {
+            primary_index
+        } else {
+            self.best_address(Some(primary_index)).unwrap_or(primary_index)
+        };
         let Pick::Ready(index, socket_address, address) = self.pick_address_at(next, resolver, now) else {
+            self.back_off_racing(now);
             return;
         };
         let transport = TransportConfig {
@@ -812,14 +923,20 @@ impl SessionRuntime {
             unix_time: (now.unix + self.time_difference()) as i32,
         };
         let token = self.free_token();
-        if let Ok(racer) = Connection::connect(registry, token, socket_address, &transport, None, index, now.mono, rng)
-        {
-            self.racer = Some(racer);
-            self.racer_check = silent.then(|| RacerCheck { nonce: rng.array(), sent: false });
+        match Connection::connect(registry, token, socket_address, &transport, None, index, now.mono, rng) {
+            Ok(racer) => {
+                self.racer = Some(racer);
+                self.racer_check =
+                    (silent || suspect).then(|| RacerCheck { nonce: rng.array(), sent: false, promote_at: None });
+            }
+            Err(_) => self.back_off_racing(now),
         }
     }
 
     fn race_deadline(&self, now: Now, config: &EngineConfig) -> Option<f64> {
+        if let Some(at) = self.racer_check.and_then(|check| check.promote_at) {
+            return Some(at.max(now.mono) + 0.001);
+        }
         if let Some(racer) = &self.racer {
             let limit = if self.racer_check.is_some() { RACE_VERIFY_TIMEOUT } else { config.connect_timeout };
             return Some(racer.started_at + limit + 0.01);
@@ -831,12 +948,9 @@ impl SessionRuntime {
         let start_at = if !primary.is_tcp_connected() {
             primary.started_at + RACE_AFTER
         } else if primary.is_established() && !primary.received_bytes {
-            let silent_after = self
-                .rpc
-                .as_ref()
-                .and_then(|rpc| rpc.session().smoothed_rtt())
-                .map_or(RACE_SILENT_AFTER, |rtt| (rtt * 3.0 + 0.3).max(1.0));
-            primary.established_at? + silent_after
+            primary.established_at? + self.silent_after()
+        } else if self.suspect_since.is_some() {
+            now.mono
         } else {
             return None;
         };
@@ -870,17 +984,24 @@ impl SessionRuntime {
         true
     }
 
+    /// Replaces the primary with the racer. `reason` is why the primary goes, unless the caller
+    /// already reported its failure.
     fn promote_racer(
         &mut self,
         registry: &Registry,
         now: Now,
         callbacks: &Arc<dyn EngineCallbacks>,
         rng: &mut OsRandom,
+        reason: Option<DropReason>,
     ) {
         self.racer_check = None;
         let Some(winner) = self.racer.take() else {
             return;
         };
+        if let Some(reason) = reason {
+            self.report_drop(reason, now, callbacks);
+        }
+        self.suspect_since = None;
         if let Some(mut loser) = self.connection.take() {
             self.report_address(loser.address_index, false, now, callbacks);
             self.account_usage(&loser);
@@ -901,6 +1022,24 @@ impl SessionRuntime {
         if connected {
             self.on_established(now, callbacks, rng);
         }
+    }
+
+    /// Replaces a primary that failed before it ever answered with the racer that already did.
+    fn promote_parked_racer(
+        &mut self,
+        registry: &Registry,
+        now: Now,
+        callbacks: &Arc<dyn EngineCallbacks>,
+        rng: &mut OsRandom,
+    ) -> bool {
+        if self.racer.is_none()
+            || self.connection_received_packet()
+            || self.racer_check.is_none_or(|check| check.promote_at.is_none())
+        {
+            return false;
+        }
+        self.promote_racer(registry, now, callbacks, rng, None);
+        true
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -926,7 +1065,13 @@ impl SessionRuntime {
             return;
         }
         if self.racer_check.is_none() {
-            self.promote_racer(registry, now, callbacks, rng);
+            self.promote_racer(registry, now, callbacks, rng, Some(DropReason::SlowConnect));
+            return;
+        }
+        if self.racer_check.is_some_and(|check| check.promote_at.is_some()) {
+            if readable {
+                self.fail_racer(registry, now, callbacks);
+            }
             return;
         }
         if !self.send_racer_check(registry, server_time, now, callbacks, rng) {
@@ -973,12 +1118,22 @@ impl SessionRuntime {
         };
         if verified {
             let index = racer.address_index;
+            let round_trip = now.mono - racer.started_at;
             self.racer_failures = 0;
             self.note_address(index, true, now);
-            if self.connection.as_ref().is_some_and(|primary| primary.received_bytes) {
+            let promote_at = self
+                .connection
+                .as_ref()
+                .and_then(|primary| primary.established_at)
+                .map_or(now.mono, |at| at + round_trip * 3.0 + 0.3);
+            if self.suspect_since.is_some() {
+                self.promote_racer(registry, now, callbacks, rng, Some(DropReason::RacerWon));
+            } else if self.connection.as_ref().is_some_and(|primary| primary.received_bytes) {
                 self.drop_racer(registry);
-            } else {
-                self.promote_racer(registry, now, callbacks, rng);
+            } else if promote_at <= now.mono {
+                self.promote_racer(registry, now, callbacks, rng, Some(DropReason::RacerWon));
+            } else if let Some(check) = &mut self.racer_check {
+                check.promote_at = Some(promote_at);
             }
         } else if failed {
             self.fail_racer(registry, now, callbacks);
@@ -995,6 +1150,7 @@ impl SessionRuntime {
                 connection.last_progress_at = now.mono;
                 self.acknowledged_out = connection.acknowledged_bytes().unwrap_or(0);
                 self.outbound_backlog_sample = 0;
+                self.kernel_moving_at = now.mono;
             }
             None => return,
         }
@@ -1042,7 +1198,10 @@ impl SessionRuntime {
         let mut failure: Option<ConnectionError> = None;
         if writable {
             let result = self.connection.as_mut().expect("connection").handle_writable(registry, now.mono);
-            if self.racer.is_some() && self.connection.as_ref().is_some_and(Connection::is_tcp_connected) {
+            if self.racer.is_some()
+                && self.racer_check.is_none()
+                && self.connection.as_ref().is_some_and(Connection::is_tcp_connected)
+            {
                 self.drop_racer(registry);
             }
             match result {
@@ -1107,12 +1266,31 @@ impl SessionRuntime {
             self.log(callbacks, LogLevel::Info, &format!("connection closed: {error}"));
             let established = self.connection.as_ref().is_some_and(Connection::is_established);
             let reason = self.close_reason.take();
+            let dropped = match reason {
+                Some(CloseReason::ServerRejected) => DropReason::KeyInvalid,
+                Some(CloseReason::KeyRejectionUnconfirmed) => DropReason::KeyRejectedOnce,
+                Some(CloseReason::SessionFailed) => DropReason::SessionError,
+                Some(CloseReason::AddressRejected) => DropReason::AddressRejected,
+                Some(CloseReason::TransportFlood) => DropReason::TransportFlood,
+                Some(CloseReason::HandshakeFailed) => DropReason::HandshakeFailed,
+                None => match error {
+                    ConnectionError::Closed => DropReason::Closed,
+                    ConnectionError::Io(_) => DropReason::IoError,
+                    ConnectionError::Transport(_) | ConnectionError::Socks(_) => DropReason::Protocol,
+                },
+            };
+            self.report_drop(dropped, now, callbacks);
             let reachable = matches!(
                 reason,
                 Some(CloseReason::ServerRejected)
                     | Some(CloseReason::KeyRejectionUnconfirmed)
                     | Some(CloseReason::TransportFlood)
             ) || (matches!(reason, Some(CloseReason::AddressRejected)) && self.rejections < 2);
+            if matches!(reason, None | Some(CloseReason::AddressRejected) | Some(CloseReason::SessionFailed))
+                && self.promote_parked_racer(registry, now, callbacks, rng)
+            {
+                return false;
+            }
             if let Some((index, success)) = self
                 .connection
                 .as_ref()
@@ -1126,7 +1304,7 @@ impl SessionRuntime {
                 | Some(CloseReason::AddressRejected)
                 | Some(CloseReason::HandshakeFailed) => true,
                 Some(CloseReason::TransportFlood) | Some(CloseReason::KeyRejectionUnconfirmed) => false,
-                None => !established || !received,
+                None | Some(CloseReason::SessionFailed) => !established || !received,
             };
             self.close_dropped_connection(registry, now, failed);
             return false;
@@ -1158,10 +1336,14 @@ impl SessionRuntime {
         };
         let (Some(acknowledged), Some(backlog)) = (connection.acknowledged_bytes(), connection.outbound_backlog())
         else {
+            self.kernel_moving_at = now.mono;
             return;
         };
         let was_pushing = self.outbound_backlog_sample >= OUTBOUND_PROGRESS_MIN_BACKLOG;
         self.outbound_backlog_sample = backlog;
+        if backlog == 0 || acknowledged > self.acknowledged_out {
+            self.kernel_moving_at = now.mono;
+        }
         if acknowledged > self.acknowledged_out {
             self.acknowledged_out = acknowledged;
             if was_pushing {
@@ -1170,6 +1352,18 @@ impl SessionRuntime {
                     rpc.note_bytes_received(now);
                 }
             }
+        }
+    }
+
+    /// Until when the session's transmit grace holds the request timer back. Not while the kernel keeps
+    /// bytes nobody acknowledges: the grace is for bytes that left the device, and a path that stopped
+    /// taking them is stuck, however slow the uplink.
+    fn transmit_grace_until(&self, now: Now) -> f64 {
+        match &self.rpc {
+            Some(rpc) if now.mono - self.kernel_moving_at <= SEND_QUEUE_STUCK_AFTER => {
+                rpc.session().transmit_grace_until()
+            }
+            _ => 0.0,
         }
     }
 
@@ -1245,10 +1439,12 @@ impl SessionRuntime {
                     };
                     let fresh_before = rpc.session().fresh_packets();
                     let result = rpc.handle_packet(&packet, now, rng);
-                    if rpc.session().fresh_packets() != fresh_before
-                        && let Some(connection) = &mut self.connection
-                    {
+                    let fresh = rpc.session().fresh_packets() != fresh_before;
+                    if fresh && let Some(connection) = &mut self.connection {
                         connection.last_progress_at = now.mono;
+                    }
+                    if fresh {
+                        self.clear_suspicion(registry);
                     }
                     match result {
                         Ok(()) => {
@@ -1279,6 +1475,7 @@ impl SessionRuntime {
                         | Err(SessionError::EvenServerMsgId(_)) => {}
                         Err(error) => {
                             self.log(callbacks, LogLevel::Warning, &format!("session error: {error}"));
+                            self.close_reason.get_or_insert(CloseReason::SessionFailed);
                             self.pump_rpc_events(now, registry, callbacks);
                             return Err(ConnectionError::Closed);
                         }
@@ -1286,8 +1483,11 @@ impl SessionRuntime {
                     self.pump_rpc_events(now, registry, callbacks);
                 }
                 Incoming::QuickAck(token) => {
-                    if let Some(rpc) = &mut self.rpc {
-                        rpc.handle_quick_ack(token, now);
+                    if self.rpc.as_mut().is_some_and(|rpc| rpc.handle_quick_ack(token, now)) {
+                        if let Some(connection) = &mut self.connection {
+                            connection.last_progress_at = now.mono;
+                        }
+                        self.clear_suspicion(registry);
                     }
                     self.pump_rpc_events(now, registry, callbacks);
                 }
@@ -1426,6 +1626,19 @@ impl SessionRuntime {
         }
     }
 
+    fn report_drop(&self, reason: DropReason, now: Now, callbacks: &Arc<dyn EngineCallbacks>) {
+        if let Some(connection) = &self.connection {
+            callbacks.on_event(
+                self.handle,
+                EngineEvent::ConnectionDropped {
+                    reason,
+                    answered: connection.received_packet,
+                    age: now.mono - connection.started_at,
+                },
+            );
+        }
+    }
+
     fn log(&self, callbacks: &Arc<dyn EngineCallbacks>, level: LogLevel, message: &str) {
         callbacks.on_log(level, &format!("[MTProtoEngine#{} dc{}] {message}", self.handle.0, self.setup.datacenter_id));
     }
@@ -1444,6 +1657,7 @@ impl SessionRuntime {
             callbacks.on_event(self.handle, EngineEvent::AuthKeyRequired);
         }
 
+        self.refresh_uploads(now);
         let wants = self.wants_connection(now);
         if !wants && self.connection.is_some() {
             self.close_connection(registry, now, false);
@@ -1452,9 +1666,18 @@ impl SessionRuntime {
             self.start_connection(registry, now, resolver, config, rng);
         }
 
+        if let Some(at) = self.racer_check.and_then(|check| check.promote_at) {
+            if self.connection.as_ref().is_some_and(|primary| primary.received_bytes) {
+                self.drop_racer(registry);
+            } else if now.mono >= at {
+                self.promote_racer(registry, now, callbacks, rng, Some(DropReason::RacerWon));
+            }
+        }
         self.start_racer(registry, now, resolver, rng);
         let racer_limit = if self.racer_check.is_some() { RACE_VERIFY_TIMEOUT } else { config.connect_timeout };
-        if self.racer.as_ref().is_some_and(|racer| now.mono - racer.started_at > racer_limit) {
+        if self.racer_check.is_none_or(|check| check.promote_at.is_none())
+            && self.racer.as_ref().is_some_and(|racer| now.mono - racer.started_at > racer_limit)
+        {
             self.fail_racer(registry, now, callbacks);
         }
         let mut failure = None;
@@ -1465,6 +1688,7 @@ impl SessionRuntime {
             let index = connection.address_index;
             let tcp_connected = connection.is_tcp_connected();
             if !tcp_connected && let Some(racer) = self.racer.take() {
+                self.report_drop(DropReason::ConnectTimeout, now, callbacks);
                 self.report_address(index, false, now, callbacks);
                 if let Some(mut loser) = self.connection.take() {
                     self.account_usage(&loser);
@@ -1472,13 +1696,14 @@ impl SessionRuntime {
                 }
                 self.connection = Some(racer);
             } else {
-                failure = Some("connect timeout");
+                failure = Some(DropReason::ConnectTimeout);
             }
         }
         if failure.is_none() && self.handshake_started_at.is_some_and(|started| now.mono - started > HANDSHAKE_TIMEOUT)
         {
             callbacks.on_event(self.handle, EngineEvent::AuthKeyCreationFailed { reason: "handshake timeout".into() });
             self.log(callbacks, LogLevel::Info, "handshake timeout");
+            self.report_drop(DropReason::HandshakeTimeout, now, callbacks);
             self.close_connection(registry, now, true);
         }
         if failure.is_none()
@@ -1492,40 +1717,60 @@ impl SessionRuntime {
         if failure.is_none() && self.handshake.is_none() {
             self.note_outbound_progress(now);
         }
+        let mut silence = false;
         if failure.is_none()
             && let Some(rpc) = &mut self.rpc
             && self.connection.as_ref().is_some_and(Connection::is_established)
             && self.handshake.is_none()
             && let Err(error) = rpc.handle_timeout(now)
         {
+            silence =
+                matches!(error, SessionError::PingTimeout | SessionError::ReadTimeout | SessionError::ProbeTimeout);
             failure = Some(match error {
-                SessionError::PingTimeout => "ping timeout",
-                SessionError::ReadTimeout => "read timeout",
-                SessionError::ProbeTimeout => "probe timeout",
-                _ => "session timeout",
+                SessionError::PingTimeout => DropReason::PingTimeout,
+                SessionError::ReadTimeout => DropReason::ReadTimeout,
+                SessionError::ProbeTimeout => DropReason::ProbeTimeout,
+                _ => DropReason::SessionError,
             });
         }
         if failure.is_none()
+            && self.suspect_since.is_none()
             && let (Some(connection), Some(rpc)) = (&self.connection, &self.rpc)
             && connection.is_established()
             && !self.timeout_fired
             && rpc.has_timeout_timer_requests()
-            && now.mono - connection.last_progress_at > self.setup.request_timeout
+            && now.mono - connection.last_progress_at.max(self.transmit_grace_until(now)) > self.setup.request_timeout
         {
             self.timeout_fired = true;
-            failure = Some("request timeout");
+            silence = true;
+            failure = Some(DropReason::RequestTimeout);
+        }
+        if silence && self.suspect(now) {
+            if let Some(reason) = failure.take()
+                && self.racer.is_none()
+            {
+                self.log(
+                    callbacks,
+                    LogLevel::Info,
+                    &format!("{}; racing a fresh connection against the silent one", reason.name()),
+                );
+            }
+            self.start_racer(registry, now, resolver, rng);
         }
         self.pump_rpc_events(now, registry, callbacks);
         if let Some(reason) = failure {
-            self.log(callbacks, LogLevel::Info, reason);
-            let received = self.connection_received_packet();
-            if !received && let Some(index) = self.connection.as_ref().map(|connection| connection.address_index) {
-                self.report_address(index, false, now, callbacks);
+            self.log(callbacks, LogLevel::Info, reason.name());
+            self.report_drop(reason, now, callbacks);
+            if !self.promote_parked_racer(registry, now, callbacks, rng) {
+                let received = self.connection_received_packet();
+                if !received && let Some(index) = self.connection.as_ref().map(|connection| connection.address_index) {
+                    self.report_address(index, false, now, callbacks);
+                }
+                if received {
+                    self.next_attempt_at = now.mono;
+                }
+                self.close_dropped_connection(registry, now, !received);
             }
-            if received {
-                self.next_attempt_at = now.mono;
-            }
-            self.close_dropped_connection(registry, now, !received);
         }
 
         self.flush_output(registry, now, callbacks, rng);
@@ -1581,7 +1826,10 @@ impl SessionRuntime {
         self.pump_rpc_events(now, registry, callbacks);
         if let Some(error) = failed {
             self.log(callbacks, LogLevel::Info, &format!("write failed: {error}"));
-            self.close_dropped_connection(registry, now, true);
+            self.report_drop(DropReason::IoError, now, callbacks);
+            if !self.promote_parked_racer(registry, now, callbacks, rng) {
+                self.close_dropped_connection(registry, now, true);
+            }
         }
     }
 
@@ -1629,6 +1877,7 @@ impl SessionRuntime {
     }
 
     pub fn next_deadline(&mut self, now: Now, config: &EngineConfig) -> Option<f64> {
+        self.refresh_uploads(now);
         let mut deadline = f64::INFINITY;
         let wants = self.wants_connection(now);
         if wants && self.connection.is_none() {
@@ -1642,6 +1891,7 @@ impl SessionRuntime {
         if let Some(at) = self.race_deadline(now, config) {
             deadline = deadline.min(at);
         }
+        let grace = self.transmit_grace_until(now);
         if let Some(connection) = &self.connection {
             if !connection.is_established() {
                 deadline = deadline.min(connection.started_at + config.connect_timeout);
@@ -1652,8 +1902,8 @@ impl SessionRuntime {
                 if let Some(at) = rpc.poll_timeout(now) {
                     deadline = deadline.min(at);
                 }
-                if rpc.has_timeout_timer_requests() && !self.timeout_fired {
-                    deadline = deadline.min(connection.last_progress_at + self.setup.request_timeout);
+                if rpc.has_timeout_timer_requests() && !self.timeout_fired && self.suspect_since.is_none() {
+                    deadline = deadline.min(connection.last_progress_at.max(grace) + self.setup.request_timeout);
                 }
             }
         } else if let Some(rpc) = &mut self.rpc
@@ -1715,6 +1965,12 @@ fn is_res_pq_for(packet: &[u8], nonce: &[u8; 16]) -> bool {
 
 fn rpc_pending_requests(rpc: RpcClient) -> Vec<RpcRequest> {
     rpc.into_requests()
+}
+
+impl Drop for SessionRuntime {
+    fn drop(&mut self) {
+        self.uploads.change(self.published_upload, 0);
+    }
 }
 
 #[cfg(test)]

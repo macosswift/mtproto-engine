@@ -904,7 +904,7 @@ fn session_case(seed: u64) -> CaseResult {
             format!("one {}-byte packet took {:?}", packet.len(), started.elapsed())
         })?;
         if g.one_in(8) {
-            session.handle_quick_ack(g.u32());
+            session.handle_quick_ack(g.u32(), now);
         }
         events += session.drain_events().len();
         ensure(events < 1_000_000, || "event storm".into())?;

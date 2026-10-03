@@ -24,6 +24,15 @@ pub struct Blackhole {
     pub end: BlackholeEnd,
 }
 
+/// Periodic outages of the whole link, as in a tunnel: every `every_min`–`every_max` the link goes
+/// dark for `length`, swallowing live connections and refusing new ones.
+#[derive(Debug, Clone, Copy)]
+pub struct Tunnel {
+    pub every_min: Duration,
+    pub every_max: Duration,
+    pub length: Duration,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DpiAction {
     Reset,
@@ -43,15 +52,25 @@ pub struct Profile {
     pub latency: Duration,
     pub jitter: Duration,
     pub bandwidth: Option<u64>,
+    /// Bytes per second from the client when it differs from `bandwidth`.
+    pub uplink: Option<u64>,
     pub max_chunk: usize,
     pub stall_probability: f64,
     pub stall: Duration,
     pub reset_after: Option<(Duration, Duration)>,
     pub blackhole: Option<Blackhole>,
+    pub tunnel: Option<Tunnel>,
     pub refuse_probability: f64,
     pub connect_delay: Duration,
     pub dpi: Option<Dpi>,
     pub queue_limit: Option<usize>,
+    /// One first-in, first-out bottleneck queue per direction shared by all connections, holding up
+    /// to this much transfer time, as a cellular modem's buffer does: bulk data sent first delays
+    /// everything sent after it on any connection. Without it connections share the link fairly.
+    pub fifo_queue: Option<Duration>,
+    /// A carrier NAT or firewall forgets a connection that carried nothing either way for this long
+    /// and from then on silently drops its packets both ways.
+    pub idle_timeout: Option<Duration>,
 }
 
 impl Profile {
@@ -61,15 +80,19 @@ impl Profile {
             latency: Duration::ZERO,
             jitter: Duration::ZERO,
             bandwidth: None,
+            uplink: None,
             max_chunk: 64 * 1024,
             stall_probability: 0.0,
             stall: Duration::ZERO,
             reset_after: None,
             blackhole: None,
+            tunnel: None,
             refuse_probability: 0.0,
             connect_delay: Duration::ZERO,
             dpi: None,
             queue_limit: None,
+            fifo_queue: None,
+            idle_timeout: None,
         }
     }
 
@@ -194,6 +217,140 @@ impl Profile {
         }
     }
 
+    /// GPRS/EDGE at the edge of coverage: long and jumpy round trips, a trickle of bandwidth,
+    /// multi-second stalls and slow, sometimes refused connects.
+    pub fn gprs() -> Self {
+        Self {
+            name: "gprs".into(),
+            latency: Duration::from_millis(500),
+            jitter: Duration::from_millis(250),
+            bandwidth: Some(48_000 / 8),
+            max_chunk: 256,
+            stall_probability: 0.05,
+            stall: Duration::from_millis(2500),
+            refuse_probability: 0.1,
+            connect_delay: Duration::from_millis(1500),
+            ..Self::perfect()
+        }
+    }
+
+    /// A geostationary satellite link: 600 ms round trips with little jitter.
+    pub fn satellite() -> Self {
+        Self {
+            name: "satellite".into(),
+            latency: Duration::from_millis(300),
+            jitter: Duration::from_millis(15),
+            bandwidth: Some(4_000_000 / 8),
+            max_chunk: 1400,
+            ..Self::perfect()
+        }
+    }
+
+    /// A mobile link on a train: 3G-like, with a tunnel every 8–20 s in which the whole link is
+    /// dark for 6 s, live connections and new ones alike.
+    pub fn train() -> Self {
+        Self {
+            name: "train".into(),
+            latency: Duration::from_millis(120),
+            jitter: Duration::from_millis(80),
+            bandwidth: Some(1_000_000 / 8),
+            max_chunk: 1400,
+            tunnel: Some(Tunnel {
+                every_min: Duration::from_secs(8),
+                every_max: Duration::from_secs(20),
+                length: Duration::from_secs(6),
+            }),
+            ..Self::perfect()
+        }
+    }
+
+    /// Heavy loss: every eighth chunk or so stalls for most of a second.
+    pub fn lossy_heavy() -> Self {
+        Self {
+            name: "lossy-heavy".into(),
+            latency: Duration::from_millis(100),
+            jitter: Duration::from_millis(80),
+            bandwidth: Some(2_000_000 / 8),
+            max_chunk: 1400,
+            stall_probability: 0.12,
+            stall: Duration::from_millis(900),
+            ..Self::perfect()
+        }
+    }
+
+    /// A usable downlink with a starved uplink, as on congested cells: sending media crawls.
+    pub fn uplink_starved() -> Self {
+        Self {
+            name: "uplink-starved".into(),
+            latency: Duration::from_millis(60),
+            jitter: Duration::from_millis(20),
+            bandwidth: Some(8_000_000 / 8),
+            uplink: Some(64_000 / 8),
+            max_chunk: 1400,
+            ..Self::perfect()
+        }
+    }
+
+    /// A 3G link behind a carrier NAT that forgets connections idle for 30 s, as many do: an app that
+    /// pings less often finds its connection silently dead after every pause.
+    pub fn nat() -> Self {
+        Self {
+            name: "nat".into(),
+            latency: Duration::from_millis(80),
+            jitter: Duration::from_millis(30),
+            bandwidth: Some(1_500_000 / 8),
+            max_chunk: 1400,
+            idle_timeout: Some(Duration::from_secs(30)),
+            ..Self::perfect()
+        }
+    }
+
+    /// A loaded LTE cell: a fair downlink, a 256 kbit/s uplink behind a modem buffer holding 3 s of
+    /// data, so a running upload delays every request sent after it.
+    pub fn bufferbloat() -> Self {
+        Self {
+            name: "bufferbloat".into(),
+            latency: Duration::from_millis(40),
+            jitter: Duration::from_millis(10),
+            bandwidth: Some(4_000_000 / 8),
+            uplink: Some(256_000 / 8),
+            max_chunk: 1400,
+            fifo_queue: Some(Duration::from_secs(3)),
+            ..Self::perfect()
+        }
+    }
+
+    /// A congested cell's downlink: 1 Mbit/s behind a base-station buffer holding 5 s of data, so a
+    /// running download delays every answer and pong behind it by seconds. The buffer is per
+    /// direction, so the 512 kbit/s uplink queues up to 5 s behind an upload as well.
+    pub fn bufferbloat_down() -> Self {
+        Self {
+            name: "bufferbloat-down".into(),
+            latency: Duration::from_millis(40),
+            jitter: Duration::from_millis(10),
+            bandwidth: Some(1_000_000 / 8),
+            uplink: Some(512_000 / 8),
+            max_chunk: 1400,
+            fifo_queue: Some(Duration::from_secs(5)),
+            ..Self::perfect()
+        }
+    }
+
+    /// Wi-Fi to cellular handovers: connections reset every 4–12 s, reconnects are slow and some
+    /// are refused.
+    pub fn handover() -> Self {
+        Self {
+            name: "handover".into(),
+            latency: Duration::from_millis(40),
+            jitter: Duration::from_millis(15),
+            bandwidth: Some(10_000_000 / 8),
+            reset_after: Some((Duration::from_secs(4), Duration::from_secs(12))),
+            refuse_probability: 0.15,
+            connect_delay: Duration::from_millis(800),
+            ..Self::perfect()
+        }
+    }
+
     pub fn by_name(name: &str) -> Option<Self> {
         match name {
             "perfect" => Some(Self::perfect()),
@@ -206,6 +363,15 @@ impl Profile {
             "blackholes" => Some(Self::blackholes()),
             "edge" => Some(Self::edge()),
             "edge-flaky" => Some(Self::edge_flaky()),
+            "gprs" => Some(Self::gprs()),
+            "satellite" => Some(Self::satellite()),
+            "train" => Some(Self::train()),
+            "lossy-heavy" => Some(Self::lossy_heavy()),
+            "uplink-starved" => Some(Self::uplink_starved()),
+            "handover" => Some(Self::handover()),
+            "bufferbloat" => Some(Self::bufferbloat()),
+            "bufferbloat-down" => Some(Self::bufferbloat_down()),
+            "nat" => Some(Self::nat()),
             "dpi-reset" => Some(Self::dpi("dpi-reset", DpiAction::Reset, 1.0)),
             "dpi-blackhole" => Some(Self::dpi("dpi-blackhole", DpiAction::Blackhole, 1.0)),
             "dpi-half" => Some(Self::dpi("dpi-half", DpiAction::Blackhole, 0.5)),
@@ -225,6 +391,15 @@ impl Profile {
             "blackholes",
             "edge",
             "edge-flaky",
+            "gprs",
+            "satellite",
+            "train",
+            "lossy-heavy",
+            "uplink-starved",
+            "handover",
+            "bufferbloat",
+            "bufferbloat-down",
+            "nat",
             "dpi-reset",
             "dpi-blackhole",
             "dpi-half",
@@ -246,9 +421,29 @@ struct Bucket {
     rate: Option<f64>,
     available: f64,
     last: Instant,
+    /// When the FIFO bottleneck finishes sending what is queued in it.
+    busy_until: Instant,
 }
 
 impl Bucket {
+    fn new(rate: Option<f64>) -> Self {
+        let now = Instant::now();
+        Self { rate, available: 0.0, last: now, busy_until: now }
+    }
+
+    fn queued(&self, now: Instant) -> Duration {
+        self.busy_until.saturating_duration_since(now)
+    }
+
+    /// Queues `bytes` behind everything already in the FIFO bottleneck; returns when they are through.
+    fn enqueue(&mut self, bytes: usize, now: Instant) -> Instant {
+        let Some(rate) = self.rate else {
+            return now;
+        };
+        self.busy_until = self.busy_until.max(now) + Duration::from_secs_f64(bytes as f64 / rate);
+        self.busy_until
+    }
+
     fn delay_for(&mut self, bytes: usize) -> Duration {
         let Some(rate) = self.rate else {
             return Duration::ZERO;
@@ -265,6 +460,15 @@ impl Bucket {
 struct Random(u64);
 
 impl Random {
+    /// Spreads the seed over the whole state: xorshift draws small numbers first from a small state,
+    /// which refused every first connection, and `seed | 1` alone made neighbouring seeds identical.
+    fn new(seed: u64) -> Self {
+        let mut z = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        Self((z ^ (z >> 31)) | 1)
+    }
+
     fn next(&mut self) -> u64 {
         let mut x = self.0;
         x ^= x << 13;
@@ -294,6 +498,10 @@ struct ConnectionControl {
     blackholed: AtomicBool,
     dead: AtomicBool,
     closed: AtomicBool,
+    /// Blackholed by a tunnel, to come back when it ends.
+    tunneled: AtomicBool,
+    /// When the connection last carried bytes either way.
+    active_at: Mutex<Instant>,
 }
 
 impl ConnectionControl {
@@ -337,6 +545,68 @@ pub struct NetSim {
     pub address: SocketAddr,
     shared: Arc<Shared>,
     thread: Option<JoinHandle<()>>,
+    tunnel_thread: Option<JoinHandle<()>>,
+}
+
+/// A tunnel stops all traffic and refuses new connections, but live connections survive it as TCP
+/// connections do: what was sent meanwhile arrives once the link is back.
+fn begin_tunnel(shared: &Shared, length: Duration) {
+    *shared.outage_until.lock().unwrap() = Some(Instant::now() + length);
+    for control in shared.live.lock().unwrap().iter() {
+        if !control.blackholed.swap(true, Ordering::SeqCst) {
+            control.tunneled.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+fn end_tunnel(shared: &Shared) {
+    for control in shared.live.lock().unwrap().iter() {
+        if control.tunneled.swap(false, Ordering::SeqCst) && !control.dead.load(Ordering::SeqCst) {
+            control.blackholed.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
+fn begin_outage(shared: &Shared, duration: Duration) {
+    *shared.outage_until.lock().unwrap() = Some(Instant::now() + duration);
+    for control in shared.live.lock().unwrap().iter() {
+        control.dead.store(true, Ordering::SeqCst);
+        control.blackholed.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Sleeps up to `duration`, waking early when the simulator stops. Returns false if it stopped.
+fn sleep_unless_stopped(shared: &Shared, duration: Duration) -> bool {
+    let until = Instant::now() + duration;
+    while Instant::now() < until {
+        if shared.stop.load(Ordering::Relaxed) {
+            return false;
+        }
+        std::thread::sleep((until - Instant::now()).min(Duration::from_millis(20)));
+    }
+    !shared.stop.load(Ordering::Relaxed)
+}
+
+fn run_tunnels(shared: Arc<Shared>, seed: u64) {
+    let mut random = Random::new(seed);
+    loop {
+        let Some(tunnel) = shared.profile.lock().unwrap().tunnel else {
+            if !sleep_unless_stopped(&shared, Duration::from_millis(200)) {
+                return;
+            }
+            continue;
+        };
+        let span = tunnel.every_max.saturating_sub(tunnel.every_min);
+        let wait = tunnel.every_min + span.mul_f64(random.unit());
+        if !sleep_unless_stopped(&shared, wait) {
+            return;
+        }
+        begin_tunnel(&shared, tunnel.length);
+        if !sleep_unless_stopped(&shared, tunnel.length) {
+            return;
+        }
+        end_tunnel(&shared);
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -362,10 +632,11 @@ impl NetSim {
         }
         let address = listener.local_addr()?;
         let rate = profile.bandwidth.map(|value| value as f64);
+        let up_rate = profile.uplink.or(profile.bandwidth).map(|value| value as f64);
         let shared = Arc::new(Shared {
             profile: Mutex::new(profile),
-            up: Mutex::new(Bucket { rate, available: 0.0, last: Instant::now() }),
-            down: Mutex::new(Bucket { rate, available: 0.0, last: Instant::now() }),
+            up: Mutex::new(Bucket::new(up_rate)),
+            down: Mutex::new(Bucket::new(rate)),
             stop: AtomicBool::new(false),
             outage_until: Mutex::new(None),
             live: Mutex::new(Vec::new()),
@@ -375,7 +646,7 @@ impl NetSim {
             blackholes: AtomicU64::new(0),
             bytes_up: AtomicU64::new(0),
             bytes_down: AtomicU64::new(0),
-            seed: AtomicU64::new(seed | 1),
+            seed: AtomicU64::new(seed),
         });
         let thread = {
             let shared = shared.clone();
@@ -394,22 +665,24 @@ impl NetSim {
                 }
             })?
         };
-        Ok(Self { address, shared, thread: Some(thread) })
+        let tunnel_thread = {
+            let shared = shared.clone();
+            std::thread::Builder::new()
+                .name("netsim-tunnel".into())
+                .spawn(move || run_tunnels(shared, seed ^ 0x7475_6e6e_656c))?
+        };
+        Ok(Self { address, shared, thread: Some(thread), tunnel_thread: Some(tunnel_thread) })
     }
 
     pub fn set_profile(&self, profile: Profile) {
         let rate = profile.bandwidth.map(|value| value as f64);
-        self.shared.up.lock().unwrap().rate = rate;
+        self.shared.up.lock().unwrap().rate = profile.uplink.or(profile.bandwidth).map(|value| value as f64);
         self.shared.down.lock().unwrap().rate = rate;
         *self.shared.profile.lock().unwrap() = profile;
     }
 
     pub fn outage(&self, duration: Duration) {
-        *self.shared.outage_until.lock().unwrap() = Some(Instant::now() + duration);
-        for control in self.shared.live.lock().unwrap().iter() {
-            control.dead.store(true, Ordering::SeqCst);
-            control.blackholed.store(true, Ordering::SeqCst);
-        }
+        begin_outage(&self.shared, duration);
     }
 
     pub fn reset_all(&self) {
@@ -441,6 +714,9 @@ impl Drop for NetSim {
         self.shared.stop.store(true, Ordering::Relaxed);
         self.reset_all();
         if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        if let Some(thread) = self.tunnel_thread.take() {
             let _ = thread.join();
         }
     }
@@ -507,13 +783,26 @@ fn set_receive_buffer(socket: &impl AsRawFd, bytes: usize) {
     }
 }
 
+/// The client closed the connection while it was being set up, without sending anything.
+fn client_gone(client: &TcpStream) -> bool {
+    let _ = client.set_nonblocking(true);
+    let mut probe = [0u8; 1];
+    let gone = match client.peek(&mut probe) {
+        Ok(0) => true,
+        Ok(_) => false,
+        Err(error) => error.kind() != ErrorKind::WouldBlock,
+    };
+    let _ = client.set_nonblocking(false);
+    gone
+}
+
 fn handle_connection(mut client: TcpStream, upstream: Upstream, shared: Arc<Shared>) {
     let _ = client.set_nonblocking(false);
     let profile = shared.profile.lock().unwrap().clone();
     if let Some(limit) = profile.queue_limit {
         set_receive_buffer(&client, limit);
     }
-    let mut random = Random(shared.seed.fetch_add(0x9e37_79b9_7f4a_7c15, Ordering::Relaxed) | 1);
+    let mut random = Random::new(shared.seed.fetch_add(1, Ordering::Relaxed));
     let outage = shared.outage_until.lock().unwrap().is_some_and(|until| Instant::now() < until);
     if outage || random.unit() < profile.refuse_probability {
         shared.refused.fetch_add(1, Ordering::Relaxed);
@@ -538,6 +827,9 @@ fn handle_connection(mut client: TcpStream, upstream: Upstream, shared: Arc<Shar
     };
     if !profile.connect_delay.is_zero() {
         std::thread::sleep(profile.connect_delay);
+        if client_gone(&client) {
+            return;
+        }
     }
     let Ok(upstream) = TcpStream::connect_timeout(&target, Duration::from_secs(10)) else {
         return;
@@ -554,6 +846,8 @@ fn handle_connection(mut client: TcpStream, upstream: Upstream, shared: Arc<Shar
         blackholed: AtomicBool::new(false),
         dead: AtomicBool::new(false),
         closed: AtomicBool::new(false),
+        tunneled: AtomicBool::new(false),
+        active_at: Mutex::new(Instant::now()),
     });
     shared.live.lock().unwrap().push(control.clone());
 
@@ -566,6 +860,23 @@ fn handle_connection(mut client: TcpStream, upstream: Upstream, shared: Arc<Shar
             if !control.closed.load(Ordering::SeqCst) {
                 shared.resets.fetch_add(1, Ordering::Relaxed);
                 control.reset();
+            }
+        });
+    }
+    if let Some(timeout) = profile.idle_timeout {
+        let control = control.clone();
+        let shared = shared.clone();
+        std::thread::spawn(move || {
+            while !control.closed.load(Ordering::SeqCst) && !shared.stop.load(Ordering::Relaxed) {
+                let idle = control.active_at.lock().unwrap().elapsed();
+                if idle >= timeout {
+                    if !control.dead.swap(true, Ordering::SeqCst) {
+                        shared.blackholes.fetch_add(1, Ordering::Relaxed);
+                    }
+                    control.blackholed.store(true, Ordering::SeqCst);
+                    return;
+                }
+                std::thread::sleep((timeout - idle).min(Duration::from_millis(200)));
             }
         });
     }
@@ -638,7 +949,7 @@ fn spawn_direction(
         std::thread::spawn(move || deliver(receiver, destination, shared, control, upstream))
     };
     std::thread::spawn(move || {
-        let mut random = Random(seed | 1);
+        let mut random = Random::new(seed);
         let mut buffer = vec![0u8; 64 * 1024];
         let mut last_delivery = Instant::now();
         let mut seen: u64 = 0;
@@ -650,6 +961,7 @@ fn spawn_direction(
                 }
                 Ok(read) => {
                     seen += read as u64;
+                    *control.active_at.lock().unwrap() = Instant::now();
                     if let Some(dpi) = dpi
                         && seen > dpi.after_bytes_up
                     {
@@ -669,12 +981,26 @@ fn spawn_direction(
                         }
                     }
                     let profile = shared.profile.lock().unwrap().clone();
+                    let bucket = if upstream { &shared.up } else { &shared.down };
                     for chunk in buffer[..read].chunks(profile.max_chunk.max(1)) {
                         let mut delay = profile.latency + random.between(Duration::ZERO, profile.jitter);
                         if profile.stall_probability > 0.0 && random.unit() < profile.stall_probability {
                             delay += profile.stall;
                         }
-                        let at = (Instant::now() + delay).max(last_delivery);
+                        let sent = match profile.fifo_queue {
+                            Some(depth) => {
+                                loop {
+                                    let queued = bucket.lock().unwrap().queued(Instant::now());
+                                    if queued <= depth || shared.stop.load(Ordering::Relaxed) {
+                                        break;
+                                    }
+                                    std::thread::sleep((queued - depth).min(Duration::from_millis(20)));
+                                }
+                                bucket.lock().unwrap().enqueue(chunk.len(), Instant::now())
+                            }
+                            None => Instant::now(),
+                        };
+                        let at = (sent + delay).max(last_delivery);
                         last_delivery = at;
                         if sender.send(Some((at, chunk.to_vec()))).is_err() {
                             return;
@@ -698,6 +1024,15 @@ impl ChunkSender {
             ChunkSender::Unbounded(sender) => sender.send(chunk).map_err(|_| ()),
             ChunkSender::Bounded(sender) => sender.send(chunk).map_err(|_| ()),
         }
+    }
+}
+
+/// Holds `bytes` for as long as the fairly shared link takes to pass them.
+fn pace(shared: &Shared, upstream: bool, bytes: usize) {
+    let bucket = if upstream { &shared.up } else { &shared.down };
+    let wait = bucket.lock().unwrap().delay_for(bytes);
+    if !wait.is_zero() {
+        std::thread::sleep(wait);
     }
 }
 
@@ -726,9 +1061,21 @@ fn deliver(
             }
             continue;
         }
-        for data in held.drain(..) {
-            if destination.write_all(&data).is_err() {
-                return;
+        if !held.is_empty() {
+            let (latency, fifo) = {
+                let profile = shared.profile.lock().unwrap();
+                (profile.latency, profile.fifo_queue.is_some())
+            };
+            std::thread::sleep(latency);
+            for data in held.drain(..) {
+                if !fifo {
+                    pace(&shared, upstream, data.len());
+                }
+                if destination.write_all(&data).is_err() {
+                    return;
+                }
+                let counter = if upstream { &shared.bytes_up } else { &shared.bytes_down };
+                counter.fetch_add(data.len() as u64, Ordering::Relaxed);
             }
         }
         let Some(item) = item else {
@@ -742,10 +1089,8 @@ fn deliver(
         if at > now {
             std::thread::sleep(at - now);
         }
-        let bucket = if upstream { &shared.up } else { &shared.down };
-        let wait = bucket.lock().unwrap().delay_for(data.len());
-        if !wait.is_zero() {
-            std::thread::sleep(wait);
+        if shared.profile.lock().unwrap().fifo_queue.is_none() {
+            pace(&shared, upstream, data.len());
         }
         if control.blackholed.load(Ordering::SeqCst) {
             if !control.dead.load(Ordering::SeqCst) {
@@ -850,6 +1195,126 @@ mod tests {
         stream.read_exact(&mut received).unwrap();
         sender.join().unwrap();
         assert!(started.elapsed() >= Duration::from_millis(400), "{:?}", started.elapsed());
+    }
+
+    #[test]
+    fn tunnels_hold_the_whole_link_and_then_let_it_resume() {
+        let upstream = echo_server();
+        let mut profile = Profile::perfect();
+        profile.tunnel = Some(Tunnel {
+            every_min: Duration::from_millis(800),
+            every_max: Duration::from_millis(800),
+            length: Duration::from_millis(600),
+        });
+        let started = Instant::now();
+        let sim = NetSim::start(upstream, profile, 6).unwrap();
+        let mut stream = TcpStream::connect(sim.address).unwrap();
+        stream.write_all(b"x").unwrap();
+        let mut one = [0u8; 1];
+        stream.read_exact(&mut one).unwrap();
+        std::thread::sleep(Duration::from_millis(900).saturating_sub(started.elapsed()));
+        assert!(sim.in_outage(), "the tunnel started");
+        stream.set_read_timeout(Some(Duration::from_millis(150))).unwrap();
+        let _ = stream.write_all(b"y");
+        assert!(stream.read(&mut one).is_err() || one == [b'x'], "nothing gets through the tunnel");
+        let mut refused = TcpStream::connect(sim.address).unwrap();
+        refused.set_read_timeout(Some(Duration::from_millis(150))).unwrap();
+        let _ = refused.write_all(b"z");
+        let mut buffer = [0u8; 1];
+        assert!(!matches!(refused.read(&mut buffer), Ok(1)), "new connections do not get through either");
+        std::thread::sleep(Duration::from_millis(1600).saturating_sub(started.elapsed()));
+        assert!(!sim.in_outage(), "the tunnel ended");
+        stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        stream.read_exact(&mut one).unwrap();
+        assert_eq!(one, [b'y'], "the live connection survived the tunnel and delivers what was held");
+        assert!(Profile::train().tunnel.is_some());
+    }
+
+    fn echo_delay(sim: &NetSim, bulk: usize) -> Duration {
+        let mut bulk_stream = TcpStream::connect(sim.address).unwrap();
+        let mut probe = TcpStream::connect(sim.address).unwrap();
+        bulk_stream.write_all(&vec![7u8; bulk]).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        let started = Instant::now();
+        probe.write_all(b"p").unwrap();
+        let mut one = [0u8; 1];
+        probe.read_exact(&mut one).unwrap();
+        started.elapsed()
+    }
+
+    #[test]
+    fn a_fifo_bottleneck_queues_every_connection_behind_bulk_data() {
+        let upstream = echo_server();
+        let mut profile = Profile::perfect();
+        profile.uplink = Some(10_000);
+        profile.max_chunk = 1000;
+        let fair = NetSim::start(upstream, profile.clone(), 3).unwrap();
+        assert!(echo_delay(&fair, 30_000) < Duration::from_millis(800), "fair sharing lets the probe through");
+        profile.fifo_queue = Some(Duration::from_secs(2));
+        let bloated = NetSim::start(upstream, profile, 3).unwrap();
+        let delay = echo_delay(&bloated, 30_000);
+        assert!(delay >= Duration::from_millis(1500), "the probe waits behind the queued bulk data: {delay:?}");
+        assert!(delay < Duration::from_secs(4), "but no longer than the queue holds: {delay:?}");
+        assert_eq!(Profile::bufferbloat().fifo_queue, Some(Duration::from_secs(3)));
+        assert_eq!(Profile::bufferbloat_down().fifo_queue, Some(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn seeds_spread_and_first_connections_are_not_always_refused() {
+        let first: Vec<f64> = (0..64u64).map(|seed| Random::new(seed).unit()).collect();
+        assert!(first.iter().filter(|draw| **draw < 0.1).count() < 16, "{first:?}");
+        assert_ne!(Random::new(5000).next(), Random::new(5001).next(), "neighbouring seeds differ");
+    }
+
+    #[test]
+    fn a_nat_forgets_an_idle_connection_but_not_a_busy_one() {
+        let upstream = echo_server();
+        let mut profile = Profile::perfect();
+        profile.idle_timeout = Some(Duration::from_millis(400));
+        let sim = NetSim::start(upstream, profile, 8).unwrap();
+        let mut busy = TcpStream::connect(sim.address).unwrap();
+        let mut idle = TcpStream::connect(sim.address).unwrap();
+        let mut one = [0u8; 1];
+        for stream in [&mut busy, &mut idle] {
+            stream.write_all(b"a").unwrap();
+            stream.read_exact(&mut one).unwrap();
+        }
+        for _ in 0..6 {
+            std::thread::sleep(Duration::from_millis(150));
+            busy.write_all(b"b").unwrap();
+            busy.read_exact(&mut one).unwrap();
+        }
+        assert_eq!(sim.stats().blackholes, 1, "only the idle connection was forgotten");
+        idle.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+        idle.write_all(b"c").unwrap();
+        assert!(idle.read(&mut one).is_err(), "the idle connection drops packets");
+        assert_eq!(Profile::nat().idle_timeout, Some(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn uplink_limit_applies_to_client_traffic_only() {
+        let upstream = echo_server();
+        let mut profile = Profile::perfect();
+        profile.uplink = Some(50_000);
+        let sim = NetSim::start(upstream, profile, 5).unwrap();
+        let mut stream = TcpStream::connect(sim.address).unwrap();
+        let data = vec![9u8; 50_000];
+        let started = Instant::now();
+        let mut writer = stream.try_clone().unwrap();
+        let sender = std::thread::spawn(move || writer.write_all(&data).unwrap());
+        let mut received = vec![0u8; 50_000];
+        stream.read_exact(&mut received).unwrap();
+        sender.join().unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(800), "{:?}", started.elapsed());
+        assert_eq!(Profile::uplink_starved().uplink, Some(8_000));
+
+        let mut fast_uplink = Profile::perfect();
+        fast_uplink.bandwidth = Some(50_000);
+        fast_uplink.uplink = Some(10_000_000);
+        sim.set_profile(fast_uplink);
+        assert_eq!(sim.shared.up.lock().unwrap().rate, Some(10_000_000.0));
+        assert_eq!(sim.shared.down.lock().unwrap().rate, Some(50_000.0));
+        assert!(Profile::all_names().iter().all(|name| Profile::by_name(name).is_some()));
     }
 
     #[test]

@@ -12,6 +12,8 @@ pub const AUTH_EXPORT_AUTHORIZATION: u32 = 0xe5bf_ffcd;
 pub const AUTH_IMPORT_AUTHORIZATION: u32 = 0xa57a_7dad;
 pub const HELP_GET_CDN_CONFIG: u32 = 0x5202_9342;
 pub const HELP_GET_NEAREST_DC: u32 = 0x1fb3_3026;
+pub const UPLOAD_SAVE_FILE_PART: u32 = 0xb304_a621;
+pub const UPLOAD_SAVE_BIG_FILE_PART: u32 = 0xde7b_673d;
 
 pub const UPLOAD_FILE: u32 = 0x096a_18d5;
 pub const UPLOAD_FILE_CDN_REDIRECT: u32 = 0xf18c_da44;
@@ -28,6 +30,12 @@ pub const INPUT_DOCUMENT_FILE_LOCATION: u32 = 0xbad0_7584;
 pub const INPUT_PHOTO_FILE_LOCATION: u32 = 0x4018_1ffe;
 
 pub const MEGABYTE: u64 = 1 << 20;
+/// Uploaded files are made of blocks of this size, each starting with its index and the file's tag
+/// (`upload_content`).
+pub const UPLOAD_BLOCK: usize = 1024;
+const UPLOAD_HEADER: usize = 16;
+pub const UPLOAD_MAX_PART: usize = 512 * 1024;
+const UPLOAD_CONTENT_ID: i64 = 0x5550_4c4f_4144;
 pub const CDN_HASH_CHUNK: u64 = 128 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,6 +110,13 @@ pub struct ApiStats {
     pub bytes_served: u64,
     pub file_requests: HashMap<(i64, u64), usize>,
     pub cdn_requests: HashMap<(i64, u64), usize>,
+    pub upload_parts: usize,
+    pub upload_bytes: u64,
+    /// Parts received again after they were already stored.
+    pub upload_duplicates: usize,
+    /// Parts whose bytes or position did not match what the client must have sent.
+    pub upload_bad_parts: usize,
+    pub upload_largest_part: usize,
 }
 
 pub enum ApiReply {
@@ -124,8 +139,39 @@ struct WorldState {
     authorized: HashSet<(i32, u64)>,
     exports: HashMap<i64, (i32, Vec<u8>)>,
     cdn_tokens: HashMap<Vec<u8>, CdnToken>,
+    uploads: HashMap<i64, UploadState>,
     rng: XorShiftRandom,
     stats: ApiStats,
+}
+
+#[derive(Default)]
+struct UploadState {
+    /// The part size implied by a part's position, once a part other than the first arrived.
+    part_size: Option<u64>,
+    /// The file tag every block carries.
+    tag: Option<u64>,
+    /// Received parts and their lengths.
+    parts: HashMap<i32, usize>,
+    /// Parts too short to carry a block header, kept until the part size and tag are known.
+    short_parts: Vec<(i32, Vec<u8>)>,
+    bad: bool,
+}
+
+impl UploadState {
+    /// The size of every part but the last: implied by a later part's offset, or else part 0's length.
+    fn part_size(&self) -> Option<u64> {
+        self.part_size
+            .or_else(|| self.parts.get(&0).filter(|length| **length >= UPLOAD_HEADER).map(|length| *length as u64))
+    }
+}
+
+/// One uploaded file as the server holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadedFile {
+    pub tag: Option<u64>,
+    pub bytes: u64,
+    /// Every part from 0 to the last arrived, every part but the last has the part size, and no part was bad.
+    pub complete: bool,
 }
 
 pub struct ApiWorld {
@@ -159,6 +205,41 @@ pub fn file_content(file_id: i64, offset: u64, length: usize) -> Vec<u8> {
     data.drain(..skip);
     data.truncate(length);
     data
+}
+
+/// The bytes of the upload tagged `tag` from `offset` on: every `UPLOAD_BLOCK` bytes start with the
+/// block's index and the tag, so a part says where it belongs whatever the client's part size, and
+/// parts of two files cannot be swapped unnoticed.
+pub fn upload_content(tag: u64, offset: u64, length: usize) -> Vec<u8> {
+    let mut data = Vec::with_capacity(length);
+    let mut position = offset;
+    while data.len() < length {
+        let block = position / UPLOAD_BLOCK as u64;
+        let within = (position % UPLOAD_BLOCK as u64) as usize;
+        let mut block_bytes = block.to_le_bytes().to_vec();
+        block_bytes.extend_from_slice(&tag.to_le_bytes());
+        block_bytes.extend_from_slice(&file_content(
+            UPLOAD_CONTENT_ID,
+            block * UPLOAD_BLOCK as u64 + UPLOAD_HEADER as u64,
+            UPLOAD_BLOCK - UPLOAD_HEADER,
+        ));
+        let take = (UPLOAD_BLOCK - within).min(length - data.len());
+        data.extend_from_slice(&block_bytes[within..within + take]);
+        position += take as u64;
+    }
+    data
+}
+
+/// Where a received part starts and its file's tag, read from its first block, if its bytes are
+/// what `upload_content` makes there.
+fn upload_part_offset(bytes: &[u8]) -> Option<(u64, u64)> {
+    if bytes.len() < UPLOAD_HEADER {
+        return None;
+    }
+    let block = u64::from_le_bytes(bytes[..8].try_into().ok()?);
+    let tag = u64::from_le_bytes(bytes[8..16].try_into().ok()?);
+    let offset = block.checked_mul(UPLOAD_BLOCK as u64)?;
+    (upload_content(tag, offset, bytes.len()) == bytes).then_some((offset, tag))
 }
 
 pub fn cdn_iv(base: &[u8; 16], offset: u64) -> [u8; 16] {
@@ -223,6 +304,7 @@ impl ApiWorld {
                 authorized: HashSet::new(),
                 exports: HashMap::new(),
                 cdn_tokens: HashMap::new(),
+                uploads: HashMap::new(),
                 rng: XorShiftRandom::new(seed),
                 stats: ApiStats::default(),
             }),
@@ -245,6 +327,29 @@ impl ApiWorld {
         self.state.lock().unwrap().stats.clone()
     }
 
+    /// The uploads the server received, by file.
+    pub fn uploaded_files(&self) -> Vec<UploadedFile> {
+        let state = self.state.lock().unwrap();
+        state
+            .uploads
+            .values()
+            .map(|upload| {
+                let last = upload.parts.keys().copied().max().unwrap_or(-1);
+                let bytes: u64 = upload.parts.values().map(|length| *length as u64).sum();
+                let contiguous = (0..=last).all(|part| upload.parts.contains_key(&part));
+                let sized = match upload.part_size() {
+                    Some(size) => upload.parts.iter().all(|(part, length)| *part == last || *length as u64 == size),
+                    None => last == 0,
+                };
+                UploadedFile {
+                    tag: upload.tag,
+                    bytes,
+                    complete: last >= 0 && contiguous && sized && upload.short_parts.is_empty() && !upload.bad,
+                }
+            })
+            .collect()
+    }
+
     pub fn handles(constructor: u32) -> bool {
         matches!(
             constructor,
@@ -256,6 +361,8 @@ impl ApiWorld {
                 | AUTH_IMPORT_AUTHORIZATION
                 | HELP_GET_CDN_CONFIG
                 | HELP_GET_NEAREST_DC
+                | UPLOAD_SAVE_FILE_PART
+                | UPLOAD_SAVE_BIG_FILE_PART
         )
     }
 
@@ -310,6 +417,9 @@ impl ApiWorld {
                 writer.write_vector_header(0);
                 ApiReply::Result(writer.into_inner())
             }
+            UPLOAD_SAVE_FILE_PART | UPLOAD_SAVE_BIG_FILE_PART => {
+                self.save_file_part(&mut state, datacenter_id, constructor == UPLOAD_SAVE_BIG_FILE_PART, &mut reader)
+            }
             HELP_GET_NEAREST_DC => {
                 let mut writer = Writer::new();
                 writer.write_u32(NEAREST_DC);
@@ -320,6 +430,77 @@ impl ApiWorld {
             }
             _ => ApiReply::Error(400, "METHOD_INVALID".into()),
         }
+    }
+
+    fn save_file_part(
+        &self,
+        state: &mut WorldState,
+        datacenter_id: i32,
+        big: bool,
+        reader: &mut Reader<'_>,
+    ) -> ApiReply {
+        let (Ok(file_id), Ok(part)) = (reader.read_i64(), reader.read_i32()) else {
+            return ApiReply::Error(400, "INPUT_REQUEST_INVALID".into());
+        };
+        if big && reader.read_i32().is_err() {
+            return ApiReply::Error(400, "INPUT_REQUEST_INVALID".into());
+        }
+        let Ok(bytes) = reader.read_bytes() else {
+            return ApiReply::Error(400, "INPUT_REQUEST_INVALID".into());
+        };
+        if datacenter_id != self.options.main_datacenter_id {
+            return ApiReply::Error(400, "DC_ID_INVALID".into());
+        }
+        if part < 0 || bytes.is_empty() || bytes.len() > UPLOAD_MAX_PART {
+            return ApiReply::Error(400, "FILE_PART_SIZE_INVALID".into());
+        }
+        state.stats.upload_parts += 1;
+        state.stats.upload_bytes += bytes.len() as u64;
+        state.stats.upload_largest_part = state.stats.upload_largest_part.max(bytes.len());
+        let upload = state.uploads.entry(file_id).or_default();
+        if upload.parts.insert(part, bytes.len()).is_some() {
+            state.stats.upload_duplicates += 1;
+        }
+        let mut bad = 0;
+        if bytes.len() < UPLOAD_HEADER {
+            upload.short_parts.push((part, bytes.to_vec()));
+        } else {
+            let placed = match upload_part_offset(bytes) {
+                Some((offset, tag)) if upload.tag.is_none_or(|known| known == tag) => {
+                    upload.tag = Some(tag);
+                    if part == 0 {
+                        offset == 0
+                    } else {
+                        let implied = offset / part as u64;
+                        let consistent = implied * part as u64 == offset
+                            && bytes.len() as u64 <= implied
+                            && upload.part_size.is_none_or(|size| size == implied);
+                        if consistent {
+                            upload.part_size = Some(implied);
+                        }
+                        consistent
+                    }
+                }
+                _ => false,
+            };
+            if !placed {
+                bad += 1;
+            }
+        }
+        if let (Some(part_size), Some(tag)) = (upload.part_size(), upload.tag) {
+            for (short_part, short_bytes) in std::mem::take(&mut upload.short_parts) {
+                if upload_content(tag, short_part as u64 * part_size, short_bytes.len()) != short_bytes {
+                    bad += 1;
+                }
+            }
+        }
+        if bad > 0 {
+            upload.bad = true;
+            state.stats.upload_bad_parts += bad;
+        }
+        let mut writer = Writer::new();
+        writer.write_u32(ids::BOOL_TRUE);
+        ApiReply::Result(writer.into_inner())
     }
 
     fn is_authorized(&self, state: &WorldState, datacenter_id: i32, family: u64) -> bool {
@@ -557,6 +738,111 @@ mod tests {
         let whole = file_content(9, 0, 1000);
         assert_eq!(file_content(9, 13, 100), whole[13..113]);
         assert_ne!(file_content(10, 0, 64), whole[..64]);
+    }
+
+    fn save_part(file_id: i64, part: i32, bytes: &[u8], big: bool) -> (u32, Vec<u8>) {
+        let mut writer = Writer::new();
+        writer.write_i64(file_id);
+        writer.write_i32(part);
+        if big {
+            writer.write_i32(-1);
+        }
+        writer.write_bytes(bytes);
+        (if big { UPLOAD_SAVE_BIG_FILE_PART } else { UPLOAD_SAVE_FILE_PART }, writer.into_inner())
+    }
+
+    #[test]
+    fn uploads_with_gaps_short_parts_swaps_or_tiny_tails_are_caught() {
+        let world = world(true);
+        let part = 16_384usize;
+        let content = upload_content(1, 0, 3 * part + 3);
+        for (index, range) in
+            [(0usize, 0..part), (1, part..2 * part), (2, 2 * part..3 * part), (3, 3 * part..3 * part + 3)]
+        {
+            let (constructor, body) = save_part(11, index as i32, &content[range], false);
+            result(world.handle(2, 1, constructor, &body));
+        }
+        let other = upload_content(2, 0, 2 * part);
+        let (constructor, body) = save_part(12, 0, &other[..part], false);
+        result(world.handle(2, 1, constructor, &body));
+        let (constructor, body) = save_part(12, 1, &content[part..2 * part], false);
+        result(world.handle(2, 1, constructor, &body));
+        let (constructor, body) = save_part(13, 0, &content[..part], false);
+        result(world.handle(2, 1, constructor, &body));
+        let (constructor, body) = save_part(13, 1, &content[part..part + 100], false);
+        result(world.handle(2, 1, constructor, &body));
+        let (constructor, body) = save_part(13, 3, &content[3 * part..3 * part + 3], false);
+        result(world.handle(2, 1, constructor, &body));
+        let two = upload_content(3, 0, part + 5);
+        let (constructor, body) = save_part(14, 1, &two[part..], false);
+        result(world.handle(2, 1, constructor, &body));
+        let (constructor, body) = save_part(14, 0, &two[..part], false);
+        result(world.handle(2, 1, constructor, &body));
+        let mut files = world.uploaded_files();
+        files.sort_by_key(|file| file.bytes);
+        let complete: Vec<u64> = files.iter().filter(|file| file.complete).map(|file| file.bytes).collect();
+        assert_eq!(
+            complete,
+            vec![part as u64 + 5, 3 * part as u64 + 3],
+            "a tiny tail is verified once the part size is known, from part 0 in a two-part file; {files:?}"
+        );
+        assert_eq!(world.stats().upload_bad_parts, 1, "the part swapped in from another file");
+        assert_eq!(files.len(), 4);
+    }
+
+    #[test]
+    fn upload_content_names_its_blocks_and_file() {
+        let whole = upload_content(9, 0, 5000);
+        assert_eq!(upload_content(9, 1024, 3000), whole[1024..4024]);
+        assert_eq!(u64::from_le_bytes(whole[2048..2056].try_into().unwrap()), 2);
+        assert_eq!(u64::from_le_bytes(whole[2056..2064].try_into().unwrap()), 9);
+        assert_eq!(upload_part_offset(&whole[3072..]), Some((3072, 9)));
+        assert_ne!(upload_content(10, 0, 64), whole[..64]);
+        let mut corrupt = whole[1024..2048].to_vec();
+        corrupt[500] ^= 1;
+        assert_eq!(upload_part_offset(&corrupt), None);
+    }
+
+    #[test]
+    fn uploads_verify_bytes_positions_and_duplicates() {
+        let world = world(true);
+        let size = 300_000usize;
+        let part_size = 131_072usize;
+        let content = upload_content(5, 0, size);
+        for part in [2usize, 0, 1] {
+            let end = (part * part_size + part_size).min(size);
+            let (constructor, body) = save_part(77, part as i32, &content[part * part_size..end], false);
+            let reply = result(world.handle(2, 1, constructor, &body));
+            assert_eq!(Reader::new(&reply).read_u32().unwrap(), ids::BOOL_TRUE);
+        }
+        let stats = world.stats();
+        assert_eq!(
+            (stats.upload_parts, stats.upload_bytes, stats.upload_bad_parts, stats.upload_duplicates),
+            (3, size as u64, 0, 0)
+        );
+
+        let (constructor, body) = save_part(77, 1, &content[part_size..2 * part_size], false);
+        result(world.handle(2, 1, constructor, &body));
+        assert_eq!(world.stats().upload_duplicates, 1);
+
+        let (constructor, body) = save_part(78, 1, &content[part_size..2 * part_size], true);
+        result(world.handle(2, 1, constructor, &body));
+        assert_eq!(world.stats().upload_bad_parts, 0);
+        let (constructor, body) = save_part(78, 2, &content[part_size..2 * part_size], true);
+        result(world.handle(2, 1, constructor, &body));
+        let mut corrupt = content[..part_size].to_vec();
+        corrupt[9] ^= 0xff;
+        let (constructor, body) = save_part(79, 0, &corrupt, true);
+        result(world.handle(2, 1, constructor, &body));
+        assert_eq!(world.stats().upload_bad_parts, 2, "a misplaced part and a corrupted part");
+
+        let (constructor, body) = save_part(80, 0, &vec![0u8; UPLOAD_MAX_PART + 1], false);
+        assert_eq!(error(world.handle(2, 1, constructor, &body)).1, "FILE_PART_SIZE_INVALID");
+        let files = world.uploaded_files();
+        assert_eq!(files.iter().filter(|file| file.complete).count(), 1, "{files:?}");
+        assert!(files.iter().any(|file| file.complete && file.bytes == size as u64 && file.tag == Some(5)));
+        let (constructor, body) = save_part(80, 0, &content[..1024], false);
+        assert_eq!(error(world.handle(4, 1, constructor, &body)).1, "DC_ID_INVALID");
     }
 
     #[test]

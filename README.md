@@ -153,3 +153,84 @@ path with MtProtoKit downloading the same file directly.
 - `--suite torture`: numbered calls through `Network.request` while the server injects one fault class
   at 1 % (or all of them mixed), plus a clean million-call run. Columns: wrong results, double
   completions, server-side duplicate executions, req/s, CPU, peak RSS and how the process exited.
+
+### Weak networks
+
+```sh
+./target/release/mtproto-bench tc --telegramcore <telegramcore-bench> --suite weak[-full] [--telemetry DIR] [--jobs 3]
+```
+
+Twelve links users actually have (`gprs`, `edge`, `edge-flaky`, `3g`, `satellite`, `lossy-heavy`,
+`train`, whose tunnels stop the whole link for 6 s and refuse new connections while live ones wait
+it out, `handover` between Wi-Fi and cellular, `uplink-starved` with a 64 kbit/s uplink,
+`blackholes`, `bufferbloat`, whose 256 kbit/s uplink sits behind a 3 s first-in, first-out modem
+buffer, and `bufferbloat-down`, whose 1 Mbit/s downlink sits behind a 5 s base-station buffer, so
+answers and pongs wait seconds behind a download; its 512 kbit/s uplink queues the same way), each with seven workloads: small calls (`rpc`, long enough for every periodic tunnel,
+reset or blackhole to strike), calls while downloading (`rpc-under-load`, head-of-line blocking)
+and while uploading (`rpc-during-upload`), downloads, and uploads through TelegramCore's
+`multipartUpload` in its usual parts and in 256 KB parts (`large-parts`, most of a minute each on
+the slowest links), and two such uploads at once (`shared-uplink`). The three kinds of calls also
+run with the user online (`rpc-online`, `rpc-under-load-online`, `rpc-during-upload-online`), as
+while the app is in front: the main session then pings every round trip and gives up on silence
+after a few. One more scenario,
+`nat/after-pauses`, makes a call and downloads a file every 45 s through a carrier NAT that forgets
+connections idle for 30 s (netsim `idle_timeout`), so each round starts on connections that died
+silently. Every uploaded 1 KB block names its
+index and file, so the test server checks each part's bytes, position and file, and an upload the
+client reports done counts as bad data unless the server holds all of it. Transfers are sized to
+each link (uploads also to its round trip, since small files go 16 KB parts three at a time) so
+every run moves for a comparable time. The table adds re-sent parts, the client's CPU time and,
+with `--telemetry`, the failure records the client's `NetworkTelemetry` wrote (stalls after 20 s,
+every request watched); the dumps stay in `DIR` for `replay`. A closing section lists the scenarios
+where the Rust engine did worse than MtProtoKit: more failed or hung requests, any bad data, more
+failure records with as many failures, a p95 25% and 100 ms worse when both completed at least 20
+calls per run (files do not count), 20% less throughput (up to the last file done, when nothing
+failed, so calls still in flight after it do not count), or half as much CPU again and a second
+more, as a worker spinning on a timer would use.
+
+### Replaying field failures
+
+TelegramCore's `NetworkTelemetry` records every failed, abandoned, slow or stalled request with the
+context needed to reproduce it, and reports the records through `help.saveAppLog` while the server
+enables it (`network_telemetry_enabled`). `replay` turns such records back into bench runs:
+
+```sh
+./target/release/mtproto-bench replay --records failures.json --telegramcore bench/telegramcore-client/.build/release/telegramcore-bench [--engines rust,mtprotokit] [--max-cases 5] [--rounds 1] [--only NAME] [--plan]
+```
+
+- Input: `failures.jsonl` from an account directory (`network-telemetry/`), a JSON array of records,
+  reported `{"records": [...]}` chunks, or an array of app log events.
+- Records are grouped by failure class, session role and API method. Each group gets a simulated
+  link (latency and jitter from the requests' p50/p90, a cellular link when the records were
+  cellular, the reconnect cadence and connect time from the connection timelines, an outage when the
+  connection was down at the failure, a SOCKS5 proxy when one was used, the user online when they
+  mostly were), a workload with as many requests in flight as the records estimated (`in_flight`),
+  and candidate server faults for the class (`stalled`: salt rotation, transport floods, clock warps,
+  lost answers, stalls, new sessions, copies).
+- Each case also lists the connections the Rust engine gave up on shortly before its failures and
+  why (`probe_timeout`, `racer_won`, `session_error`, …, `(unanswered)` when the session never took a
+  packet from it), each drop counted once: which of the engine's checks cut the user's connections.
+- A timeline cannot tell a network that drops connections from a client that reconnects because of
+  what the server sent, so the network-only candidate runs the measured link with its reconnects and
+  outage, and each fault candidate runs the measured link without them.
+- Calls run for a fixed time, long enough for the measured outage, two reconnect cycles and a stall
+  to happen while requests wait, and transfers are sized to keep the measured link busy as long.
+  Upload records replay as uploads, `upload.saveBigFilePart` ones in big parts, or in 256 KB parts on
+  links too slow for a 10 MB file within the run; download records
+  use files on the main DC, where the faults are injected; proxied cases go through the SOCKS5 proxy
+  on the measured link.
+- Every candidate runs on each engine with the client's own telemetry on (`TC_BENCH_TELEMETRY=1`,
+  stalls after 6 s for calls and 20 s for transfers, every request watched) and dumps the client's
+  records; the table says whether a run recorded the same failure class, which classes it recorded,
+  and how many requests failed or hung.
+- `--plan` prints the derived cases without running them. Faults are injected on the main DC only;
+  4xx answers (`client`, `auth`, `migrate`) are server decisions, so their cases replay only the link.
+
+`telegramcore-bench` also takes `TC_BENCH_TELEMETRY=0|1`, `TC_BENCH_STALLED_AFTER=SECONDS`,
+`TC_BENCH_WATCH_EVERY=N` (a power of two) and `TC_BENCH_TELEMETRY_DUMP=PATH` (the records plus
+`failure_counts`, which are not capped like the records) in any suite, `TC_BENCH_UPLOAD_LARGE_PARTS=1`
+to upload files under 10 MB in 256 KB parts (`useLargerParts`; TelegramCore sends a file already in
+memory in 512 KB `saveBigFilePart` parts only over 10 MB, which replay uses when the measured link
+carries it within the run), and with `TC_BENCH_STDERR=1`
+prints a `telemetry:` line per run (requests, failures by class, disconnects). With `tc-torture`,
+`--requests 0` calls for `--duration` seconds instead of a fixed number of times.

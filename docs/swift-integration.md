@@ -160,6 +160,7 @@ and send them (see 9).
 | `ConnectionState` | main only, to `networkSessionConnectionStateChanged` (deduplicated); `proxyAddress` is the proxy's `ip` like MtProtoKit. While the session is held for a replacement key or an unsupported proxy and not paused by TelegramCore: reported as connecting (`isNetworkAvailable` from reachability, `proxyHasConnectionIssues` for the proxy case). Also drives the connection watchdog |
 | `NetworkUsage` | `MTNetworkUsageManager(info: usageCalculationInfo)`: `addIncomingBytes`/`addOutgoingBytes`, interface `Other` |
 | `AddressResult` | `reportTransportSchemeSuccess` / `reportTransportSchemeFailure` for the scheme at that index |
+| `ConnectionDropped` | every observer from `observeConnectionDrops` gets `NetworkEngineConnectionDrop(reason: text, answered: flags & 1, age: value1)`; `RecordingNetworkEngine` feeds them to `NetworkTelemetry` (drops per role and reason, and the latest on failure records). `text` is the reason (`probe_timeout`, `racer_won`, `session_error`, …), `answered` whether the session took a packet from the connection, `age` seconds since it started connecting |
 | `AuthKeyCreated`, `AuthKeyCreationFailed`, `TransportFlood` | logged only (`AuthKeyCreated` cannot happen with `generate_key = 0`; its payload is freed) |
 
 ## 6. MTContext reads and writes

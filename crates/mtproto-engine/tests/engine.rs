@@ -7,8 +7,8 @@ use mtproto_engine::mtproto_core::rpc::{RequestFlags, RequestId, RpcEvent, RpcRe
 use mtproto_engine::mtproto_core::session::ServerSalt;
 use mtproto_engine::mtproto_core::test_support::{ServerHandshake, ServerHandshakeBehavior};
 use mtproto_engine::{
-    AuthKeyMaterial, DcAddress, Engine, EngineCallbacks, EngineConfig, EngineEvent, KeyGeneration, ProxyConfig,
-    SessionHandle, SessionSetup, unix_seconds,
+    AuthKeyMaterial, DcAddress, DropReason, Engine, EngineCallbacks, EngineConfig, EngineEvent, KeyGeneration,
+    ProxyConfig, SessionHandle, SessionSetup, unix_seconds,
 };
 use mtproto_testserver::*;
 
@@ -66,6 +66,19 @@ impl Collector {
 
     fn count(&self, predicate: impl Fn(&EngineEvent) -> bool) -> usize {
         self.events.lock().unwrap().iter().filter(|(_, event)| predicate(event)).count()
+    }
+
+    /// Reasons of the connections dropped so far, and whether each had answered.
+    fn drops(&self) -> Vec<(DropReason, bool)> {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(_, event)| match event {
+                EngineEvent::ConnectionDropped { reason, answered, .. } => Some((*reason, *answered)),
+                _ => None,
+            })
+            .collect()
     }
 }
 
@@ -532,6 +545,7 @@ fn transport_flood_backs_off_and_retransmits_without_reexecution() {
     assert!(started.elapsed() >= Duration::from_millis(900), "waited {:?}", started.elapsed());
     assert!(started.elapsed() < Duration::from_secs(4), "waited {:?}", started.elapsed());
     assert_eq!(collector.count(|event| matches!(event, EngineEvent::TransportFlood)), 1);
+    assert_eq!(collector.drops(), vec![(DropReason::TransportFlood, false)]);
     assert_eq!(collector.count(|event| matches!(event, EngineEvent::AuthKeyInvalid { .. })), 0);
     assert_eq!(server.executions(TAG_TRANSPORT_ERROR_ONCE), 2);
     assert_eq!(
@@ -1047,6 +1061,51 @@ fn run_hostile_case(name: &str, chaos: mtproto_testserver::chaos::ChaosConfig, r
 }
 
 #[test]
+fn a_corrupted_packet_is_reported_as_a_session_error_not_a_close() {
+    use mtproto_testserver::chaos::{ChaosConfig, Fault};
+    let key = random_key(78);
+    let server = TestServer::start(
+        vec![key.clone()],
+        ServerOptions { chaos: Some(ChaosConfig::only(31, Fault::HostileBadMsgKey, 0.5)), ..ServerOptions::default() },
+    );
+    let collector = Arc::new(Collector::default());
+    let engine = engine(&collector, 1);
+    let session = engine.create_session(setup(&server, &key, SessionRole::Main));
+    for id in 1..=8u64 {
+        engine.send(session, request(id, 100 + id as u32));
+    }
+    assert!(collector.wait(Duration::from_secs(60), |events| completions(events, session) == 8));
+    let drops = collector.drops();
+    assert!(!drops.is_empty(), "the corrupted packets cost connections");
+    assert!(drops.iter().all(|(reason, _)| *reason == DropReason::SessionError), "{drops:?}");
+    engine.shutdown();
+}
+
+#[test]
+fn a_transport_error_keeps_its_reason_when_garbage_follows_it() {
+    use mtproto_testserver::chaos::{ChaosConfig, Fault};
+    let key = random_key(80);
+    let server = TestServer::start(
+        vec![key.clone()],
+        ServerOptions {
+            chaos: Some(ChaosConfig::only(33, Fault::HostileTransportCodeThenGarbage, 0.3)),
+            ..ServerOptions::default()
+        },
+    );
+    let collector = Arc::new(Collector::default());
+    let engine = engine(&collector, 1);
+    let session = engine.create_session(setup(&server, &key, SessionRole::Main));
+    for id in 1..=20u64 {
+        engine.send(session, request(id, 100 + id as u32));
+        assert!(collector.wait(Duration::from_secs(60), |events| completions(events, session) == id as usize));
+    }
+    let drops = collector.drops();
+    assert!(!drops.is_empty(), "the transport errors cost connections");
+    assert!(drops.iter().all(|(reason, _)| *reason == DropReason::AddressRejected), "{drops:?}");
+    engine.shutdown();
+}
+
+#[test]
 fn hostile_server_faults_never_break_exactly_once_delivery() {
     use mtproto_testserver::chaos::{ChaosConfig, Fault};
     let mut cases: Vec<(String, ChaosConfig)> = Fault::HOSTILE
@@ -1300,4 +1359,345 @@ fn debug_output_redacts_proxy_secrets_and_verification_tokens() {
         mtproto_engine::mtproto_core::rpc::Verification::Apns { nonce: "N".into(), secret: "APNS-SECRET".into() };
     assert!(!format!("{recaptcha:?}").contains("TOKEN-XYZ"));
     assert!(!format!("{apns:?}").contains("APNS-SECRET"));
+}
+
+#[test]
+fn calls_wait_out_a_bloated_uplink_instead_of_reconnecting() {
+    let key = random_key(81);
+    let server = TestServer::start(vec![key.clone()], ServerOptions::default());
+    let sim = mtproto_netsim::NetSim::start(server.address, mtproto_netsim::Profile::bufferbloat(), 11).unwrap();
+    let collector = Arc::new(Collector::default());
+    let engine = engine(&collector, 2);
+    let address = vec![DcAddress { host: "127.0.0.1".into(), port: sim.address.port(), secret: None }];
+    let mut main = setup(&server, &key, SessionRole::Main);
+    main.addresses = address.clone();
+    let main = engine.create_session(main);
+    engine.send(main, request(1, 1));
+    assert!(collector.wait(WAIT, |events| completions(events, main) == 1), "main session up");
+    let connected = sim.stats().connections;
+    let mut worker = setup(&server, &key, SessionRole::Worker { requires_auth_token: false });
+    worker.addresses = address;
+    let upload = engine.create_session(worker);
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    let mut payload: Vec<u8> = (0..128 * 1024)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u8
+        })
+        .collect();
+    payload[..4].copy_from_slice(&16u32.to_le_bytes());
+    for id in 1..=6u64 {
+        engine.send(upload, raw_request(id, call(TAG_SIZED, &payload)));
+    }
+    std::thread::sleep(Duration::from_secs(3));
+    let mut latencies = Vec::new();
+    for id in 2..=12u64 {
+        let started = Instant::now();
+        engine.send(main, request(id, id as u32));
+        assert!(
+            collector.wait(Duration::from_secs(40), |events| completions(events, main) == id as usize),
+            "call {id} never came back; {} connections",
+            sim.stats().connections
+        );
+        latencies.push(started.elapsed().as_secs_f64());
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    assert!(collector.wait(Duration::from_secs(90), |events| completions(events, upload) == 6), "uploads finished");
+    let opened = sim.stats().connections - connected;
+    assert!((1..=4).contains(&opened), "{opened} connections opened during the upload");
+    assert!((2..=12u32).all(|tag| server.executions(tag) == 1), "a call was sent again on a replacement connection");
+    assert!(latencies.iter().all(|latency| *latency < 6.0), "calls waited longer than the 3 s queue: {latencies:.1?}");
+    engine.shutdown();
+}
+
+fn steady_calls(engine: &Engine, collector: &Collector, session: SessionHandle, first: u64, count: u64) -> Vec<f64> {
+    let mut latencies = Vec::new();
+    for id in first..first + count {
+        let started = Instant::now();
+        engine.send(session, request(id, id as u32));
+        assert!(
+            collector.wait(Duration::from_secs(40), |events| completions(events, session) == id as usize),
+            "call {id} never came back"
+        );
+        latencies.push(started.elapsed().as_secs_f64());
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    latencies
+}
+
+#[test]
+fn a_connection_that_falls_silent_in_a_tunnel_is_kept_and_resumes() {
+    let key = random_key(82);
+    let server = TestServer::start(vec![key.clone()], ServerOptions::default());
+    let mut profile = mtproto_netsim::Profile::perfect();
+    profile.latency = Duration::from_millis(30);
+    profile.tunnel = Some(mtproto_netsim::Tunnel {
+        every_min: Duration::from_secs(3),
+        every_max: Duration::from_secs(3),
+        length: Duration::from_secs(7),
+    });
+    let sim = mtproto_netsim::NetSim::start(server.address, profile, 12).unwrap();
+    let collector = Arc::new(Collector::default());
+    let engine = engine(&collector, 1);
+    let mut main = setup(&server, &key, SessionRole::Main);
+    main.addresses = vec![DcAddress { host: "127.0.0.1".into(), port: sim.address.port(), secret: None }];
+    let main = engine.create_session(main);
+    let latencies = steady_calls(&engine, &collector, main, 1, 40);
+    assert!(sim.stats().refused > 0, "fresh connections were tried and refused in the tunnel");
+    assert_eq!(sim.stats().connections, 1, "the silent connection was dropped instead of waiting out the tunnel");
+    let worst = latencies.iter().copied().fold(0.0, f64::max);
+    assert!(worst < 8.5, "a call waited {worst:.1} s for a 7 s tunnel");
+    engine.shutdown();
+}
+
+#[test]
+fn a_dead_connection_loses_the_race_to_a_fresh_one() {
+    let key = random_key(83);
+    let server = TestServer::start(vec![key.clone()], ServerOptions::default());
+    let mut profile = mtproto_netsim::Profile::perfect();
+    profile.latency = Duration::from_millis(30);
+    profile.blackhole = Some(mtproto_netsim::Blackhole {
+        after_min: Duration::from_secs(2),
+        after_max: Duration::from_secs(2),
+        duration: Duration::from_secs(600),
+        end: mtproto_netsim::BlackholeEnd::Dead,
+    });
+    let sim = mtproto_netsim::NetSim::start(server.address, profile, 13).unwrap();
+    let collector = Arc::new(Collector::default());
+    let engine = engine(&collector, 1);
+    let mut main = setup(&server, &key, SessionRole::Main);
+    main.addresses = vec![DcAddress { host: "127.0.0.1".into(), port: sim.address.port(), secret: None }];
+    let main = engine.create_session(main);
+    let latencies = steady_calls(&engine, &collector, main, 1, 24);
+    assert!(sim.stats().connections >= 2, "the dead connection was replaced");
+    let drops = collector.drops();
+    assert!(drops.first() == Some(&(DropReason::RacerWon, true)), "the host hears why: {drops:?}");
+    let worst = latencies.iter().copied().fold(0.0, f64::max);
+    assert!(worst < 4.0, "a call waited {worst:.1} s on a dead connection while fresh ones worked");
+    engine.shutdown();
+}
+
+#[test]
+fn a_racer_that_answers_first_waits_for_a_primary_that_is_only_slow() {
+    let key = random_key(44);
+    let server = TestServer::start(vec![key.clone()], ServerOptions::default());
+    let delayed = |latency: u64| mtproto_netsim::Profile {
+        latency: Duration::from_millis(latency),
+        ..mtproto_netsim::Profile::perfect()
+    };
+    let primary = mtproto_netsim::NetSim::start(server.address, delayed(1650), 11).unwrap();
+    let racer = mtproto_netsim::NetSim::start(server.address, delayed(600), 12).unwrap();
+    let collector = Arc::new(Collector::default());
+    let engine = engine(&collector, 2);
+    let mut session_setup = setup(&server, &key, SessionRole::Main);
+    session_setup.addresses = [&primary, &racer]
+        .iter()
+        .map(|sim| DcAddress { host: sim.address.ip().to_string(), port: sim.address.port(), secret: None })
+        .collect();
+    let session = engine.create_session(session_setup);
+    engine.send(session, request(1, 9));
+    assert!(collector.wait(WAIT, |events| completions(events, session) == 1));
+    assert_eq!(server.executions(9), 1);
+    assert!(racer.stats().connections >= 1, "the silent primary was raced");
+    assert!(
+        racer.stats().bytes_up < 120,
+        "the request stays on the slow primary instead of moving to the racer ({} bytes reached the racer)",
+        racer.stats().bytes_up
+    );
+    engine.shutdown();
+}
+
+#[test]
+fn a_waiting_racer_takes_over_when_the_silent_primary_is_given_up() {
+    let key = random_key(45);
+    let server = TestServer::start(vec![key.clone()], ServerOptions::default());
+    let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let silent_address = silent.local_addr().unwrap();
+    let held = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let keeper = {
+        let held = held.clone();
+        std::thread::spawn(move || {
+            for stream in silent.incoming().take(4).flatten() {
+                held.lock().unwrap().push(stream);
+            }
+        })
+    };
+    let racer = mtproto_netsim::NetSim::start(
+        server.address,
+        mtproto_netsim::Profile { latency: Duration::from_millis(800), ..mtproto_netsim::Profile::perfect() },
+        13,
+    )
+    .unwrap();
+    let collector = Arc::new(Collector::default());
+    let engine = engine(&collector, 2);
+    let mut session_setup = setup(&server, &key, SessionRole::Main);
+    session_setup.addresses = vec![
+        DcAddress { host: silent_address.ip().to_string(), port: silent_address.port(), secret: None },
+        DcAddress { host: racer.address.ip().to_string(), port: racer.address.port(), secret: None },
+    ];
+    let started = Instant::now();
+    let session = engine.create_session(session_setup);
+    engine.send(session, request(1, 9));
+    assert!(collector.wait(WAIT, |events| completions(events, session) == 1));
+    assert!(started.elapsed() < Duration::from_secs(7), "{:?}", started.elapsed());
+    assert_eq!(racer.stats().connections, 1, "the verified racer is promoted, not dropped and dialled again");
+    assert_eq!(collector.drops(), vec![(DropReason::ProbeTimeout, false)], "the primary's own failure, once");
+    assert_eq!(server.executions(9), 1);
+    engine.shutdown();
+    drop(keeper);
+}
+
+fn call_after_a_blackhole(alternate: &str) -> f64 {
+    let key = random_key(84);
+    let server = TestServer::start(vec![key.clone()], ServerOptions::default());
+    let mut profile = mtproto_netsim::Profile::perfect();
+    profile.latency = Duration::from_millis(30);
+    profile.blackhole = Some(mtproto_netsim::Blackhole {
+        after_min: Duration::from_secs(3),
+        after_max: Duration::from_secs(3),
+        duration: Duration::from_secs(600),
+        end: mtproto_netsim::BlackholeEnd::Dead,
+    });
+    let sim = mtproto_netsim::NetSim::start(server.address, profile, 15).unwrap();
+    let collector = Arc::new(Collector::default());
+    let engine = engine(&collector, 1);
+    let mut main = setup(&server, &key, SessionRole::Main);
+    main.addresses = vec![
+        DcAddress { host: "127.0.0.1".into(), port: sim.address.port(), secret: None },
+        DcAddress { host: alternate.into(), port: 443, secret: None },
+    ];
+    let main = engine.create_session(main);
+    let started = Instant::now();
+    engine.send(main, request(1, 1));
+    assert!(collector.wait(WAIT, |events| completions(events, main) == 1));
+    std::thread::sleep(Duration::from_secs(4).saturating_sub(started.elapsed()));
+    let sent = Instant::now();
+    engine.send(main, request(2, 2));
+    assert!(collector.wait(Duration::from_secs(60), |events| completions(events, main) == 2));
+    engine.shutdown();
+    sent.elapsed().as_secs_f64()
+}
+
+#[test]
+fn a_silent_connection_is_replaced_on_its_own_address_when_the_others_are_dead() {
+    for alternate in ["192.0.2.1", "2001:db8::1"] {
+        let took = call_after_a_blackhole(alternate);
+        assert!(took < 6.0, "with {alternate} as the other address the call took {took:.1} s");
+    }
+}
+
+#[test]
+fn an_upload_does_not_hold_up_noticing_that_the_main_connection_died() {
+    let key = random_key(85);
+    let server = TestServer::start(vec![key.clone()], ServerOptions::default());
+    let mut profile = mtproto_netsim::Profile::perfect();
+    profile.latency = Duration::from_millis(30);
+    profile.bandwidth = Some(64_000);
+    profile.max_chunk = 1400;
+    let sim = mtproto_netsim::NetSim::start(server.address, profile, 16).unwrap();
+    let collector = Arc::new(Collector::default());
+    let engine = engine(&collector, 2);
+    let address = vec![DcAddress { host: "127.0.0.1".into(), port: sim.address.port(), secret: None }];
+    let mut main = setup(&server, &key, SessionRole::Main);
+    main.addresses = address.clone();
+    main.online = true;
+    let main = engine.create_session(main);
+    engine.send(main, request(1, 1));
+    assert!(collector.wait(WAIT, |events| completions(events, main) == 1));
+    let mut worker = setup(&server, &key, SessionRole::Worker { requires_auth_token: false });
+    worker.addresses = address;
+    let upload = engine.create_session(worker);
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let mut payload: Vec<u8> = (0..128 * 1024)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u8
+        })
+        .collect();
+    payload[..4].copy_from_slice(&16u32.to_le_bytes());
+    for id in 1..=8u64 {
+        engine.send(upload, raw_request(id, call(TAG_SIZED, &payload)));
+    }
+    std::thread::sleep(Duration::from_secs(4));
+    sim.outage(Duration::from_secs(4));
+    let sent = Instant::now();
+    engine.send(main, request(2, 2));
+    assert!(collector.wait(Duration::from_secs(60), |events| completions(events, main) == 2));
+    let took = sent.elapsed().as_secs_f64();
+    assert!(took < 12.0, "a call across a 4 s outage took {took:.1} s while another session uploaded");
+    engine.shutdown();
+}
+
+#[test]
+fn a_fresh_connection_waits_out_a_deep_queue_behind_another_upload() {
+    let key = random_key(86);
+    let server = TestServer::start(vec![key.clone()], ServerOptions::default());
+    let mut profile = mtproto_netsim::Profile::bufferbloat();
+    profile.fifo_queue = Some(Duration::from_secs(10));
+    let sim = mtproto_netsim::NetSim::start(server.address, profile, 17).unwrap();
+    let collector = Arc::new(Collector::default());
+    let engine = engine(&collector, 2);
+    let address = vec![DcAddress { host: "127.0.0.1".into(), port: sim.address.port(), secret: None }];
+    let mut worker = setup(&server, &key, SessionRole::Worker { requires_auth_token: false });
+    worker.addresses = address.clone();
+    let upload = engine.create_session(worker);
+    let mut state = 0x5851_f42d_4c95_7f2du64;
+    let mut payload: Vec<u8> = (0..128 * 1024)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u8
+        })
+        .collect();
+    payload[..4].copy_from_slice(&16u32.to_le_bytes());
+    for id in 1..=8u64 {
+        engine.send(upload, raw_request(id, call(TAG_SIZED, &payload)));
+    }
+    std::thread::sleep(Duration::from_secs(12));
+    let before = sim.stats().connections;
+    let mut main = setup(&server, &key, SessionRole::Main);
+    main.addresses = address;
+    let main = engine.create_session(main);
+    let started = Instant::now();
+    engine.send(main, request(1, 1));
+    assert!(collector.wait(Duration::from_secs(60), |events| completions(events, main) == 1));
+    let took = started.elapsed().as_secs_f64();
+    let opened = sim.stats().connections - before;
+    assert!(took < 16.0, "the first call behind a 10 s queue took {took:.1} s");
+    assert!(opened <= 2, "{opened} connections for one fresh session: it was cut while queued");
+    engine.shutdown();
+}
+
+#[test]
+fn racers_learn_which_alternate_is_dead_while_the_primary_is_held() {
+    let key = random_key(87);
+    let server = TestServer::start(vec![key.clone()], ServerOptions::default());
+    let mut profile = mtproto_netsim::Profile::perfect();
+    profile.latency = Duration::from_millis(30);
+    let primary = mtproto_netsim::NetSim::start(server.address, profile.clone(), 18).unwrap();
+    let alternate = mtproto_netsim::NetSim::start(server.address, profile, 19).unwrap();
+    let collector = Arc::new(Collector::default());
+    let engine = engine(&collector, 1);
+    let mut main = setup(&server, &key, SessionRole::Main);
+    main.addresses = vec![
+        DcAddress { host: "127.0.0.1".into(), port: primary.address.port(), secret: None },
+        DcAddress { host: "192.0.2.1".into(), port: 443, secret: None },
+        DcAddress { host: "127.0.0.1".into(), port: alternate.address.port(), secret: None },
+    ];
+    let main = engine.create_session(main);
+    engine.send(main, request(1, 1));
+    assert!(collector.wait(WAIT, |events| completions(events, main) == 1));
+    primary.outage(Duration::from_secs(120));
+    let sent = Instant::now();
+    engine.send(main, request(2, 2));
+    assert!(collector.wait(Duration::from_secs(60), |events| completions(events, main) == 2));
+    let took = sent.elapsed().as_secs_f64();
+    assert!(alternate.stats().connections >= 1, "the live alternate took over");
+    assert!(took < 28.0, "the call took {took:.1} s: racers kept picking the dead alternate");
+    engine.shutdown();
 }

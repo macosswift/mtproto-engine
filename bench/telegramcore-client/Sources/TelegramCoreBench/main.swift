@@ -177,6 +177,44 @@ func fileWord(_ fileId: Int64, _ word: UInt64) -> UInt64 {
     return z ^ (z >> 31)
 }
 
+let uploadContentId: Int64 = 0x5550_4c4f_4144
+
+/// What the test server expects to receive for an upload: 1 KB blocks, each starting with its index
+/// and the file's tag, then `fileWord(uploadContentId, …)` words (`mtproto_testserver::api::upload_content`).
+func uploadContent(tag: Int64, length: Int) -> Data {
+    var data = Data(count: length)
+    data.withUnsafeMutableBytes { raw in
+        let bytes = raw.bindMemory(to: UInt8.self)
+        var block = 0
+        var blockBytes = [UInt8](repeating: 0, count: 1024)
+        while block * 1024 < length {
+            for (field, value) in [UInt64(block), UInt64(bitPattern: tag)].enumerated() {
+                var header = value.littleEndian
+                withUnsafeBytes(of: &header) { source in
+                    for index in 0 ..< 8 {
+                        blockBytes[field * 8 + index] = source[index]
+                    }
+                }
+            }
+            for word in 0 ..< 126 {
+                var value = fileWord(uploadContentId, UInt64(block * 128 + 2 + word)).littleEndian
+                withUnsafeBytes(of: &value) { source in
+                    for index in 0 ..< 8 {
+                        blockBytes[16 + word * 8 + index] = source[index]
+                    }
+                }
+            }
+            let start = block * 1024
+            let take = min(1024, length - start)
+            for index in 0 ..< take {
+                bytes[start + index] = blockBytes[index]
+            }
+            block += 1
+        }
+    }
+    return data
+}
+
 func verifyFileContent(fileId: Int64, offset: Int64, data: Data) -> Bool {
     return data.withUnsafeBytes { buffer -> Bool in
         let bytes = buffer.bindMemory(to: UInt8.self)
@@ -388,6 +426,8 @@ final class Recorder {
     private(set) var completed = 0
     private(set) var failed = 0
     private(set) var bytes: UInt64 = 0
+    private(set) var transfersDone = 0
+    private(set) var lastTransferAt: Double = 0
     var verifyFailures = 0
     var cancellations = 0
     var doubleCompletions = 0
@@ -398,6 +438,13 @@ final class Recorder {
 
     func elapsed() -> Double {
         return Double(DispatchTime.now().uptimeNanoseconds &- self.start) / 1e9
+    }
+
+    /// Work that is still moving, such as an upload reporting progress, is not a stall.
+    func noteProgress() {
+        self.lock.lock()
+        self.lastProgressAt = self.elapsed()
+        self.lock.unlock()
     }
 
     func begin(probe: Bool = false) -> Int {
@@ -424,6 +471,10 @@ final class Recorder {
                 self.done[index] = at
                 self.completed += 1
                 self.bytes += bytes
+                if bytes > 0 {
+                    self.transfersDone += 1
+                    self.lastTransferAt = at
+                }
                 self.lastProgressAt = at
             } else {
                 self.doubleCompletions += 1
@@ -462,7 +513,7 @@ final class Recorder {
         let throughput = elapsed > 0 ? Double(self.bytes) / 1e6 / elapsed : 0
         var output = "{\"engine\":\"\(engine)\",\"workload\":\"\(workload)\",\"completed\":\(self.completed),\"failed\":\(failed),\"elapsed\":\(formatNumber(elapsed)),"
         output += "\"latency_ms\":{\"p50\":\(formatNumber(latency.p50)),\"p95\":\(formatNumber(latency.p95)),\"p99\":\(formatNumber(latency.p99)),\"max\":\(formatNumber(latency.max))},"
-        output += "\"bytes\":\(self.bytes),\"throughput_mbps\":\(formatNumber(throughput)),\"verify_failures\":\(self.verifyFailures),\"cancellations\":\(self.cancellations),\"double_completions\":\(self.doubleCompletions),\"stalled\":\(self.stalled ? 1 : 0),\"engine_switched\":\(self.engineSwitched ? 1 : 0),\"issued\":\(self.sent.count),\"requests\":["
+        output += "\"bytes\":\(self.bytes),\"throughput_mbps\":\(formatNumber(throughput)),\"verify_failures\":\(self.verifyFailures),\"cancellations\":\(self.cancellations),\"double_completions\":\(self.doubleCompletions),\"stalled\":\(self.stalled ? 1 : 0),\"engine_switched\":\(self.engineSwitched ? 1 : 0),\"issued\":\(self.sent.count),\"transfers_done\":\(self.transfersDone),\"transfers_elapsed\":\(formatNumber(self.lastTransferAt)),\"requests\":["
         if !self.compact {
             output += zip(self.sent, self.done).map { "[\(formatNumber($0)),\($1.map(formatNumber) ?? "null")]" }.joined(separator: ",")
         }
@@ -560,6 +611,53 @@ final class FileDownload {
     }
 }
 
+/// One upload through TelegramCore's `multipartUpload`, the code that sends photos, videos and files.
+final class FileUpload {
+    let file: FileConfig
+    let recorder: Recorder
+    let index: Int
+    private let queue: Queue
+    private let disposable = MetaDisposable()
+    private var finished = false
+    private let completion: (FileUpload, Bool) -> Void
+
+    init(file: FileConfig, recorder: Recorder, index: Int, queue: Queue, completion: @escaping (FileUpload, Bool) -> Void) {
+        self.file = file
+        self.recorder = recorder
+        self.index = index
+        self.queue = queue
+        self.completion = completion
+    }
+
+    func start(postbox: Postbox, network: Network) {
+        let data = uploadContent(tag: self.file.id, length: Int(self.file.size))
+        let largeParts = ProcessInfo.processInfo.environment["TC_BENCH_UPLOAD_LARGE_PARTS"] == "1"
+        let signal = multipartUpload(network: network, postbox: postbox, source: .data(data), encrypt: false, tag: nil, hintFileSize: self.file.size, hintFileIsLarge: false, forceNoBigParts: false, useLargerParts: largeParts)
+        self.disposable.set((signal |> deliverOn(self.queue)).start(next: { [weak self] result in
+            switch result {
+            case .inputFile:
+                self?.finish(success: true)
+            case .progress:
+                self?.recorder.noteProgress()
+            default:
+                break
+            }
+        }, error: { [weak self] _ in
+            self?.finish(success: false)
+        }))
+    }
+
+    private func finish(success: Bool) {
+        if self.finished {
+            return
+        }
+        self.finished = true
+        self.disposable.dispose()
+        self.recorder.finish(self.index, success: success, bytes: success ? UInt64(self.file.size) : 0)
+        self.completion(self, success)
+    }
+}
+
 final class Bench {
     let arguments: Arguments
     let config: BenchConfig
@@ -568,6 +666,7 @@ final class Bench {
     let recorder = Recorder()
     let queue = Queue(name: "TelegramCoreBench")
     private var active: [Int: FileDownload] = [:]
+    private var uploads: [Int: FileUpload] = [:]
     private var nextFile = 0
     private var finishedFiles = 0
     private var rng: UInt64
@@ -625,6 +724,23 @@ final class Bench {
         download.start(postbox: self.postbox, network: self.network)
     }
 
+    private func startNextUploads() {
+        while self.uploads.count < self.arguments.concurrency && self.nextFile < self.config.files.count {
+            let file = self.config.files[self.nextFile]
+            self.nextFile += 1
+            let upload = FileUpload(file: file, recorder: self.recorder, index: self.recorder.begin(), queue: self.queue, completion: { [weak self] upload, _ in
+                guard let self = self else {
+                    return
+                }
+                self.uploads.removeValue(forKey: upload.index)
+                self.finishedFiles += 1
+                self.startNextUploads()
+            })
+            self.uploads[upload.index] = upload
+            upload.start(postbox: self.postbox, network: self.network)
+        }
+    }
+
     private func probe() {
         let index = self.recorder.begin(probe: true)
         let recorder = self.recorder
@@ -657,12 +773,22 @@ final class Bench {
                 self.startNextFiles(scroll: false)
                 self.scheduleProbes(interval: 1.0 / max(self.arguments.rate, 0.1), deadline: deadline)
                 self.poll(deadline: deadline, done: done) { $0.downloadsDone && $0.recorder.pendingCount == 0 }
+            case "tc-upload":
+                self.startNextUploads()
+                self.poll(deadline: deadline, done: done) { $0.downloadsDone }
+            case "tc-mixed-upload":
+                latencyFromProbes = true
+                self.startNextUploads()
+                self.scheduleProbes(interval: 1.0 / max(self.arguments.rate, 0.1), deadline: deadline)
+                self.poll(deadline: deadline, done: done) { $0.downloadsDone && $0.recorder.pendingCount == 0 }
             case "tc-small":
                 self.smallBurst(remaining: self.arguments.requests, deadline: deadline, done: done)
+            case "tc-idle":
+                self.idle(interval: 1.0 / max(self.arguments.rate, 0.001), until: Date().addingTimeInterval(self.arguments.duration), deadline: deadline, done: done)
             case "tc-steady":
                 self.steady(interval: 1.0 / max(self.arguments.rate, 0.1), until: Date().addingTimeInterval(self.arguments.duration), deadline: deadline, done: done)
             case "tc-torture":
-                self.recorder.compact = self.arguments.requests > 200_000
+                self.recorder.compact = self.arguments.requests > 200_000 || self.arguments.requests == 0
                 if self.arguments.trickle > 0 {
                     self.trickle(interval: self.arguments.trickle, deadline: deadline)
                 }
@@ -699,6 +825,49 @@ final class Bench {
         self.queue.after(interval, { [weak self] in
             self?.scheduleProbes(interval: interval, deadline: deadline)
         })
+    }
+
+    /// One call and one new file after every pause, so that both the main and the media connection sit
+    /// idle in between.
+    private func idle(interval: Double, until: Date, deadline: Date, done: DispatchSemaphore) {
+        var round: UInt64 = 0
+        var tick: (() -> Void)!
+        tick = { [weak self] in
+            guard let self = self else {
+                return
+            }
+            if Date() >= until {
+                self.poll(deadline: deadline, done: done) { $0.recorder.pendingCount == 0 }
+                return
+            }
+            let record = self.recorder.begin()
+            let recorder = self.recorder
+            let tag = UInt32(1 + round % 900)
+            let call = round
+            let _ = (self.network.request(makeCall(tag: tag, index: call))
+            |> deliverOn(self.queue)).start(next: { result in
+                if result.tag != tag || result.index != call {
+                    recorder.addVerifyFailure()
+                }
+                recorder.finish(record, success: true)
+            }, error: { _ in
+                recorder.finish(record, success: false)
+            })
+            if self.nextFile < self.config.files.count {
+                let file = self.config.files[self.nextFile]
+                self.nextFile += 1
+                let index = self.recorder.begin()
+                let download = FileDownload(file: file, recorder: self.recorder, index: index, queue: self.queue, completion: { [weak self] download, _ in
+                    self?.active.removeValue(forKey: download.index)
+                    self?.finishedFiles += 1
+                })
+                self.active[index] = download
+                download.start(postbox: self.postbox, network: self.network)
+            }
+            round += 1
+            self.queue.after(interval, tick)
+        }
+        tick()
     }
 
     private func steady(interval: Double, until: Date, deadline: Date, done: DispatchSemaphore) {
@@ -782,7 +951,11 @@ final class Bench {
         })
     }
 
-    private func torture(total: Int, deadline: Date, done: DispatchSemaphore) {
+    /// `total` numbered calls with `concurrency` in flight; with `total == 0`, calls for `duration`
+    /// seconds, then waits for the ones in flight.
+    private func torture(total requested: Int, deadline: Date, done: DispatchSemaphore) {
+        let total = requested > 0 ? requested : Int.max
+        let issueUntil = requested > 0 ? Date.distantFuture : Date().addingTimeInterval(self.arguments.duration)
         var issued = 0
         var inFlight = 0
         let recorder = self.recorder
@@ -791,7 +964,7 @@ final class Bench {
         let concurrency = self.arguments.concurrency
         var issue: (() -> Void)!
         issue = {
-            while inFlight < concurrency && issued < total {
+            while inFlight < concurrency && issued < total && Date() < issueUntil {
                 let index = recorder.begin()
                 issued += 1
                 inFlight += 1
@@ -811,11 +984,16 @@ final class Bench {
                     issue()
                 })
             }
-            if issued >= total && inFlight == 0 {
+            if (issued >= total || Date() >= issueUntil) && inFlight == 0 {
                 done.signal()
             }
         }
         issue()
+        if requested == 0 {
+            self.queue.after(max(0.0, issueUntil.timeIntervalSinceNow) + 0.01, {
+                issue()
+            })
+        }
         self.poll(deadline: deadline, done: done) { _ in false }
     }
 
@@ -871,12 +1049,62 @@ let store = MemoryStore()
 let keychain = Keychain(get: { store.get($0) }, set: { store.set($0, $1) }, remove: { store.remove($0) })
 seedKeychain(config: config, keychain: keychain, provider: provider)
 let postbox = openTemporaryPostbox(basePath: basePath)
+if let value = ProcessInfo.processInfo.environment["TC_BENCH_TELEMETRY"] {
+    networkTelemetryOverrides.recording = value == "1"
+}
+if let value = ProcessInfo.processInfo.environment["TC_BENCH_STALLED_AFTER"].flatMap(Double.init) {
+    networkTelemetryOverrides.stalledAfter = value
+}
+if let value = ProcessInfo.processInfo.environment["TC_BENCH_WATCH_EVERY"].flatMap(Int.init) {
+    if value > 0 && value & (value - 1) == 0 {
+        networkTelemetryOverrides.watchEvery = value
+    } else {
+        writeStderr("TC_BENCH_WATCH_EVERY must be a power of two, ignoring \(value)")
+    }
+}
 let network = makeNetwork(arguments: arguments, config: config, keychain: keychain, basePath: basePath, provider: provider)
 network.shouldKeepConnection.set(.single(true))
+if ProcessInfo.processInfo.environment["TC_BENCH_ONLINE"] == "1" {
+    network.isUserOnline.set(.single(true))
+}
 
 let bench = Bench(arguments: arguments, config: config, network: network, postbox: postbox)
 let output = bench.run()
 print(output)
+if let telemetry = network.telemetry {
+    let summaries = telemetry.makeReport(maxFailures: 0).summaries
+    let failures = Dictionary(grouping: telemetry.pendingFailures, by: { "\($0.failure.rawValue):\($0.code):\($0.error)" }).mapValues(\.count).sorted(by: { $0.value > $1.value }).prefix(6).map { "\($0.key)=\($0.value)" }.joined(separator: ",")
+    writeStderr("telemetry: engine=\(network.engineKind.rawValue) requests=\(summaries.reduce(0, { $0 + $1.requests })) failures=\(telemetry.pendingFailureCount) dropped=\(summaries.reduce(0, { $0 + $1.droppedFailures })) resets=\(summaries.reduce(0, { $0 + $1.connection.sessionResets })) disconnects=\(summaries.reduce(0, { $0 + $1.connection.disconnects })) [\(failures)]")
+    if let path = ProcessInfo.processInfo.environment["TC_BENCH_TELEMETRY_DUMP"] {
+        struct Dump: Encodable {
+            let records: [NetworkFailureRecord]
+            /// Failures by class over every period, not capped like the records.
+            let failureCounts: [String: Int32]
+            /// Connections the engine gave up on, by `role/reason`, over every period.
+            let dropCounts: [String: Int32]
+        }
+        var counts: [String: Int32] = [:]
+        var drops: [String: Int32] = [:]
+        for summary in summaries {
+            for method in summary.methods {
+                for (failure, count) in method.failures {
+                    counts[failure, default: 0] += count
+                }
+            }
+            for (role, reasons) in summary.connection.drops ?? [:] {
+                for (reason, count) in reasons {
+                    drops["\(role)/\(reason)", default: 0] += count
+                }
+            }
+        }
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        encoder.outputFormatting = [.sortedKeys]
+        if let data = try? encoder.encode(Dump(records: telemetry.pendingFailures, failureCounts: counts, dropCounts: drops)) {
+            try? data.write(to: URL(fileURLWithPath: path))
+        }
+    }
+}
 fflush(stdout)
 try? FileManager.default.removeItem(atPath: basePath)
 exit(0)
