@@ -5,15 +5,23 @@ use mio::net::TcpStream;
 use mio::{Interest, Registry, Token};
 use mtproto_core::crypto::SecureRandom;
 use mtproto_core::transport::{
-    Incoming, InputBuffer, Socks5Auth, Socks5Handshake, Socks5Progress, Socks5Target, TransportConfig, TransportError,
-    TransportStream,
+    HttpConnectError, HttpConnectHandshake, HttpCredentials, Incoming, InputBuffer, Socks5Auth, Socks5Handshake,
+    Socks5Progress, Socks5Target, TransportConfig, TransportError, TransportStream,
 };
+
+/// How a connection reaches the datacenter through a proxy before the transport starts.
+#[derive(Debug, Clone)]
+pub enum Tunnel {
+    Socks5(Socks5Target, Option<Socks5Auth>),
+    HttpConnect { authority: String, credentials: Option<HttpCredentials> },
+}
 
 #[derive(Debug)]
 pub enum ConnectionError {
     Io(io::Error),
     Transport(TransportError),
     Socks(mtproto_core::transport::Socks5Error),
+    Proxy(HttpConnectError),
     Closed,
 }
 
@@ -23,6 +31,7 @@ impl core::fmt::Display for ConnectionError {
             ConnectionError::Io(error) => write!(f, "io: {error}"),
             ConnectionError::Transport(error) => write!(f, "transport: {error}"),
             ConnectionError::Socks(error) => write!(f, "socks5: {error}"),
+            ConnectionError::Proxy(error) => write!(f, "http proxy: {error}"),
             ConnectionError::Closed => f.write_str("closed by peer"),
         }
     }
@@ -31,6 +40,7 @@ impl core::fmt::Display for ConnectionError {
 enum Phase {
     Connecting,
     Socks { handshake: Socks5Handshake },
+    HttpTunnel { handshake: HttpConnectHandshake },
     Ready,
 }
 
@@ -48,15 +58,19 @@ pub struct Connection {
     phase: Phase,
     transport: TransportStream,
     socks_input: InputBuffer,
-    pending_socks: Option<(Socks5Target, Option<Socks5Auth>)>,
+    pending_tunnel: Option<Tunnel>,
     write_buffer: Vec<u8>,
     write_offset: usize,
     writable_interest: bool,
     pub address_index: usize,
+    /// Where the socket goes: the address, or the proxy's.
+    pub target: SocketAddr,
     pub started_at: f64,
     pub established_at: Option<f64>,
     pub last_progress_at: f64,
     pub received_packet: bool,
+    /// Any packet of the server's arrived, a handshake step included.
+    pub heard_from_server: bool,
     pub received_bytes: bool,
     pub cellular: bool,
     pub bytes_in: u64,
@@ -71,7 +85,7 @@ impl Connection {
         token: Token,
         address: SocketAddr,
         transport: &TransportConfig,
-        socks: Option<(Socks5Target, Option<Socks5Auth>)>,
+        tunnel: Option<Tunnel>,
         address_index: usize,
         now: f64,
         rng: &mut impl SecureRandom,
@@ -84,15 +98,17 @@ impl Connection {
             phase: Phase::Connecting,
             transport: TransportStream::new(transport, rng),
             socks_input: InputBuffer::new(),
-            pending_socks: socks,
+            pending_tunnel: tunnel,
             write_buffer: Vec::new(),
             write_offset: 0,
             writable_interest: true,
             address_index,
+            target: address,
             started_at: now,
             established_at: None,
             last_progress_at: now,
             received_packet: false,
+            heard_from_server: false,
             received_bytes: false,
             cellular: false,
             bytes_in: 0,
@@ -136,11 +152,16 @@ impl Connection {
                 .ok()
                 .and_then(|address| crate::interface::interface_name_for(address.ip()))
                 .is_some_and(|name| crate::interface::is_cellular_interface(&name));
-            match self.pending_socks.take() {
-                Some((target, auth)) => {
+            match self.pending_tunnel.take() {
+                Some(Tunnel::Socks5(target, auth)) => {
                     let (handshake, greeting) = Socks5Handshake::new(target, auth).map_err(ConnectionError::Socks)?;
                     self.write_buffer.extend_from_slice(&greeting);
                     self.phase = Phase::Socks { handshake };
+                }
+                Some(Tunnel::HttpConnect { authority, credentials }) => {
+                    let (handshake, request) = HttpConnectHandshake::new(&authority, credentials.as_ref());
+                    self.write_buffer.extend_from_slice(&request);
+                    self.phase = Phase::HttpTunnel { handshake };
                 }
                 None => {
                     self.phase = Phase::Ready;
@@ -281,6 +302,20 @@ impl Connection {
                     self.move_transport_output();
                 }
             }
+            Phase::HttpTunnel { handshake } => {
+                self.socks_input.extend(&scratch[..read]);
+                if handshake.feed(&mut self.socks_input).map_err(ConnectionError::Proxy)? {
+                    let leftover = self.socks_input.as_slice().to_vec();
+                    self.socks_input = InputBuffer::new();
+                    self.phase = Phase::Ready;
+                    self.established_at = Some(now);
+                    became_ready = true;
+                    if !leftover.is_empty() {
+                        self.transport.receive(&leftover).map_err(ConnectionError::Transport)?;
+                    }
+                    self.move_transport_output();
+                }
+            }
             Phase::Ready => {
                 let was_ready = self.transport.is_ready();
                 self.transport.receive(&scratch[..read]).map_err(ConnectionError::Transport)?;
@@ -322,7 +357,7 @@ fn compact_written_prefix(buffer: &mut Vec<u8>, offset: &mut usize) {
 
 #[cfg(target_vendor = "apple")]
 #[allow(unsafe_code)]
-fn kernel_send_queue(socket: &mio::net::TcpStream) -> Option<usize> {
+pub(crate) fn kernel_send_queue(socket: &mio::net::TcpStream) -> Option<usize> {
     use std::os::fd::AsRawFd;
     let mut value: libc::c_int = 0;
     let mut length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
@@ -339,7 +374,7 @@ fn kernel_send_queue(socket: &mio::net::TcpStream) -> Option<usize> {
 }
 
 #[cfg(not(target_vendor = "apple"))]
-fn kernel_send_queue(_socket: &mio::net::TcpStream) -> Option<usize> {
+pub(crate) fn kernel_send_queue(_socket: &mio::net::TcpStream) -> Option<usize> {
     None
 }
 

@@ -2,8 +2,10 @@
 
 mod clock;
 mod connection;
+mod http_link;
 mod interface;
 mod resolver;
+mod route_hints;
 mod session_runtime;
 mod types;
 mod uploads;
@@ -21,8 +23,8 @@ use mtproto_core::rpc::{ApiEnvironment, RequestId, RpcRequest, SessionRole, Veri
 
 pub use clock::{monotonic_seconds, now, unix_seconds};
 pub use types::{
-    AuthKeyMaterial, ConnectionState, DcAddress, DropReason, EngineCallbacks, EngineConfig, EngineEvent, KeyGeneration,
-    LogLevel, ProxyConfig, SessionHandle, SessionSetup,
+    AuthKeyMaterial, BoundTemporaryKey, ConnectionState, DcAddress, DropReason, EngineCallbacks, EngineConfig,
+    EngineEvent, KeyGeneration, LogLevel, PfsSetup, ProxyConfig, SessionHandle, SessionSetup, TransportPreference,
 };
 use uploads::Uploads;
 use worker::{Command, WAKER_TOKEN, Worker};
@@ -66,6 +68,7 @@ impl Engine {
             round_robin: AtomicUsize::new(0),
         };
         let uploads = Arc::new(Uploads::default());
+        let hints = Arc::new(route_hints::RouteHints::default());
         for index in 0..count {
             let poll = Poll::new()?;
             let waker = Arc::new(Waker::new(poll.registry(), WAKER_TOKEN)?);
@@ -80,7 +83,8 @@ impl Engine {
                 callbacks.clone(),
                 config.clone(),
             )
-            .sharing_uploads(uploads.clone());
+            .sharing_uploads(uploads.clone())
+            .sharing_route_hints(hints.clone());
             let thread = std::thread::Builder::new()
                 .name(if index == 0 { "mtproto-main".into() } else { format!("mtproto-worker-{index}") })
                 .stack_size(512 * 1024)
@@ -168,6 +172,34 @@ impl Engine {
 
     pub fn set_proxy(&self, handle: SessionHandle, proxy: Option<ProxyConfig>) {
         self.post(handle, Command::SetProxy(handle, proxy));
+    }
+
+    /// Which transports the session may use, and the port HTTP goes to (None: each address's own).
+    pub fn set_transport(&self, handle: SessionHandle, transport: TransportPreference, http_port: Option<u16>) {
+        self.post(handle, Command::SetTransport(handle, transport, http_port));
+    }
+
+    /// The engine makes and binds temporary keys itself from now on; the session's key is the
+    /// permanent key.
+    /// False, and PFS stays off, without a public key to make temporary keys with.
+    pub fn enable_pfs(&self, handle: SessionHandle, setup: PfsSetup) -> bool {
+        if setup.public_keys.is_empty() {
+            return false;
+        }
+        self.post(handle, Command::EnablePfs(handle, Box::new(setup)));
+        true
+    }
+
+    /// A temporary key already bound to the session's permanent key, made by another session or kept
+    /// from an earlier run: the session takes it instead of making one whenever it needs a new key.
+    pub fn offer_temporary_key(&self, handle: SessionHandle, key: BoundTemporaryKey) {
+        self.post(handle, Command::OfferTemporaryKey(handle, Box::new(key)));
+    }
+
+    /// With PFS and the permanent key from the host: whether this session may make the permanent key
+    /// itself while it has none.
+    pub fn allow_permanent_key(&self, handle: SessionHandle, allowed: bool) {
+        self.post(handle, Command::AllowPermanentKey(handle, allowed));
     }
 
     pub fn update_environment(&self, handle: SessionHandle, environment: ApiEnvironment, noop: Option<RpcRequest>) {

@@ -26,6 +26,7 @@ fn main() {
         Some("run") => {
             let mut mtprotokit: Option<String> = None;
             let mut tdlib: Option<String> = None;
+            let mut tdlib_http: Option<String> = None;
             let mut online = false;
             let mut suite_name = "quick".to_string();
             let mut include_real = false;
@@ -37,6 +38,7 @@ fn main() {
                 match flag.as_str() {
                     "--mtprotokit" => mtprotokit = iter.next().cloned(),
                     "--tdlib" => tdlib = iter.next().cloned(),
+                    "--tdlib-http" => tdlib_http = iter.next().cloned(),
                     "--online" => online = true,
                     "--suite" => suite_name = iter.next().cloned().expect("suite"),
                     "--real" => include_real = true,
@@ -46,13 +48,25 @@ fn main() {
                     other => panic!("unknown argument {other}"),
                 }
             }
-            let mut engines =
-                vec![EngineBinary { label: "rust".into(), path: arguments[0].clone(), prefix: vec!["client".into()] }];
+            let mut engines = vec![EngineBinary {
+                label: "rust".into(),
+                path: arguments[0].clone(),
+                prefix: vec!["client".into()],
+                transport: None,
+            }];
             if let Some(path) = mtprotokit {
-                engines.push(EngineBinary { label: "mtprotokit".into(), path, prefix: Vec::new() });
+                engines.push(EngineBinary { label: "mtprotokit".into(), path, prefix: Vec::new(), transport: None });
             }
             if let Some(path) = tdlib {
-                engines.push(EngineBinary { label: "tdlib".into(), path, prefix: Vec::new() });
+                engines.push(EngineBinary { label: "tdlib".into(), path, prefix: Vec::new(), transport: None });
+            }
+            if let Some(path) = tdlib_http {
+                engines.push(EngineBinary {
+                    label: "tdlib-http".into(),
+                    path,
+                    prefix: Vec::new(),
+                    transport: Some("http".into()),
+                });
             }
             let mut results = Vec::new();
             let mut scenarios = orchestrator::suite(&suite_name, include_real);

@@ -8,7 +8,9 @@ pub use salts::{SALT_SAFETY_MARGIN, SINGLE_SALT_LIFETIME, SaltState, ServerSalt}
 
 use crate::auth_key::AuthKey;
 use crate::crypto::{SecureRandom, Side, aes_ige_decrypt, message_key_v2};
-use crate::message::{MessageError, MessageHeader, PaddingPolicy, decrypt_message, encrypt_message, read_auth_key_id};
+use crate::message::{
+    MessageError, MessageHeader, PaddingPolicy, decrypt_message, encrypt_message, encrypt_message_v1, read_auth_key_id,
+};
 use crate::msg_id::{MSG_ID_MAX_FUTURE_SECONDS, MSG_ID_MAX_PAST_SECONDS, msg_id_for_time, msg_id_time};
 use crate::tl::mtproto::{self as tlm, ContainerMessage, FutureSalt, RpcResultBody, ServiceMessage};
 use crate::tl::{Reader, TlError, Writer, ids};
@@ -82,6 +84,19 @@ pub const UPLINK_SAMPLE_MIN_BYTES: u64 = 16 * 1024;
 /// How long the kernel may hold unsent bytes without the peer acknowledging any before the transmit
 /// grace stops covering for it. Receive windows open in bursts and weak links stall for seconds.
 pub const SEND_QUEUE_STUCK_AFTER: f64 = 10.0;
+/// HTTP: how long a re-send of an answer the server announced with msg_detailed_info waits, at
+/// least, for that answer to arrive in a response another connection is still receiving.
+pub const HTTP_ANSWER_HOLD_MIN: f64 = 1.0;
+/// HTTP: the longest an announced answer is waited for while responses keep arriving.
+pub const HTTP_ANSWER_HOLD_MAX: f64 = 30.0;
+/// HTTP: packets tracked for loss; beyond it the oldest are forgotten (their queries then wait for
+/// the usual state requests).
+pub const MAX_TRACKED_HTTP_PACKETS: usize = 256;
+/// HTTP: a response proves the server read the request, and it acknowledges the queries in it in
+/// that response or soon after; one neither acknowledged nor answered this long after goes again.
+pub const HTTP_ACK_GRACE: f64 = 3.0;
+/// HTTP: acknowledgements wait this long for a request with queries to ride along with.
+pub const HTTP_ACK_DELAY: f64 = 0.02;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Now {
@@ -183,6 +198,54 @@ pub struct Transmit {
     pub quick_ack_token: Option<u32>,
     pub msg_id: i64,
     pub contains_queries: bool,
+    pub packet_seq: u64,
+}
+
+/// The `http_wait` an HTTP request carries: the server answers once something is queued for the
+/// session, after `max_delay` ms at most (`wait_after` ms after the latest message), and otherwise
+/// after `max_wait` ms with an empty packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HttpWait {
+    pub max_delay: i32,
+    pub wait_after: i32,
+    pub max_wait: i32,
+}
+
+impl HttpWait {
+    pub const IMMEDIATE: HttpWait = HttpWait { max_delay: 0, wait_after: 0, max_wait: 0 };
+
+    pub fn long_poll(max_wait_ms: i32) -> Self {
+        Self { max_delay: 0, wait_after: 0, max_wait: max_wait_ms }
+    }
+}
+
+/// `auth.bindTempAuthKey` for this session's temporary key. Its body is made when it gets a msg_id:
+/// the inner `bind_auth_key_inner`, encrypted with the permanent key under MTProto 1.0, has to carry
+/// that msg_id, and this session's id.
+#[derive(Clone)]
+pub struct BindRequest {
+    pub perm_key: AuthKey,
+    pub nonce: i64,
+    pub expires_at: i32,
+}
+
+impl core::fmt::Debug for BindRequest {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("BindRequest")
+            .field("perm_key", &self.perm_key.id())
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+/// What one HTTP request carried, to resend it promptly if the request is lost.
+#[derive(Debug, Clone)]
+struct HttpPacket {
+    seq: u64,
+    queries: Vec<(QueryId, i64)>,
+    services: Vec<i64>,
+    future_salts: Option<i64>,
+    destroys_auth_key: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -259,6 +322,9 @@ impl ServiceRequest {
 struct AwaitedAnswer {
     query: Option<QueryId>,
     requests: u32,
+    /// HTTP: no re-send request before then; the answer may be in a response still arriving.
+    hold_until: f64,
+    announced_at: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -401,8 +467,22 @@ pub struct Session {
 
     need_destroy_auth_key: bool,
     sent_destroy_auth_key: bool,
+    destroy_answered: bool,
     pending_reset: bool,
     drain_reset_at: Option<f64>,
+
+    /// The transport is HTTP: every packet is a request carrying an `http_wait`, the server answers
+    /// only in responses, there is no quick ack and no ping; the host times each request instead.
+    http: bool,
+    http_packets: VecDeque<HttpPacket>,
+    /// HTTP: queries whose request was answered, with when they must be acknowledged by.
+    http_awaiting_ack: VecDeque<(QueryId, i64, f64)>,
+    /// HTTP: response bytes arrived lately, so an announced answer may be among them.
+    http_receiving_until: f64,
+
+    bind: Option<(QueryId, BindRequest)>,
+    /// The key is temporary and not bound yet: nothing but the bind query goes out.
+    bind_gate: bool,
 
     events: VecDeque<SessionEvent>,
 }
@@ -497,10 +577,216 @@ impl Session {
             dropped_answer_window_start: now.mono,
             need_destroy_auth_key: false,
             sent_destroy_auth_key: false,
+            destroy_answered: false,
             pending_reset: false,
             drain_reset_at: None,
+            http: false,
+            http_packets: VecDeque::new(),
+            http_awaiting_ack: VecDeque::new(),
+            http_receiving_until: 0.0,
+            bind: None,
+            bind_gate: false,
             events: VecDeque::new(),
         }
+    }
+
+    /// Switches between the stream transports and HTTP. The host calls `connection_closed` before a
+    /// switch while a connection is open.
+    pub fn set_http(&mut self, http: bool) {
+        if self.http == http {
+            return;
+        }
+        self.http = http;
+        self.http_packets.clear();
+        self.http_awaiting_ack.clear();
+        self.quick_acks.clear();
+        self.pending_pings.clear();
+        self.unconfirmed_large.clear();
+        self.transmit_grace_until = 0.0;
+        self.last_ping_at = None;
+        self.last_ping_msg_id = 0;
+        self.last_ping_container_id = 0;
+        self.last_ping_delay = f64::INFINITY;
+    }
+
+    /// Each query's state, for diagnostics.
+    pub fn describe_queries(&self) -> String {
+        self.queries
+            .values()
+            .map(|query| {
+                format!(
+                    "[{:?} ack {} arrived {} epoch {}/{} msg {:x}]",
+                    query.state,
+                    query.acknowledged,
+                    query.may_have_arrived,
+                    query.connection_epoch,
+                    self.connection_epoch,
+                    query.msg_id
+                )
+            })
+            .collect()
+    }
+
+    pub fn is_http(&self) -> bool {
+        self.http
+    }
+
+    /// HTTP: a response to the request that carried packet `seq` arrived, so the server read it.
+    pub fn http_packet_delivered(&mut self, seq: u64, now: Now) {
+        let Some(position) = self.http_packets.iter().position(|packet| packet.seq == seq) else {
+            return;
+        };
+        let packet = self.http_packets.remove(position).expect("position is valid");
+        for (id, msg_id) in packet.queries {
+            if self
+                .queries
+                .get(&id)
+                .is_some_and(|query| query.state == QueryState::Sent && query.msg_id == msg_id && !query.acknowledged)
+            {
+                self.http_awaiting_ack.push_back((id, msg_id, now.mono + HTTP_ACK_GRACE));
+            }
+        }
+        while self.http_awaiting_ack.len() > MAX_AWAITED_ANSWERS {
+            self.http_awaiting_ack.pop_front();
+        }
+    }
+
+    /// HTTP: queries the server read but neither acknowledged nor answered in time go again under
+    /// their msg_id; if they did arrive, the server answers the copy from its cache.
+    fn resend_unacknowledged_http(&mut self, now: Now) {
+        let server_time = self.server_time(now);
+        let mut resend = Vec::new();
+        while let Some(&(id, msg_id, due)) = self.http_awaiting_ack.front() {
+            if due > now.mono {
+                break;
+            }
+            self.http_awaiting_ack.pop_front();
+            let Some(query) = self.queries.get_mut(&id) else {
+                continue;
+            };
+            if query.state != QueryState::Sent || query.msg_id != msg_id || query.acknowledged {
+                continue;
+            }
+            if query.retransmit_refused || server_time - msg_id_time(msg_id) >= RETRANSMIT_WINDOW {
+                continue;
+            }
+            Self::count_transition(
+                &mut self.pending_queries,
+                &mut self.unknown_queries,
+                Some(QueryState::Sent),
+                Some(QueryState::Unknown),
+            );
+            query.state = QueryState::Unknown;
+            query.may_have_arrived = true;
+            resend.push((msg_id, id));
+        }
+        if resend.is_empty() {
+            return;
+        }
+        resend.sort_unstable();
+        for (_, id) in resend {
+            if !self.to_retransmit.contains(&id) {
+                self.to_retransmit.push(id);
+            }
+        }
+        self.refresh_unknown_tracking();
+        self.send_before(now.mono);
+    }
+
+    /// HTTP: the request that carried packet `seq` failed before its response came. What it carried
+    /// may or may not have reached the server: queries go again under the same msg_id, which the
+    /// server never executes twice, and service requests are asked again.
+    pub fn http_packet_lost(&mut self, seq: u64, now: Now) {
+        let Some(position) = self.http_packets.iter().position(|packet| packet.seq == seq) else {
+            return;
+        };
+        let packet = self.http_packets.remove(position).expect("position is valid");
+        if packet.destroys_auth_key {
+            self.sent_destroy_auth_key = false;
+        }
+        let server_time = self.server_time(now);
+        let mut retransmit = Vec::new();
+        for (id, msg_id) in packet.queries {
+            let Some(query) = self.queries.get_mut(&id) else {
+                continue;
+            };
+            if query.state != QueryState::Sent || query.msg_id != msg_id || query.acknowledged {
+                continue;
+            }
+            Self::count_transition(
+                &mut self.pending_queries,
+                &mut self.unknown_queries,
+                Some(QueryState::Sent),
+                Some(QueryState::Unknown),
+            );
+            query.state = QueryState::Unknown;
+            query.may_have_arrived = true;
+            if !query.retransmit_refused && server_time - msg_id_time(msg_id) < RETRANSMIT_WINDOW {
+                retransmit.push((msg_id, id));
+            } else if !self.to_state_request.contains(&msg_id) {
+                self.to_state_request.push(msg_id);
+                self.unknown_since.get_or_insert(now.mono);
+            }
+        }
+        retransmit.sort_unstable();
+        for (_, id) in retransmit {
+            if !self.to_retransmit.contains(&id) {
+                self.to_retransmit.push(id);
+            }
+        }
+        for service in packet.services {
+            match self.service_requests.remove(&service) {
+                Some(ServiceRequest::StateRequest { msg_ids, .. }) => {
+                    for msg_id in msg_ids {
+                        if !self.to_state_request.contains(&msg_id) {
+                            self.to_state_request.push(msg_id);
+                        }
+                    }
+                }
+                Some(ServiceRequest::ResendRequest { msg_ids, .. }) => {
+                    for msg_id in msg_ids {
+                        if self.awaited_answers.contains_key(&msg_id) && !self.to_resend_answer.contains(&msg_id) {
+                            self.to_resend_answer.push(msg_id);
+                        }
+                    }
+                }
+                None => {}
+            }
+        }
+        if let Some(request) = packet.future_salts
+            && let Some(index) = self.future_salts_requests.iter().position(|pending| *pending == request)
+        {
+            self.future_salts_requests.remove(index);
+            self.last_future_salts_at = None;
+        }
+        self.refresh_unknown_tracking();
+        self.send_before(now.mono);
+    }
+
+    /// HTTP: response bytes are arriving; an answer the server announced may be among them.
+    pub fn note_http_receiving(&mut self, now: Now) {
+        self.http_receiving_until = self.http_receiving_until.max(now.mono + HTTP_ANSWER_HOLD_MIN / 2.0);
+    }
+
+    /// HTTP: a round trip of a request the server answered at once.
+    pub fn note_rtt_sample(&mut self, rtt: f64) {
+        let rtt = rtt.max(0.0);
+        self.rtt_peak = rtt.max(self.rtt_peak * 0.9);
+        if self.rtt == 0.0 {
+            self.rtt = rtt;
+            self.rtt_var = rtt / 2.0;
+        } else {
+            self.rtt_var = self.rtt_var * 0.75 + (self.rtt - rtt).abs() * 0.25;
+            self.rtt = self.rtt * 0.7 + rtt * 0.3;
+        }
+    }
+
+    /// When an answer announced over HTTP may be asked for again.
+    fn answer_hold_until(&self, awaited: &AwaitedAnswer) -> f64 {
+        if !self.http {
+            return 0.0;
+        }
+        awaited.hold_until.max(self.http_receiving_until).min(awaited.announced_at + HTTP_ANSWER_HOLD_MAX)
     }
 
     pub fn session_id(&self) -> i64 {
@@ -535,6 +821,10 @@ impl Session {
         self.queries.len()
     }
 
+    pub fn unanswered_query_count(&self) -> usize {
+        self.queries.len() - self.pending_queries
+    }
+
     pub fn has_unanswered_queries(&self) -> bool {
         self.queries.len() > self.pending_queries
     }
@@ -543,8 +833,15 @@ impl Session {
         self.unknown_queries > 0
     }
 
+    /// Answers may still come under the session about to be reset: for queries sent, and over HTTP
+    /// also for queries whose request was lost but may have reached the server.
     fn awaits_old_session_answers(&self) -> bool {
         self.queries.len() > self.pending_queries + self.unknown_queries
+            || (self.http
+                && self
+                    .queries
+                    .values()
+                    .any(|query| query.state == QueryState::Unknown && query.may_have_arrived && !query.acknowledged))
     }
 
     fn finish_drain_reset(&mut self, now: Now, rng: &mut impl SecureRandom) -> bool {
@@ -603,6 +900,11 @@ impl Session {
         self.queries.contains_key(&id)
     }
 
+    /// The query went out at least once, so the server may have it.
+    pub fn was_transmitted(&self, id: QueryId) -> bool {
+        self.queries.get(&id).is_some_and(|query| query.state != QueryState::Pending || query.may_have_arrived)
+    }
+
     pub fn set_online(&mut self, online: bool, now: Now) {
         let need_ping = online || !self.online;
         self.online = online;
@@ -627,6 +929,9 @@ impl Session {
         if auth_key.id() != self.auth_key.id() {
             self.auth_key = auth_key;
             self.salts = SaltState::from_salts(salts, self.server_time(now));
+            self.need_destroy_auth_key = false;
+            self.sent_destroy_auth_key = false;
+            self.destroy_answered = false;
         }
     }
 
@@ -641,11 +946,19 @@ impl Session {
     pub fn destroy_auth_key(&mut self, now: Now) {
         self.need_destroy_auth_key = true;
         self.sent_destroy_auth_key = false;
+        self.destroy_answered = false;
         self.send_before(now.mono);
+    }
+
+    /// `destroy_auth_key` was asked for and its answer has not come yet.
+    pub fn is_destroying_auth_key(&self) -> bool {
+        self.need_destroy_auth_key && !self.destroy_answered
     }
 
     pub fn request_destroy_auth_key(&mut self) {
         self.need_destroy_auth_key = true;
+        self.sent_destroy_auth_key = false;
+        self.destroy_answered = false;
     }
 
     pub fn smoothed_rtt(&self) -> Option<f64> {
@@ -1101,6 +1414,9 @@ impl Session {
             return;
         }
         self.connected = false;
+        self.sent_destroy_auth_key = false;
+        self.http_packets.clear();
+        self.http_awaiting_ack.clear();
         let epoch = self.connection_epoch;
         for query in self.queries.values_mut() {
             if query.state == QueryState::Sent && !query.acknowledged && query.connection_epoch == epoch {
@@ -1480,7 +1796,9 @@ impl Session {
     }
 
     fn schedule_ack(&mut self, msg_id: i64, now: Now) {
-        if self.to_ack.is_empty() {
+        if self.http {
+            self.send_before(now.mono + HTTP_ACK_DELAY);
+        } else if self.to_ack.is_empty() {
             self.send_before(now.mono + ACK_DELAY);
         }
         if self.to_ack.last() != Some(&msg_id) {
@@ -1535,25 +1853,30 @@ impl Session {
         }
         self.sync_wall_clock(now);
         let body = decrypted.body();
-        let mode = match self.received.peek(header.msg_id) {
+        let mut mode = match self.received.peek(header.msg_id) {
             DuplicateCheck::New => Mode::Process,
             DuplicateCheck::Duplicate => Mode::AckOnly,
             DuplicateCheck::TooOld => Mode::Replay,
         };
-        let mut budget = self.config.max_unpacked_bytes;
+        let budget = self.config.max_unpacked_bytes;
         match mode {
             Mode::Process => {
                 self.observe_server_time(header.msg_id, now);
                 if !self.is_within_time_window(header.msg_id, now) {
-                    if !self.has_freshness_proof(body, 0, &mut budget, &mut 0, now) {
+                    if self.has_freshness_proof(body, 0, &mut { budget }, &mut 0, now) {
+                        self.reset_server_time(header.msg_id, now);
+                    } else if self.answers_an_awaited_query(body, 0, &mut { budget }, &mut 0) {
+                        mode = Mode::Replay;
+                    } else {
                         return Ok(());
                     }
-                    self.reset_server_time(header.msg_id, now);
                 }
                 self.received.check(header.msg_id);
             }
             Mode::Replay => {
-                if !self.is_within_time_window(header.msg_id, now) {
+                if !self.is_within_time_window(header.msg_id, now)
+                    && !self.answers_an_awaited_query(body, 0, &mut { budget }, &mut 0)
+                {
                     return Ok(());
                 }
                 self.received.check(header.msg_id);
@@ -1610,6 +1933,12 @@ impl Session {
         Ok(())
     }
 
+    /// An answer whose msg_id can set the clock: one from this packet's own time, not an old answer
+    /// taken as a replay or re-sent late inside a fresh container.
+    fn answers_with_current_time(&self, context: &PacketContext, msg_id: i64, now: Now) -> bool {
+        context.mode == Mode::Process && self.is_within_time_window(msg_id, now)
+    }
+
     fn is_within_time_window(&self, msg_id: i64, now: Now) -> bool {
         if !self.time_synchronized {
             return true;
@@ -1617,6 +1946,31 @@ impl Session {
         let server_time = self.server_time(now);
         let message_time = msg_id_time(msg_id);
         message_time >= server_time - MSG_ID_MAX_PAST_SECONDS && message_time <= server_time + MSG_ID_MAX_FUTURE_SECONDS
+    }
+
+    /// The packet carries the answer to a query this session still waits for. However old, it can only
+    /// be the server's answer, held up somewhere (an outage longer than the time window), and is taken
+    /// once like any other; its time says nothing about the server's clock.
+    fn answers_an_awaited_query(&self, body: &[u8], depth: usize, budget: &mut usize, visited: &mut usize) -> bool {
+        *visited += 1;
+        if depth > MAX_NESTING_DEPTH || *visited > MAX_MESSAGES_PER_PACKET {
+            return false;
+        }
+        match ServiceMessage::parse(body) {
+            Ok(ServiceMessage::Container(children)) => {
+                children.iter().any(|child| self.answers_an_awaited_query(child.body, depth + 1, budget, visited))
+            }
+            Ok(ServiceMessage::GzipPacked(packed)) => tlm::gunzip_within(packed, budget)
+                .map(|unpacked| self.answers_an_awaited_query(&unpacked, depth + 1, budget, visited))
+                .unwrap_or(false),
+            Ok(ServiceMessage::MsgCopy(inner)) => self.answers_an_awaited_query(inner.body, depth + 1, budget, visited),
+            Ok(ServiceMessage::RpcResult { req_msg_id, .. }) => self
+                .by_msg_id
+                .get(&req_msg_id)
+                .and_then(|id| self.queries.get(id))
+                .is_some_and(|query| query.msg_id == req_msg_id),
+            _ => false,
+        }
     }
 
     fn has_freshness_proof(
@@ -1968,11 +2322,12 @@ impl Session {
         let ping = self.pending_pings.remove(&ping_msg_id).or_else(|| self.pending_pings.remove(&ping_id));
         if let Some(ping) = ping {
             self.note_arrived(ping.packet_seq, now);
-            if msg_id < ping_msg_id.wrapping_sub(RESPONSE_TIME_SKEW) {
+            let fresh = self.answers_with_current_time(context, msg_id, now);
+            if fresh && msg_id < ping_msg_id.wrapping_sub(RESPONSE_TIME_SKEW) {
                 self.reset_server_time(msg_id, now);
             }
             let rtt = (now.mono - ping.sent_at).max(0.0);
-            if !ping.behind_large {
+            if fresh && !ping.behind_large {
                 self.rtt_peak = rtt.max(self.rtt_peak * 0.9);
                 if self.rtt == 0.0 {
                     self.rtt = rtt;
@@ -1996,7 +2351,8 @@ impl Session {
     }
 
     fn on_destroy_auth_key(&mut self, outcome: DestroyAuthKeyOutcome) {
-        if self.need_destroy_auth_key {
+        if self.is_destroying_auth_key() {
+            self.destroy_answered = true;
             self.events.push_back(SessionEvent::DestroyAuthKey { outcome });
         }
     }
@@ -2025,7 +2381,8 @@ impl Session {
             }
             return;
         };
-        if msg_id < req_msg_id.wrapping_sub(RESPONSE_TIME_SKEW) {
+        if msg_id < req_msg_id.wrapping_sub(RESPONSE_TIME_SKEW) && self.answers_with_current_time(context, msg_id, now)
+        {
             self.reset_server_time(msg_id, now);
         }
         if let Some(seq) = self
@@ -2157,12 +2514,20 @@ impl Session {
         if !self.awaited_answers.contains_key(&answer) && self.awaited_answers.len() >= MAX_AWAITED_ANSWERS {
             return;
         }
-        let entry = self.awaited_answers.entry(answer).or_insert(AwaitedAnswer { query, requests: 0 });
+        let hold = if self.http { now.mono + HTTP_ANSWER_HOLD_MIN.max(self.rtt_estimate() * 1.5) } else { 0.0 };
+        let entry = self.awaited_answers.entry(answer).or_insert(AwaitedAnswer {
+            query,
+            requests: 0,
+            hold_until: hold,
+            announced_at: now.mono,
+        });
         if entry.query.is_none() {
             entry.query = query;
         }
+        let entry = *entry;
+        let due = if self.http { self.answer_hold_until(&entry) } else { now.mono + QUERY_DELAY };
         if self.to_resend_answer.is_empty() {
-            self.send_before(now.mono + QUERY_DELAY);
+            self.send_before(due.max(now.mono + QUERY_DELAY));
         }
         if !self.to_resend_answer.contains(&answer) {
             self.to_resend_answer.push(answer);
@@ -2245,6 +2610,9 @@ impl Session {
     /// has passed: they show the connection alive, and on a starved uplink every byte counts. Never
     /// later than half that delay, so a ping that is due always may go.
     fn may_ping(&self, now: Now) -> bool {
+        if self.http {
+            return false;
+        }
         let Some(at) = self.last_ping_at else {
             return true;
         };
@@ -2269,7 +2637,7 @@ impl Session {
     }
 
     fn must_ping(&self, now: Now) -> bool {
-        self.ping_due_at().is_none_or(|at| at < now.mono)
+        !self.http && self.ping_due_at().is_none_or(|at| at < now.mono)
     }
 
     /// When a ping of its own must go out: after the ping-must delay, and no later than half the
@@ -2301,7 +2669,7 @@ impl Session {
             if self.must_ping(now) {
                 return true;
             }
-            if self.need_destroy_auth_key && !self.sent_destroy_auth_key {
+            if self.is_destroying_auth_key() && !self.sent_destroy_auth_key {
                 return true;
             }
         } else {
@@ -2325,9 +2693,11 @@ impl Session {
             if let Some(at) = self.force_send_at {
                 transmit = transmit.min(at);
             }
-            match self.last_ping_at {
-                Some(_) => transmit = transmit.min(self.ping_due_at().unwrap_or(now.mono)),
-                None => transmit = transmit.min(now.mono),
+            if !self.http {
+                match self.last_ping_at {
+                    Some(_) => transmit = transmit.min(self.ping_due_at().unwrap_or(now.mono)),
+                    None => transmit = transmit.min(now.mono),
+                }
             }
         } else {
             match self.last_future_salts_at {
@@ -2342,15 +2712,20 @@ impl Session {
             Some(at) => transmit.max(at),
             None => transmit,
         };
-        let grace = self.transmit_grace_until();
-        let grace = grace.max(self.liveness_hold_until).max(self.fresh_hold_until());
-        deadline = deadline.min((self.liveness_at() + self.ping_disconnect_delay() + 0.002).max(grace));
-        deadline = deadline.min((self.last_read_at + self.read_disconnect_delay() + 0.002).max(grace));
+        if !self.http {
+            let grace = self.transmit_grace_until();
+            let grace = grace.max(self.liveness_hold_until).max(self.fresh_hold_until());
+            deadline = deadline.min((self.liveness_at() + self.ping_disconnect_delay() + 0.002).max(grace));
+            deadline = deadline.min((self.last_read_at + self.read_disconnect_delay() + 0.002).max(grace));
+        }
         if let Some(since) = self.unknown_since {
             deadline = deadline.min(since + STATE_REQUEST_RETRY);
         }
         if let Some(at) = self.drain_reset_at {
             deadline = deadline.min(at);
+        }
+        if let Some(&(_, _, due)) = self.http_awaiting_ack.front() {
+            deadline = deadline.min(due);
         }
         if let Some(at) = self.probe_deadline() {
             deadline = deadline
@@ -2370,8 +2745,10 @@ impl Session {
         self.sync_wall_clock(now);
         self.refresh_busy(now);
         self.stretch_expired_grace(now);
-        let transmitting =
-            self.is_transmitting(now) || now.mono < self.liveness_hold_until || now.mono < self.fresh_hold_until();
+        let transmitting = self.http
+            || self.is_transmitting(now)
+            || now.mono < self.liveness_hold_until
+            || now.mono < self.fresh_hold_until();
         if !transmitting && self.liveness_at() + self.ping_disconnect_delay() < now.mono {
             self.note_silent_cut(now);
             return Err(SessionError::PingTimeout);
@@ -2380,12 +2757,16 @@ impl Session {
             self.note_silent_cut(now);
             return Err(SessionError::ReadTimeout);
         }
-        if now.mono >= self.probe_held_until(now) && self.probe_deadline().is_some_and(|at| at < now.mono) {
+        if !self.http && now.mono >= self.probe_held_until(now) && self.probe_deadline().is_some_and(|at| at < now.mono)
+        {
             if self.received_on_connection {
                 self.probe_backoff = (self.probe_backoff * 2.0).min(PROBE_BACKOFF_MAX);
             }
             self.note_silent_cut(now);
             return Err(SessionError::ProbeTimeout);
+        }
+        if self.http {
+            self.resend_unacknowledged_http(now);
         }
         self.expire_state_requests(now);
         if self.unknown_since.is_some_and(|since| since + STATE_REQUEST_RETRY < now.mono) {
@@ -2485,9 +2866,147 @@ impl Session {
         if self.drain_reset_at.is_some() || !self.must_flush(now) {
             return None;
         }
-        let transmit = self.flush_packet(now, rng);
+        let transmit = self.flush_packet(now, rng, None, true);
         self.refresh_busy(now);
         transmit
+    }
+
+    /// HTTP: the next request, carrying `wait`. `force` makes one even with nothing else to send, to
+    /// keep a long poll parked at the server; otherwise only when something is due.
+    pub fn poll_http_transmit(
+        &mut self,
+        now: Now,
+        rng: &mut impl SecureRandom,
+        wait: HttpWait,
+        force: bool,
+        queries: bool,
+    ) -> Option<Transmit> {
+        debug_assert!(self.http, "HTTP requests on a stream transport");
+        self.sync_wall_clock(now);
+        self.finish_drain_reset(now, rng);
+        let draining = self.drain_reset_at.is_some();
+        if (draining && (queries || !force)) || !self.connected || (!force && !self.must_flush(now)) {
+            return None;
+        }
+        let transmit = self.flush_packet(now, rng, Some(wait), queries);
+        self.refresh_busy(now);
+        transmit
+    }
+
+    /// Queries are waiting to go out, fresh or again, and may.
+    pub fn has_queries_to_send(&self) -> bool {
+        self.pending.iter().chain(self.to_retransmit.iter()).any(|id| !self.is_gated(*id))
+    }
+
+    /// The key is temporary and not bound yet: no query goes out until `start_bind`'s does and is
+    /// answered.
+    pub fn hold_until_bound(&mut self) {
+        self.bind_gate = true;
+    }
+
+    pub fn is_bound(&self) -> bool {
+        !self.bind_gate
+    }
+
+    pub fn bind_query(&self) -> Option<QueryId> {
+        self.bind.as_ref().map(|(id, _)| *id)
+    }
+
+    /// Sends `auth.bindTempAuthKey` ahead of everything else and holds every other query until
+    /// `finish_bind`.
+    pub fn start_bind(&mut self, id: QueryId, request: BindRequest, now: Now) {
+        if let Some((previous, _)) = self.bind.take() {
+            self.cancel(previous);
+        }
+        self.cancel(id);
+        self.queries.insert(
+            id,
+            Query {
+                body: Vec::new(),
+                options: QueryOptions::default(),
+                state: QueryState::Pending,
+                msg_id: 0,
+                seq_no: 0,
+                container_id: 0,
+                invoke_after_msg_id: 0,
+                acknowledged: false,
+                ack_reported: false,
+                sent_at: 0.0,
+                connection_epoch: 0,
+                protocol_strikes: 0,
+                rejections: 0,
+                server_resends: 0,
+                may_have_arrived: false,
+                retransmit_refused: false,
+                arrival_seq: None,
+            },
+        );
+        self.pending_queries += 1;
+        self.pending.push_front(id);
+        self.bind = Some((id, request));
+        self.bind_gate = true;
+        self.send_before(now.mono);
+    }
+
+    /// The bind query was answered: on success the other queries may go.
+    pub fn finish_bind(&mut self, id: QueryId, bound: bool, now: Now) {
+        if self.bind.as_ref().is_none_or(|(bind, _)| *bind != id) {
+            return;
+        }
+        self.bind = None;
+        if bound {
+            self.bind_gate = false;
+            if !self.pending.is_empty() || !self.to_retransmit.is_empty() {
+                self.send_before(now.mono);
+            }
+        }
+    }
+
+    /// Held back by the bind gate: everything but the bind query while the key is not bound.
+    /// A query that may not go yet: before the temporary key is bound only the bind may, and nothing
+    /// goes while the key is being destroyed (as in tdlib, a destroying session sends no queries).
+    fn is_gated(&self, id: QueryId) -> bool {
+        (self.bind_gate && self.bind.as_ref().is_none_or(|(bind, _)| *bind != id)) || self.is_destroying_auth_key()
+    }
+
+    fn bind_body(&self, id: QueryId, msg_id: i64, rng: &mut impl SecureRandom) -> Option<Vec<u8>> {
+        let (bind, request) = self.bind.as_ref()?;
+        if *bind != id {
+            return None;
+        }
+        let inner = tlm::BindAuthKeyInner {
+            nonce: request.nonce,
+            temp_auth_key_id: self.auth_key.id() as i64,
+            perm_auth_key_id: request.perm_key.id() as i64,
+            temp_session_id: self.session_id,
+            expires_at: request.expires_at,
+        };
+        let mut writer = Writer::with_capacity(40);
+        crate::tl::TlWrite::write_to(&inner, &mut writer);
+        let header =
+            MessageHeader { salt: rng.next_u64() as i64, session_id: rng.next_u64() as i64, msg_id, seq_no: 0 };
+        let encrypted = encrypt_message_v1(&request.perm_key, &header, &writer.into_inner(), rng);
+        let mut body = Writer::with_capacity(32 + encrypted.len());
+        body.write_u32(ids::AUTH_BIND_TEMP_AUTH_KEY);
+        body.write_i64(request.perm_key.id() as i64);
+        body.write_i64(request.nonce);
+        body.write_i32(request.expires_at);
+        body.write_bytes(&encrypted);
+        Some(body.into_inner())
+    }
+
+    /// A reset waits for the answers the old session may still get.
+    pub fn is_draining(&self) -> bool {
+        self.drain_reset_at.is_some()
+    }
+
+    /// HTTP: whether something is due to go out now; a drain reset that is due goes with the next
+    /// transmit, which nothing else would ask for over HTTP.
+    pub fn wants_http_transmit(&mut self, now: Now) -> bool {
+        match self.drain_reset_at {
+            Some(at) => now.mono >= at || !self.awaits_old_session_answers(),
+            None => self.must_flush(now),
+        }
     }
 
     fn query_wire_body(query: &Query) -> Vec<u8> {
@@ -2513,7 +3032,13 @@ impl Session {
         msg_id
     }
 
-    fn flush_packet(&mut self, now: Now, rng: &mut impl SecureRandom) -> Option<Transmit> {
+    fn flush_packet(
+        &mut self,
+        now: Now,
+        rng: &mut impl SecureRandom,
+        http_wait: Option<HttpWait>,
+        queries: bool,
+    ) -> Option<Transmit> {
         let server_time = self.server_time(now);
         let has_salt = self.salts.has_valid_salt(server_time);
 
@@ -2526,10 +3051,15 @@ impl Session {
         let probe_first = has_salt && !self.received_on_connection && self.may_ping(now) && self.large_query_waiting();
 
         let mut total = 0usize;
-        if has_salt && !probe_first && !self.to_retransmit.is_empty() {
+        if queries && has_salt && !probe_first && !self.to_retransmit.is_empty() {
             let epoch = self.connection_epoch;
             let mut deferred = Vec::new();
+            let mut held = Vec::new();
             for id in std::mem::take(&mut self.to_retransmit) {
+                if self.is_gated(id) {
+                    held.push(id);
+                    continue;
+                }
                 if !deferred.is_empty() {
                     deferred.push(id);
                     continue;
@@ -2560,14 +3090,26 @@ impl Session {
                 messages.push(OutgoingMessage { msg_id: query.msg_id, seq_no: query.seq_no, body });
                 force_container = true;
             }
+            deferred.extend(held);
             self.to_retransmit = deferred;
             self.refresh_unknown_tracking();
         }
 
-        if has_salt && !probe_first && self.to_retransmit.is_empty() {
+        if self.bind_gate
+            && let Some((bind, _)) = &self.bind
+            && let Some(position) = self.pending.iter().position(|id| id == bind)
+            && position > 0
+        {
+            let id = self.pending.remove(position).expect("position is valid");
+            self.pending.push_front(id);
+        }
+        if queries && has_salt && !probe_first && self.to_retransmit.iter().all(|id| self.is_gated(*id)) {
             let mut sent_now: HashMap<QueryId, i64> = HashMap::new();
             while let Some(&id) = self.pending.front() {
                 if query_messages.len() >= self.config.max_container_queries {
+                    break;
+                }
+                if self.is_gated(id) {
                     break;
                 }
                 let Some((body_len, invoke_after)) =
@@ -2586,7 +3128,11 @@ impl Session {
                 let msg_id = self.next_msg_id(now, rng);
                 let seq_no = self.next_seq_no(true);
                 let epoch = self.connection_epoch;
+                let bind_body = self.bind_body(id, msg_id, rng);
                 let query = self.queries.get_mut(&id).expect("query exists");
+                if let Some(body) = bind_body {
+                    query.body = body;
+                }
                 query.invoke_after_msg_id = dependency.unwrap_or(0);
                 let body = Self::query_wire_body(query);
                 total += body.len();
@@ -2634,6 +3180,7 @@ impl Session {
             messages.push(OutgoingMessage { msg_id, seq_no, body: writer.into_inner() });
         }
 
+        let mut future_salts_msg_id = None;
         if self.salts.needs_future_salts(server_time)
             && self.last_future_salts_at.is_none_or(|at| at + FUTURE_SALTS_RETRY < now.mono)
         {
@@ -2641,6 +3188,7 @@ impl Session {
             let mut writer = Writer::with_capacity(8);
             tlm::write_get_future_salts(&mut writer, FUTURE_SALTS_COUNT);
             let msg_id = self.push_service(&mut messages, writer.into_inner(), now, rng);
+            future_salts_msg_id = Some(msg_id);
             self.future_salts_requests.push_back(msg_id);
             while self.future_salts_requests.len() > 8 {
                 self.future_salts_requests.pop_front();
@@ -2667,6 +3215,15 @@ impl Session {
         }
 
         let mut resend_requests: Vec<(i64, Vec<i64>)> = Vec::new();
+        let mut held_answers = Vec::new();
+        if self.http && !self.to_resend_answer.is_empty() {
+            let mut due = Vec::new();
+            for id in std::mem::take(&mut self.to_resend_answer) {
+                let hold = self.awaited_answers.get(&id).map_or(0.0, |awaited| self.answer_hold_until(awaited));
+                if hold > now.mono { held_answers.push(id) } else { due.push(id) }
+            }
+            self.to_resend_answer = due;
+        }
         if has_salt && !self.to_resend_answer.is_empty() {
             let awaited = &self.awaited_answers;
             self.resend_individually.retain(|id| awaited.contains_key(id));
@@ -2717,7 +3274,8 @@ impl Session {
             }
         }
 
-        if has_salt && self.need_destroy_auth_key && !self.sent_destroy_auth_key {
+        let destroys_auth_key = has_salt && self.is_destroying_auth_key() && !self.sent_destroy_auth_key;
+        if destroys_auth_key {
             self.sent_destroy_auth_key = true;
             let mut writer = Writer::new();
             tlm::write_destroy_auth_key(&mut writer);
@@ -2731,16 +3289,41 @@ impl Session {
             self.push_service(&mut messages, writer.into_inner(), now, rng);
         }
 
-        let nothing_left = self.pending.is_empty()
+        if let Some(wait) = http_wait {
+            let mut writer = Writer::with_capacity(16);
+            tlm::write_http_wait(&mut writer, wait.max_delay, wait.wait_after, wait.max_wait);
+            self.push_service(&mut messages, writer.into_inner(), now, rng);
+        }
+
+        let held_until = held_answers
+            .iter()
+            .filter_map(|id| self.awaited_answers.get(id))
+            .map(|awaited| self.answer_hold_until(awaited))
+            .reduce(f64::min);
+        self.to_resend_answer.extend(held_answers);
+
+        let pending_held = self.pending.iter().all(|id| self.is_gated(*id));
+        let retransmit_held = self.to_retransmit.iter().all(|id| self.is_gated(*id));
+        let nothing_left = pending_held
             && self.to_ack.is_empty()
             && self.to_state_request.is_empty()
             && self.to_resend_answer.is_empty()
             && self.to_drop_answer.is_empty()
             && self.to_state_info_reply.is_empty()
             && self.to_pong.is_empty()
-            && self.to_retransmit.is_empty();
+            && retransmit_held;
+        let only_held = held_until.is_some()
+            && pending_held
+            && self.to_ack.is_empty()
+            && self.to_state_request.is_empty()
+            && self.to_drop_answer.is_empty()
+            && self.to_state_info_reply.is_empty()
+            && self.to_pong.is_empty()
+            && retransmit_held;
         if nothing_left {
             self.force_send_at = None;
+        } else if only_held {
+            self.force_send_at = held_until;
         }
 
         if messages.is_empty() {
@@ -2751,6 +3334,7 @@ impl Session {
             self.remember_sent(message.msg_id, now);
         }
 
+        let message_ids: Vec<i64> = messages.iter().map(|message| message.msg_id).collect();
         let (outer_msg_id, seq_no, body, container_id) = if messages.len() == 1 && !force_container {
             let message = messages.pop().expect("one message");
             (message.msg_id, message.seq_no, message.body, 0)
@@ -2804,7 +3388,9 @@ impl Session {
         if ping_msg_id != 0 {
             self.last_ping_msg_id = ping_msg_id;
         }
+        let mut service_ids: Vec<i64> = resend_requests.iter().map(|(msg_id, _)| *msg_id).collect();
         if let Some((msg_id, ids)) = state_request {
+            service_ids.push(msg_id);
             self.service_requests.insert(msg_id, ServiceRequest::StateRequest { msg_ids: ids, sent_at: now.mono });
         }
         for (msg_id, ids) in resend_requests {
@@ -2818,6 +3404,25 @@ impl Session {
             seq_no,
         };
         let packet = encrypt_message(&self.auth_key, &header, &body, Side::Client, self.config.padding, rng);
+        if self.http {
+            self.http_packets.push_back(HttpPacket {
+                seq: packet_seq,
+                queries: query_messages.iter().map(|(id, index)| (*id, message_ids[*index])).collect(),
+                services: service_ids,
+                future_salts: future_salts_msg_id,
+                destroys_auth_key,
+            });
+            while self.http_packets.len() > MAX_TRACKED_HTTP_PACKETS {
+                self.http_packets.pop_front();
+            }
+            return Some(Transmit {
+                data: packet.data,
+                quick_ack_token: None,
+                msg_id: outer_msg_id,
+                contains_queries: !query_messages.is_empty(),
+                packet_seq,
+            });
+        }
         let large = packet.data.len() >= TRANSMIT_GRACE_MIN_SIZE;
         if large {
             if self.unconfirmed_large.is_empty() {
@@ -2858,6 +3463,7 @@ impl Session {
             quick_ack_token,
             msg_id: outer_msg_id,
             contains_queries: !query_messages.is_empty(),
+            packet_seq,
         })
     }
 

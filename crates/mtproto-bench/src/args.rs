@@ -19,6 +19,10 @@ pub struct ClientArgs {
     pub deadline: f64,
     /// The user is online: the main session keeps the short, round-trip-based keepalive.
     pub online: bool,
+    /// tcp, http or auto (TCP that falls back to HTTP).
+    pub transport: String,
+    /// The engine makes and binds temporary keys itself.
+    pub pfs: bool,
 }
 
 impl Default for ClientArgs {
@@ -42,6 +46,8 @@ impl Default for ClientArgs {
             duration: 10.0,
             deadline: 120.0,
             online: false,
+            transport: "tcp".into(),
+            pfs: false,
         }
     }
 }
@@ -71,6 +77,8 @@ impl ClientArgs {
                 "--duration" => args.duration = value().parse().expect("duration"),
                 "--deadline" => args.deadline = value().parse().expect("deadline"),
                 "--online" => args.online = value() == "1",
+                "--transport" => args.transport = value(),
+                "--pfs" => args.pfs = value() == "1",
                 other => panic!("unknown argument {other}"),
             }
         }
@@ -121,6 +129,14 @@ impl ClientArgs {
         if self.online {
             out.push("--online".into());
             out.push("1".into());
+        }
+        if self.pfs {
+            out.push("--pfs".into());
+            out.push("1".into());
+        }
+        if self.transport != "tcp" {
+            out.push("--transport".into());
+            out.push(self.transport.clone());
         }
         out
     }

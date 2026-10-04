@@ -9,6 +9,7 @@ use mtproto_core::crypto::OsRandom;
 use mtproto_core::rpc::{ApiEnvironment, RequestId, RpcRequest, Verification};
 
 use crate::clock;
+use crate::http_link::TOKENS_PER_SESSION;
 use crate::resolver::resolve_blocking;
 use crate::session_runtime::{Resolution, Resolve, SessionRuntime};
 use crate::types::{
@@ -17,6 +18,11 @@ use crate::types::{
 use crate::uploads::Uploads;
 
 pub const WAKER_TOKEN: Token = Token(usize::MAX);
+
+/// The token a session was created with: each owns a block of `TOKENS_PER_SESSION`.
+fn session_token(token: Token) -> Token {
+    Token(token.0 - token.0 % TOKENS_PER_SESSION)
+}
 const MAX_POLL_WAIT: f64 = 60.0;
 const SHRINK_INTERVAL: f64 = 30.0;
 
@@ -31,6 +37,10 @@ pub enum Command {
     SetAddresses(SessionHandle, Vec<DcAddress>),
     SetObfuscationDcId(SessionHandle, i16),
     SetProxy(SessionHandle, Option<ProxyConfig>),
+    SetTransport(SessionHandle, crate::types::TransportPreference, Option<u16>),
+    EnablePfs(SessionHandle, Box<crate::types::PfsSetup>),
+    OfferTemporaryKey(SessionHandle, Box<crate::types::BoundTemporaryKey>),
+    AllowPermanentKey(SessionHandle, bool),
     UpdateEnvironment(SessionHandle, Box<ApiEnvironment>, Option<RpcRequest>),
     SetAuthTokenReady(SessionHandle, bool),
     ResolveVerification(SessionHandle, RequestId, Verification),
@@ -97,6 +107,7 @@ pub struct Worker {
     last_shrink: f64,
     more_readable: VecDeque<SessionHandle>,
     uploads: Arc<Uploads>,
+    hints: Arc<crate::route_hints::RouteHints>,
 }
 
 impl Worker {
@@ -116,7 +127,7 @@ impl Worker {
             resolver: ThreadResolver { sender, waker, in_flight: HashMap::new() },
             sessions: HashMap::new(),
             tokens: HashMap::new(),
-            next_token: 1,
+            next_token: TOKENS_PER_SESSION,
             callbacks,
             config,
             rng: OsRandom::new(),
@@ -125,7 +136,14 @@ impl Worker {
             last_shrink: clock::monotonic_seconds(),
             more_readable: VecDeque::new(),
             uploads: Arc::default(),
+            hints: Arc::default(),
         }
+    }
+
+    /// Lets the sessions learn from the other workers' sessions which transports get through.
+    pub fn sharing_route_hints(mut self, hints: Arc<crate::route_hints::RouteHints>) -> Self {
+        self.hints = hints;
+        self
     }
 
     /// Lets the sessions see what other workers' sessions are uploading.
@@ -158,7 +176,7 @@ impl Worker {
                 if event.token() == WAKER_TOKEN {
                     continue;
                 }
-                let Some(handle) = self.tokens.get(&event.token()).copied() else {
+                let Some(handle) = self.tokens.get(&session_token(event.token())).copied() else {
                     continue;
                 };
                 if let Some(session) = self.sessions.get_mut(&handle) {
@@ -242,19 +260,18 @@ impl Worker {
                 Command::Shutdown => return false,
                 Command::Create { handle, setup } => {
                     let token = Token(self.next_token);
-                    self.next_token += 2;
+                    self.next_token += TOKENS_PER_SESSION;
                     let mut runtime = SessionRuntime::new(handle, *setup, token, now, &mut self.rng);
                     runtime.share_uploads(self.uploads.clone());
+                    runtime.share_route_hints(self.hints.clone());
                     runtime.set_network_available(self.network_available, now, self.poll.registry());
                     self.tokens.insert(token, handle);
-                    self.tokens.insert(runtime.race_token(), handle);
                     self.sessions.insert(handle, runtime);
                 }
                 Command::Destroy(handle) => {
                     if let Some(mut session) = self.sessions.remove(&handle) {
                         session.shutdown(self.poll.registry(), now);
                         self.tokens.remove(&session.token());
-                        self.tokens.remove(&session.race_token());
                         self.callbacks.on_event(handle, EngineEvent::Closed);
                     }
                 }
@@ -291,7 +308,7 @@ impl Worker {
                 }
                 Command::SetAuthKey(handle, material) => {
                     if let Some(session) = self.sessions.get_mut(&handle) {
-                        session.set_auth_key(material, now, self.poll.registry(), &mut self.rng);
+                        session.set_auth_key(material, now, self.poll.registry(), &self.callbacks, &mut self.rng);
                     }
                 }
                 Command::SetAddresses(handle, addresses) => {
@@ -307,6 +324,26 @@ impl Worker {
                 Command::SetProxy(handle, proxy) => {
                     if let Some(session) = self.sessions.get_mut(&handle) {
                         session.set_proxy(proxy, now, self.poll.registry());
+                    }
+                }
+                Command::EnablePfs(handle, setup) => {
+                    if let Some(session) = self.sessions.get_mut(&handle) {
+                        session.enable_pfs(*setup, now, self.poll.registry(), &self.callbacks, &mut self.rng);
+                    }
+                }
+                Command::OfferTemporaryKey(handle, key) => {
+                    if let Some(session) = self.sessions.get_mut(&handle) {
+                        session.offer_temporary_key(*key, self.poll.registry(), now, &self.callbacks, &mut self.rng);
+                    }
+                }
+                Command::AllowPermanentKey(handle, allowed) => {
+                    if let Some(session) = self.sessions.get_mut(&handle) {
+                        session.allow_permanent_key(allowed, now);
+                    }
+                }
+                Command::SetTransport(handle, transport, http_port) => {
+                    if let Some(session) = self.sessions.get_mut(&handle) {
+                        session.set_transport(transport, http_port, now, self.poll.registry());
                     }
                 }
                 Command::UpdateEnvironment(handle, environment, noop) => {
@@ -341,7 +378,7 @@ impl Worker {
                 }
                 Command::DestroyAuthKey(handle) => {
                     if let Some(session) = self.sessions.get_mut(&handle) {
-                        session.destroy_auth_key(now);
+                        session.destroy_auth_key(now, self.poll.registry(), &self.callbacks, &mut self.rng);
                     }
                 }
                 Command::SetTimeDifference(handle, difference) => {

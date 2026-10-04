@@ -35,10 +35,24 @@ typedef struct {
     MTBytes secret;
 } MTAddress;
 
+/* A temporary key the server has bound to the session's permanent key; expires_at in server time. */
+typedef struct {
+    MTBytes key;
+    int32_t expires_at;
+    /* The permanent key id it is bound to, 0 when unknown: an offer bound to another key is refused. */
+    int64_t bound_to;
+    const MTSaltEntry *salts;
+    size_t salt_count;
+    uint8_t has_init_hash;
+    MTString init_hash;
+} MTTemporaryKey;
+
 enum {
     MTProxyKindNone = 0,
     MTProxyKindSocks5 = 1,
     MTProxyKindMTProxy = 2,
+    /* TCP through a CONNECT tunnel; HTTP forwarded by the proxy. */
+    MTProxyKindHttp = 3,
 };
 
 typedef struct {
@@ -105,6 +119,10 @@ typedef struct {
     uint8_t keep_connected;
     double idle_disconnect_after;
     double request_timeout;
+    /* PFS run by the engine from the start, as mt_session_enable_pfs with public_keys_pem: 0 leaves it off. */
+    int32_t pfs_lifetime;
+    uint8_t pfs_make_permanent_key;
+    const MTTemporaryKey *pfs_temporary_key;
 } MTSessionSetup;
 
 enum {
@@ -156,6 +174,21 @@ typedef enum {
     MTEventKindRetryDecisionRequired = 27,
     MTEventKindAuthKeyDestroyed = 28,
     MTEventKindConnectionDropped = 29,
+    /* The engine bound the session's temporary key to the permanent one. */
+    MTEventKindTemporaryKeyBound = 30,
+    /* auth.bindTempAuthKey failed: code and text as the server sent them. */
+    MTEventKindTemporaryKeyBindFailed = 31,
+    /* PFS run by the engine: the server keeps refusing binds to the permanent key. */
+    MTEventKindPermanentKeyInvalid = 32,
+    /* PFS: the session talks under this bound temporary key from now on. integer1 key id, integer2
+       expiry in server time, request_id the permanent key id it is bound to, code the datacenter id it
+       was made for (negative for media addresses),
+       flags 1 when the host gave the key (otherwise the session made it, and its AuthKeyCreated came
+       first). */
+    MTEventKindTemporaryKeyInUse = 33,
+    /* PFS: the server no longer takes this temporary key (integer1 key id); a copy kept for other
+       sessions should go. */
+    MTEventKindTemporaryKeyDropped = 34,
 } MTEventKind;
 
 enum {
@@ -210,6 +243,30 @@ void mt_session_set_auth_key(MTEngine *engine, MTSessionHandle session, MTBytes 
 void mt_session_set_addresses(MTEngine *engine, MTSessionHandle session, const MTAddress *addresses, size_t count);
 void mt_session_set_obfuscation_dc_id(MTEngine *engine, MTSessionHandle session, int16_t dc_id);
 void mt_session_set_proxy(MTEngine *engine, MTSessionHandle session, const MTProxy *proxy);
+
+enum {
+    MTTransportTcp = 0,
+    MTTransportHttp = 1,
+    MTTransportAuto = 2,
+};
+
+/* Which transports the session may use; HTTP goes to `http_port`, or to each address's own port
+   when it is 0. Auto stays on TCP while TCP answers and moves to HTTP while it does not. */
+void mt_session_set_transport(MTEngine *engine, MTSessionHandle session, uint8_t transport, uint16_t http_port);
+
+/* The engine makes temporary keys that live `lifetime` seconds with these RSA keys and binds them to
+   the session's key, which becomes the permanent key, before anything else goes out. 0 when none of
+   the keys parses: PFS stays off. Without make_permanent_key, a session that has no key asks for the
+   permanent key (AuthKeyRequired) instead of making one. temporary_key, when not NULL, is a key
+   already bound to the permanent key: the session starts under it without a handshake. */
+uint8_t mt_session_enable_pfs(MTEngine *engine, MTSessionHandle session, int32_t lifetime,
+                           const MTString *public_keys_pem, size_t public_key_count,
+                           uint8_t make_permanent_key, const MTTemporaryKey *temporary_key);
+/* A temporary key bound to the session's permanent key elsewhere: the session takes it at once when
+   it has no key in use, otherwise the next time it needs a new one. */
+void mt_session_offer_temporary_key(MTEngine *engine, MTSessionHandle session, const MTTemporaryKey *key);
+/* PFS with the permanent key from the host: whether this session may make one itself while it has none. */
+void mt_session_allow_permanent_key(MTEngine *engine, MTSessionHandle session, uint8_t allowed);
 void mt_session_update_environment(MTEngine *engine, MTSessionHandle session, const MTEnvironment *environment, const MTRequest *noop);
 void mt_session_set_auth_token_ready(MTEngine *engine, MTSessionHandle session, uint8_t ready);
 void mt_session_resolve_apns(MTEngine *engine, MTSessionHandle session, MTRequestId request, MTString nonce, MTString secret);

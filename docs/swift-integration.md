@@ -30,9 +30,12 @@ RustEngineRuntime (process-wide, lazy) ── mt_engine_create(0 = engine defaul
 
 - One engine per process, created on the first `makeEngine` (`RustEngineRuntime.shared`). It is never
   destroyed. All accounts share it; every account still has its own `MTContext` and sessions.
-- `MTContext` stays the single owner and writer of persisted state. The engine never generates keys
-  for TelegramCore (`generate_key = 0`); `MTContext` creates and binds them and the session installs
-  them with `mt_session_set_auth_key`.
+- `MTContext` stays the single owner and writer of persisted state. With temporary keys on (every
+  non-CDN session in TelegramCore), the engine runs PFS itself (section 9a): it makes and binds its
+  temporary keys over whichever transport works, HTTP included, and the session writes them to
+  `MTContext`, which keeps them for other sessions, later launches and MtProtoKit. CDN sessions still
+  take their keys from `MTContext` (`generate_key = 0`) and install them with `mt_session_set_auth_key`.
+- Every non-CDN session runs `MTTransportAuto`: TCP while it answers, HTTP on port 80 while it does not.
 - The factory declines (TelegramCore then uses MtProtoKit) in app extensions, when the engine fails to
   start or reports an unknown ABI version, when the active proxy is a WEB proxy, and when
   `apiEnvironment.datacenterAddressOverrides` is set.
@@ -161,7 +164,10 @@ and send them (see 9).
 | `NetworkUsage` | `MTNetworkUsageManager(info: usageCalculationInfo)`: `addIncomingBytes`/`addOutgoingBytes`, interface `Other` |
 | `AddressResult` | `reportTransportSchemeSuccess` / `reportTransportSchemeFailure` for the scheme at that index |
 | `ConnectionDropped` | every observer from `observeConnectionDrops` gets `NetworkEngineConnectionDrop(reason: text, answered: flags & 1, age: value1)`; `RecordingNetworkEngine` feeds them to `NetworkTelemetry` (drops per role and reason, and the latest on failure records). `text` is the reason (`probe_timeout`, `racer_won`, `session_error`, …), `answered` whether the session took a packet from the connection, `age` seconds since it started connecting |
-| `AuthKeyCreated`, `AuthKeyCreationFailed`, `TransportFlood` | logged only (`AuthKeyCreated` cannot happen with `generate_key = 0`; its payload is freed) |
+| `AuthKeyCreated` | PFS sessions: a temporary key is held until `TemporaryKeyInUse` names it (a permanent key cannot come: the session never allows the engine to make one). Other sessions: logged only |
+| `TemporaryKeyInUse` | the key the session talks under (salts and init hash go to its auth info). One the session made (`flags & 1 == 0`), for the address class the session has now (`code` is the obfuscation id it was made for), is written to the class's ephemeral selector with `rustEngineBoundTo` = the permanent key id in `request_id`, unless the context keeps a longer-lived key bound to the same permanent key |
+| `TemporaryKeyDropped` | the context's key for the selector is removed if it is that key |
+| `TemporaryKeyBound`, `TemporaryKeyBindFailed`, `PermanentKeyInvalid`, `AuthKeyCreationFailed`, `TransportFlood` | logged only (MtProtoKit does not log out on a refused permanent key either; the engine retries a minute later) |
 
 ## 6. MTContext reads and writes
 
@@ -187,7 +193,7 @@ and send them (see 9).
 | `reportTransportSchemeSuccess/Failure`, `invalidateTransportScheme` | `AddressResult`, 20 s connection watchdog |
 
 Read-modify-write of an auth info runs inside one `performBatchUpdates` block on the context queue.
-The persistent key of the master DC is never created, replaced or removed (integration.md 4.4 (1)).
+The bridge never creates, replaces or removes the master DC's persistent key itself (integration.md 4.4 (1)); with engine PFS it writes only temporary keys (section 9a).
 
 Listener callbacks used: `contextDatacenterAuthInfoUpdated` (declared on a base class so its
 parameter can be optional: MTContext passes nil there despite the header), `contextDatacenterAuthTokenUpdated`,
@@ -255,6 +261,39 @@ are ignored while the installed key works (MtProtoKit never revalidates its cach
 
 Tokens: a foreign-DC worker starts with the token gate closed when the context has no token, asks for
 a transfer on resume, and opens the gate on `contextDatacenterAuthTokenUpdated` with `NSNumber(dc)`.
+
+## 9a. PFS in the engine
+
+A non-CDN session with `useTempAuthKeys` and MtProtoKit's RSA keys (`MTDatacenterAuthDefaultPublicKeys`)
+is created with `pfs_lifetime = tempKeyExpiration` (24 h) and `pfs_make_permanent_key = 0`:
+
+- Its key is the context's persistent key. Permanent keys still come only from `MTContext`
+  (MtProtoKit): it also makes them on its own for `UnauthorizedAccount`'s key prefetch and for auth
+  transfers, so a second maker would race it and could leave a temporary key bound to a permanent key
+  the context no longer holds. Without one the engine asks (`AuthKeyRequired`) and the session requests
+  the persistent key from the context as before.
+- The temporary key the context keeps for the session's address class (`ephemeralMain`, or
+  `ephemeralMedia` for media addresses) goes in as `pfs_temporary_key` when it is bound to that
+  permanent key (attribute `rustEngineBoundTo`; MtProtoKit's keys carry none) and has more than 5 minutes
+  left; the session then talks under it without a handshake (a key without the attribute is bound once
+  more first, so one bound to another permanent key is refused and replaced). A key with no expiry is never
+  taken as a temporary key. `MTTemporaryKey.bound_to` carries the binding: the engine refuses an offer
+  bound to another permanent key, and drops what it kept when the permanent key changes.
+- Whenever the context gets another key for that selector (another session, MtProtoKit's refresh), it is
+  offered with `mt_session_offer_temporary_key`; the engine keeps it and takes it the next time it needs a
+  key (expiry, the server dropping the old one, a class change) instead of a handshake.
+- Keys the engine made are written with `rustEngineBoundTo` = the permanent key the engine reports in
+  `TemporaryKeyInUse` (`request_id`). MTContext's temporary-key refresher skips keys with that attribute:
+  the engine rotates them itself, over HTTP too, and two refreshers would make two keys a day.
+- An address class change sends the new obfuscation id first: the engine drops the temporary key of the
+  old class and the session offers the context's key for the new class. Calls in flight when a
+  temporary key has to go (a class change, or no quiet moment before the key's end) fail in the engine
+  as `500 TEMP_KEY_ROTATED`; the session sends them again under the new key when the request's
+  `shouldContinueAfterError` allows a server error, as MtProtoKit re-sends after a key change, and fails
+  them otherwise. Keys are made with the obfuscation id as the handshake's `dc` (test offset, negative for
+  media), as MtProtoKit and tdlib do.
+- `AUTH_KEY_PERM_EMPTY` and `-404` are handled inside the engine (rebind or a new temporary key); the
+  session never drops the permanent key for them.
 
 ## 10. Connection management
 

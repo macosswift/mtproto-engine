@@ -34,14 +34,30 @@ impl core::fmt::Debug for DcAddress {
 
 #[derive(Clone, PartialEq, Eq)]
 pub enum ProxyConfig {
-    Socks5 { host: String, port: u16, username: Option<String>, password: Option<String> },
-    MtProxy { host: String, port: u16, secret: Vec<u8> },
+    Socks5 {
+        host: String,
+        port: u16,
+        username: Option<String>,
+        password: Option<String>,
+    },
+    MtProxy {
+        host: String,
+        port: u16,
+        secret: Vec<u8>,
+    },
+    /// An HTTP proxy: TCP goes through a CONNECT tunnel, HTTP is forwarded by it.
+    Http {
+        host: String,
+        port: u16,
+        username: Option<String>,
+        password: Option<String>,
+    },
 }
 
 impl Drop for ProxyConfig {
     fn drop(&mut self) {
         match self {
-            ProxyConfig::Socks5 { password, .. } => {
+            ProxyConfig::Socks5 { password, .. } | ProxyConfig::Http { password, .. } => {
                 if let Some(password) = password.as_mut() {
                     mtproto_core::Zeroize::zeroize(password);
                 }
@@ -56,6 +72,7 @@ impl core::fmt::Debug for ProxyConfig {
         match self {
             ProxyConfig::Socks5 { host, port, .. } => write!(f, "Socks5({host}:{port})"),
             ProxyConfig::MtProxy { host, port, .. } => write!(f, "MtProxy({host}:{port})"),
+            ProxyConfig::Http { host, port, .. } => write!(f, "Http({host}:{port})"),
         }
     }
 }
@@ -63,9 +80,9 @@ impl core::fmt::Debug for ProxyConfig {
 impl ProxyConfig {
     pub fn display_address(&self) -> String {
         match self {
-            ProxyConfig::Socks5 { host, port, .. } | ProxyConfig::MtProxy { host, port, .. } => {
-                format!("{host}:{port}")
-            }
+            ProxyConfig::Socks5 { host, port, .. }
+            | ProxyConfig::MtProxy { host, port, .. }
+            | ProxyConfig::Http { host, port, .. } => format!("{host}:{port}"),
         }
     }
 }
@@ -89,6 +106,43 @@ pub struct KeyGeneration {
     pub temporary_expires_in: Option<i32>,
 }
 
+/// Perfect forward secrecy run by the engine, as tdlib does: the session talks under temporary
+/// keys it makes and binds to the permanent key itself.
+#[derive(Debug, Clone, Default)]
+pub struct PfsSetup {
+    /// Seconds each temporary key lives.
+    pub lifetime: i32,
+    pub public_keys: Vec<RsaPublicKey>,
+    /// Without a permanent key the session asks the host for one (`AuthKeyRequired`) instead of
+    /// making it, so that one place makes each permanent key.
+    pub permanent_key_from_host: bool,
+    /// A temporary key already bound to the permanent key, kept by the host from an earlier run or
+    /// another session: the session starts under it without a handshake.
+    pub temporary_key: Option<BoundTemporaryKey>,
+}
+
+/// A temporary key the server has bound to the session's permanent key.
+#[derive(Debug, Clone)]
+pub struct BoundTemporaryKey {
+    pub material: AuthKeyMaterial,
+    /// When the key expires, in server time.
+    pub expires_at: i32,
+    /// The permanent key it is bound to, when the host knows: a key bound to another one is refused.
+    pub bound_to: Option<u64>,
+}
+
+/// Which transports a session may use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TransportPreference {
+    /// The obfuscated TCP transports only.
+    #[default]
+    Tcp,
+    /// HTTP/1.1 only.
+    Http,
+    /// TCP, moving to HTTP while no TCP route gets through and back once one does.
+    Auto,
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionSetup {
     pub datacenter_id: i32,
@@ -106,6 +160,13 @@ pub struct SessionSetup {
     pub keep_connected: bool,
     pub idle_disconnect_after: Option<f64>,
     pub request_timeout: f64,
+    pub transport: TransportPreference,
+    /// The port HTTP goes to; None uses each address's own port.
+    pub http_port: Option<u16>,
+    /// Auto on HTTP: when TCP is tried again first; later tries wait twice as long each.
+    pub tcp_recheck_after: f64,
+    /// The engine makes and binds temporary keys itself; `auth_key` is then the permanent key.
+    pub pfs: Option<PfsSetup>,
 }
 
 impl SessionSetup {
@@ -129,13 +190,26 @@ impl SessionSetup {
                 _ => Some(60.0),
             },
             request_timeout: 5.0,
+            transport: TransportPreference::Tcp,
+            http_port: Some(80),
+            tcp_recheck_after: 60.0,
+            pfs: None,
+        }
+    }
+
+    pub fn proxy_host(&self) -> Option<(&str, u16)> {
+        match &self.proxy {
+            Some(ProxyConfig::Socks5 { host, port, .. })
+            | Some(ProxyConfig::MtProxy { host, port, .. })
+            | Some(ProxyConfig::Http { host, port, .. }) => Some((host.as_str(), *port)),
+            None => None,
         }
     }
 
     pub fn proxy_secret(&self, address: &DcAddress) -> Option<ProxySecret> {
         match &self.proxy {
             Some(ProxyConfig::MtProxy { secret, .. }) => ProxySecret::from_binary(secret, true).ok(),
-            Some(ProxyConfig::Socks5 { .. }) => None,
+            Some(ProxyConfig::Socks5 { .. }) | Some(ProxyConfig::Http { .. }) => None,
             None => address.secret.as_ref().and_then(|secret| ProxySecret::from_binary(secret, true).ok()),
         }
     }
@@ -190,6 +264,8 @@ pub enum DropReason {
     SlowConnect,
     /// A connection raced against this silent one answered first and replaced it.
     RacerWon,
+    /// The session moved to the other transport: HTTP answered where TCP did not.
+    TransportSwitch,
 }
 
 impl DropReason {
@@ -212,6 +288,7 @@ impl DropReason {
             DropReason::TransportFlood => "transport_flood",
             DropReason::SlowConnect => "slow_connect",
             DropReason::RacerWon => "racer_won",
+            DropReason::TransportSwitch => "transport_switch",
         }
     }
 }
@@ -240,6 +317,25 @@ pub enum EngineEvent {
     },
     AuthKeyCreationFailed {
         reason: String,
+    },
+    /// PFS: binds with fresh temporary keys keep failing with `ENCRYPTED_MESSAGE_INVALID`, so the
+    /// server does not know the permanent key.
+    PermanentKeyInvalid,
+    /// PFS: the session talks under this bound temporary key from now on; `adopted` when the host
+    /// gave it, otherwise the session made it (its `AuthKeyCreated` came before) and bound it.
+    /// `dc_id` is the datacenter id the key was made for (negative for media addresses),
+    /// `permanent_key_id` the permanent key it is bound to.
+    TemporaryKeyInUse {
+        key_id: i64,
+        expires_at: i32,
+        adopted: bool,
+        dc_id: i32,
+        permanent_key_id: i64,
+    },
+    /// PFS: the session stopped using this temporary key because the server no longer takes it; a
+    /// host keeping it for other sessions drops it.
+    TemporaryKeyDropped {
+        key_id: i64,
     },
     TransportFlood,
     NetworkUsage {

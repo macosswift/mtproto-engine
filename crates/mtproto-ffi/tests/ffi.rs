@@ -51,7 +51,7 @@ fn c_abi_end_to_end() {
     let sink: &'static Sink = Box::leak(Box::default());
     let engine = unsafe { mt_engine_create(2, sink as *const Sink as *mut c_void, Some(on_event), None) };
     assert!(!engine.is_null());
-    assert_eq!(mt_engine_abi_version(), 1);
+    assert_eq!(mt_engine_abi_version(), 2);
     let host = server.address.ip().to_string();
     let address = MTAddress { host: string(&host), port: server.address.port(), secret: bytes(&[]) };
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64();
@@ -104,6 +104,9 @@ fn c_abi_end_to_end() {
         keep_connected: 1,
         idle_disconnect_after: 0.0,
         request_timeout: 5.0,
+        pfs_lifetime: 0,
+        pfs_make_permanent_key: 0,
+        pfs_temporary_key: std::ptr::null(),
     };
     let session = unsafe { mt_session_create(engine, &setup) };
     assert_ne!(session, 0);
@@ -161,13 +164,15 @@ fn c_header_layout_matches_rust() {
 #define S(T) printf(#T " %zu\n", sizeof(T));
 #define O(T, F) printf(#T "." #F " %zu\n", offsetof(T, F));
 int main(void) {
-    S(MTBytes) S(MTString) S(MTSaltEntry) S(MTAddress) S(MTProxy) S(MTEnvironment) S(MTSessionSetup) S(MTRequest) S(MTEvent)
+    S(MTBytes) S(MTString) S(MTSaltEntry) S(MTAddress) S(MTTemporaryKey) S(MTProxy) S(MTEnvironment) S(MTSessionSetup) S(MTRequest) S(MTEvent)
+    O(MTTemporaryKey, expires_at) O(MTTemporaryKey, bound_to) O(MTTemporaryKey, salts) O(MTTemporaryKey, salt_count) O(MTTemporaryKey, has_init_hash) O(MTTemporaryKey, init_hash)
     O(MTAddress, port) O(MTAddress, secret)
     O(MTProxy, host) O(MTProxy, port) O(MTProxy, secret)
     O(MTEnvironment, has_proxy) O(MTEnvironment, proxy_port) O(MTEnvironment, params) O(MTEnvironment, init_hash) O(MTEnvironment, disable_updates)
     O(MTSessionSetup, role) O(MTSessionSetup, framing) O(MTSessionSetup, addresses) O(MTSessionSetup, proxy) O(MTSessionSetup, auth_key)
     O(MTSessionSetup, has_init_hash) O(MTSessionSetup, generate_key) O(MTSessionSetup, temp_key_expires_in) O(MTSessionSetup, environment)
     O(MTSessionSetup, time_difference) O(MTSessionSetup, online) O(MTSessionSetup, keep_connected) O(MTSessionSetup, idle_disconnect_after) O(MTSessionSetup, request_timeout)
+    O(MTSessionSetup, pfs_lifetime) O(MTSessionSetup, pfs_make_permanent_key) O(MTSessionSetup, pfs_temporary_key)
     O(MTRequest, body) O(MTRequest, flags) O(MTRequest, expected_response_size) O(MTRequest, invoke_after)
     O(MTEvent, request_id) O(MTEvent, code) O(MTEvent, flags) O(MTEvent, text) O(MTEvent, text2) O(MTEvent, payload) O(MTEvent, value1) O(MTEvent, integer1) O(MTEvent, salts) O(MTEvent, salt_count)
     return 0;
@@ -188,6 +193,7 @@ int main(void) {
         ("MTString".into(), size_of::<MTString>()),
         ("MTSaltEntry".into(), size_of::<MTSaltEntry>()),
         ("MTAddress".into(), size_of::<MTAddress>()),
+        ("MTTemporaryKey".into(), size_of::<MTTemporaryKey>()),
         ("MTProxy".into(), size_of::<MTProxy>()),
         ("MTEnvironment".into(), size_of::<MTEnvironment>()),
         ("MTSessionSetup".into(), size_of::<MTSessionSetup>()),
@@ -199,6 +205,12 @@ int main(void) {
             expected.push((format!("{}.{}", stringify!($t), stringify!($f)), offset_of!($t, $f)));
         };
     }
+    o!(MTTemporaryKey, expires_at);
+    o!(MTTemporaryKey, bound_to);
+    o!(MTTemporaryKey, salts);
+    o!(MTTemporaryKey, salt_count);
+    o!(MTTemporaryKey, has_init_hash);
+    o!(MTTemporaryKey, init_hash);
     o!(MTAddress, port);
     o!(MTAddress, secret);
     o!(MTProxy, host);
@@ -223,6 +235,9 @@ int main(void) {
     o!(MTSessionSetup, keep_connected);
     o!(MTSessionSetup, idle_disconnect_after);
     o!(MTSessionSetup, request_timeout);
+    o!(MTSessionSetup, pfs_lifetime);
+    o!(MTSessionSetup, pfs_make_permanent_key);
+    o!(MTSessionSetup, pfs_temporary_key);
     o!(MTRequest, body);
     o!(MTRequest, flags);
     o!(MTRequest, expected_response_size);

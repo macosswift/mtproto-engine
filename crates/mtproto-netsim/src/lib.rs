@@ -44,6 +44,9 @@ pub struct Dpi {
     pub after_bytes_up: u64,
     pub action: DpiAction,
     pub fraction: f64,
+    /// Lets connections through that start like an HTTP request, as a firewall that only allows
+    /// web traffic does.
+    pub spare_http: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -136,8 +139,19 @@ impl Profile {
             name: name.into(),
             latency: Duration::from_millis(30),
             jitter: Duration::from_millis(10),
-            dpi: Some(Dpi { after_bytes_up: 0, action, fraction }),
+            dpi: Some(Dpi { after_bytes_up: 0, action, fraction, spare_http: false }),
             ..Self::perfect()
+        }
+    }
+
+    /// `base` behind a filter that only lets HTTP through: anything else is blackholed (or reset,
+    /// when `base` already resets) from its first byte.
+    pub fn http_only(name: &str, base: Self) -> Self {
+        let action = base.dpi.map_or(DpiAction::Blackhole, |dpi| dpi.action);
+        Self {
+            name: name.into(),
+            dpi: Some(Dpi { after_bytes_up: 0, action, fraction: 1.0, spare_http: true }),
+            ..base
         }
     }
 
@@ -375,6 +389,10 @@ impl Profile {
             "dpi-reset" => Some(Self::dpi("dpi-reset", DpiAction::Reset, 1.0)),
             "dpi-blackhole" => Some(Self::dpi("dpi-blackhole", DpiAction::Blackhole, 1.0)),
             "dpi-half" => Some(Self::dpi("dpi-half", DpiAction::Blackhole, 0.5)),
+            "http-only" => Some(Self::http_only("http-only", Self::dpi("http-only", DpiAction::Blackhole, 1.0))),
+            "http-only-reset" => Some(Self::http_only("http-only-reset", Self::dpi("x", DpiAction::Reset, 1.0))),
+            "http-only-3g" => Some(Self::http_only("http-only-3g", Self::mobile_3g())),
+            "http-only-lossy" => Some(Self::http_only("http-only-lossy", Self::lossy())),
             _ => None,
         }
     }
@@ -403,6 +421,10 @@ impl Profile {
             "dpi-reset",
             "dpi-blackhole",
             "dpi-half",
+            "http-only",
+            "http-only-reset",
+            "http-only-3g",
+            "http-only-lossy",
         ]
     }
 }
@@ -927,7 +949,7 @@ fn spawn_direction(
     control: Arc<ConnectionControl>,
     upstream: bool,
     seed: u64,
-    dpi: Option<Dpi>,
+    mut dpi: Option<Dpi>,
 ) -> JoinHandle<()> {
     let (queue_limit, max_chunk) = {
         let profile = shared.profile.lock().unwrap();
@@ -953,6 +975,7 @@ fn spawn_direction(
         let mut buffer = vec![0u8; 64 * 1024];
         let mut last_delivery = Instant::now();
         let mut seen: u64 = 0;
+        let mut head: Vec<u8> = Vec::with_capacity(4);
         loop {
             match source.read(&mut buffer) {
                 Ok(0) | Err(_) => {
@@ -960,10 +983,19 @@ fn spawn_direction(
                     break;
                 }
                 Ok(read) => {
+                    if dpi.is_some_and(|dpi| dpi.spare_http) && head.len() < 4 {
+                        let take = (4 - head.len()).min(read);
+                        head.extend_from_slice(&buffer[..take]);
+                        if head.len() == 4 && matches!(head.as_slice(), b"POST" | b"GET " | b"HEAD" | b"OPTI" | b"PUT ")
+                        {
+                            dpi = None;
+                        }
+                    }
                     seen += read as u64;
                     *control.active_at.lock().unwrap() = Instant::now();
                     if let Some(dpi) = dpi
                         && seen > dpi.after_bytes_up
+                        && !(dpi.spare_http && head.len() < 4)
                     {
                         match dpi.action {
                             DpiAction::Reset => {

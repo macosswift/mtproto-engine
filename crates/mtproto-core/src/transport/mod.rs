@@ -1,5 +1,6 @@
 mod buffer;
 mod codec;
+mod http;
 mod obfuscation;
 mod proxy_secret;
 mod socks5;
@@ -10,6 +11,10 @@ pub use buffer::InputBuffer;
 pub use codec::{
     FrameDecoder, Framing, Incoming, MAX_FRAME_LEN, MAX_INBOUND_FRAME_LEN, SHORT_FRAME_LEN, SHORT_PADDED_FRAME_LEN,
     encode_frame, trim_padded_payload,
+};
+pub use http::{
+    API_PATH, HttpConnectError, HttpConnectHandshake, HttpCredentials, HttpError, HttpResponse, HttpResponseReader,
+    HttpRoute, MAX_ERROR_BODY_LEN, MAX_HEAD_LEN, authority, encode_post, write_post_head,
 };
 pub use obfuscation::{
     OBFUSCATED_HEADER_LEN, ObfuscatedInit, ServerObfuscation, accept_obfuscated_header, obfuscated_init,

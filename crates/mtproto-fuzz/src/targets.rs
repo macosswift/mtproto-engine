@@ -19,6 +19,9 @@ use mtproto_core::transport::InputBuffer;
 use mtproto_core::transport::ProxySecret;
 use mtproto_core::transport::accept_obfuscated_header;
 use mtproto_core::transport::{FrameDecoder, Framing, Incoming, encode_frame};
+use mtproto_core::transport::{
+    HttpConnectHandshake, HttpResponse, HttpResponseReader, MAX_ERROR_BODY_LEN, MAX_INBOUND_FRAME_LEN,
+};
 use mtproto_core::transport::{Socks5Auth, Socks5Handshake, Socks5Progress, Socks5Target};
 use mtproto_core::transport::{TlsRecordReader, server_hello_for_tests, verify_server_hello};
 use mtproto_core::transport::{TransportConfig, TransportStream};
@@ -50,6 +53,11 @@ pub const TARGETS: &[Target] = &[
     },
     Target { name: "tls", about: "fake-TLS ServerHello verification and record reader", run: tls_case },
     Target { name: "socks5", about: "SOCKS5 handshake against a hostile proxy", run: socks5_case },
+    Target {
+        name: "http",
+        about: "HTTP/1.1 responses and CONNECT replies, valid ones round trip, hostile ones stay bounded",
+        run: http_case,
+    },
     Target { name: "secret", about: "MTProxy secrets from links and binary", run: secret_case },
     Target { name: "pq", about: "pq factorisation of attacker-chosen values", run: pq_case },
     Target { name: "rsa", about: "RSA public keys from PEM/DER, then RSA_PAD with the parsed key", run: rsa_case },
@@ -490,6 +498,158 @@ fn socks5_case(seed: u64) -> CaseResult {
                 Ok(Socks5Progress::Connected) | Err(_) => return Ok(()),
             }
         }
+    }
+    Ok(())
+}
+
+fn http_response(g: &mut Gen) -> (Vec<u8>, HttpResponse, bool) {
+    let mut out = Vec::new();
+    while g.one_in(4) {
+        out.extend_from_slice(b"HTTP/1.1 100 Continue\r\n\r\n");
+    }
+    let status = *g.pick(&[200u16, 200, 200, 204, 404, 429, 444, 502]);
+    let http10 = g.one_in(5);
+    let body_len = match g.below(4) {
+        0 => 0,
+        1 => g.below(64),
+        2 => g.below(70_000),
+        _ => g.below(400_000),
+    };
+    let body_len = if status == 200 { body_len } else { body_len.min(MAX_ERROR_BODY_LEN) };
+    let body_len = if status == 204 { 0 } else { body_len };
+    let body = g.bytes(body_len);
+    let chunked = status != 204 && !http10 && g.one_in(3);
+    let until_close = !chunked && status != 204 && g.one_in(6);
+    out.extend_from_slice(if http10 { b"HTTP/1.0 " } else { b"HTTP/1.1 " });
+    out.extend_from_slice(format!("{status} Reason\r\n").as_bytes());
+    let mut keep_alive = !http10;
+    for _ in 0..g.below(6) {
+        out.extend_from_slice(format!("X-{}: {}\r\n", g.u32(), g.u32()).as_bytes());
+    }
+    match g.below(3) {
+        0 => {
+            out.extend_from_slice(b"Connection: close\r\n");
+            keep_alive = false;
+        }
+        1 => {
+            out.extend_from_slice(b"Connection: Keep-Alive\r\n");
+            keep_alive = true;
+        }
+        _ => {}
+    }
+    if chunked {
+        out.extend_from_slice(b"Transfer-Encoding: chunked\r\n\r\n");
+        let mut rest = &body[..];
+        while !rest.is_empty() {
+            let take = g.range(1, rest.len().min(70_000)).min(rest.len());
+            out.extend_from_slice(format!("{take:x}").as_bytes());
+            if g.one_in(4) {
+                out.extend_from_slice(b";ext=1");
+            }
+            out.extend_from_slice(b"\r\n");
+            out.extend_from_slice(&rest[..take]);
+            out.extend_from_slice(b"\r\n");
+            rest = &rest[take..];
+        }
+        out.extend_from_slice(b"0\r\n");
+        if g.one_in(3) {
+            out.extend_from_slice(b"X-Trailer: 1\r\n");
+        }
+        out.extend_from_slice(b"\r\n");
+    } else if until_close {
+        out.extend_from_slice(b"\r\n");
+        keep_alive = false;
+    } else {
+        if status != 204 {
+            out.extend_from_slice(format!("Content-Length: {body_len}\r\n").as_bytes());
+        }
+        out.extend_from_slice(b"\r\n");
+    }
+    if !chunked {
+        out.extend_from_slice(&body);
+    }
+    let expected =
+        HttpResponse { status, keep_alive, body: if (200..300).contains(&status) { body } else { Vec::new() } };
+    (out, expected, until_close)
+}
+
+fn http_case(seed: u64) -> CaseResult {
+    let mut g = Gen::new(seed);
+    if g.one_in(8) {
+        let (mut handshake, _) = HttpConnectHandshake::new("149.154.167.51:443", None);
+        let mut reply = match g.below(3) {
+            0 => b"HTTP/1.1 200 Connection established\r\n\r\n".to_vec(),
+            1 => b"HTTP/1.0 407 Proxy Authentication Required\r\n\r\n".to_vec(),
+            _ => {
+                let len = g.small_len();
+                g.bytes(len)
+            }
+        };
+        g.mutate(&mut reply);
+        let mut input = InputBuffer::new();
+        for chunk in g.split(&reply) {
+            input.extend(chunk);
+            if handshake.feed(&mut input).is_err() || handshake.is_done() {
+                return Ok(());
+            }
+        }
+        return Ok(());
+    }
+    let mut stream = Vec::new();
+    let mut expected = Vec::new();
+    let mut close_delimited = false;
+    for _ in 0..g.range(1, 5) {
+        let (bytes, response, until_close) = http_response(&mut g);
+        stream.extend_from_slice(&bytes);
+        expected.push(response);
+        if until_close {
+            close_delimited = true;
+            break;
+        }
+    }
+    let mutated = g.one_in(2);
+    if mutated {
+        g.mutate(&mut stream);
+    }
+    let mut reader = HttpResponseReader::new();
+    let mut input = InputBuffer::new();
+    let mut parsed = Vec::new();
+    let mut failed = false;
+    let mut failure = String::new();
+    'feed: for chunk in g.split(&stream) {
+        input.extend(chunk);
+        let mut steps = 0;
+        loop {
+            steps += 1;
+            ensure(steps < 100_000, || "http reader does not progress".into())?;
+            match reader.read(&mut input) {
+                Ok(Some(response)) => {
+                    ensure(response.body.len() <= MAX_INBOUND_FRAME_LEN, || "body over the cap".into())?;
+                    parsed.push(response);
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    failed = true;
+                    failure = format!("{error:?} after {} responses", parsed.len());
+                    break 'feed;
+                }
+            }
+        }
+        ensure(input.len() <= stream.len(), || "buffer grew".into())?;
+    }
+    if !failed {
+        match reader.finish() {
+            Ok(Some(response)) => parsed.push(response),
+            Ok(None) => {}
+            Err(error) => {
+                failed = true;
+                failure = format!("{error:?} at the end");
+            }
+        }
+    }
+    if !mutated {
+        ensure(!failed, || format!("valid stream rejected (close delimited {close_delimited}): {failure}"))?;
+        ensure(parsed == expected, || format!("parsed {} responses, expected {}", parsed.len(), expected.len()))?;
     }
     Ok(())
 }

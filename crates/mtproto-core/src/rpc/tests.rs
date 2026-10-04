@@ -473,6 +473,63 @@ fn dependency_ordering_and_msg_wait_timeout() {
 }
 
 #[test]
+fn transmitted_requests_and_the_chains_hanging_off_them_are_found() {
+    let mut h = Harness::new(SessionRole::Main, Some("h1"));
+    let chained = |id: u64, after: u64| RpcRequest {
+        id: RequestId(id),
+        body: call(id as u32),
+        flags: RequestFlags::default(),
+        invoke_after: Some(RequestId(after)),
+    };
+    assert!(!h.client.has_transmitted_requests());
+    h.send(1, RequestFlags::default());
+    h.client.send(chained(2, 1), h.now);
+    h.flush_calls();
+    h.client.send(chained(3, 2), h.now);
+    h.send(4, RequestFlags::default());
+    h.client.send(chained(5, 4), h.now);
+    assert!(h.client.has_transmitted_requests());
+    let mut transmitted = h.client.transmitted_requests();
+    transmitted.sort();
+    assert_eq!(transmitted, vec![RequestId(1), RequestId(2)]);
+    assert_eq!(h.client.dependents_of(&[RequestId(1)]), vec![RequestId(2), RequestId(3)]);
+    assert_eq!(h.client.dependents_of(&transmitted), vec![RequestId(3)]);
+    assert!(h.client.dependents_of(&[RequestId(5)]).is_empty());
+}
+
+#[test]
+fn requests_carried_to_a_new_session_keep_their_open_retry_questions() {
+    let mut h = Harness::new(SessionRole::Main, Some("h1"));
+    let flags = RequestFlags { delegate_retry_decisions: true, ..Default::default() };
+    h.send(1, flags);
+    h.send(3, flags);
+    let calls = h.flush_calls();
+    h.reply(calls.iter().map(|call| Outgoing::Content(rpc_error(call.0, 500, "INTERNAL"))).collect());
+    assert_eq!(h.events().iter().filter(|event| matches!(event, RpcEvent::RetryDecisionRequired { .. })).count(), 2);
+    h.send(2, RequestFlags::default());
+    let now = h.now;
+    let mut pending = h.client.into_pending();
+    assert_eq!(pending.iter().map(PendingRequest::id).collect::<Vec<_>>(), [RequestId(1), RequestId(3), RequestId(2)]);
+    let failed = pending[1].decide_retry(false, now).expect("a question is open").expect("a failure to report");
+    assert!(
+        matches!(failed, RpcEvent::Failed { id: RequestId(3), code: 500, ref message, .. } if message == "INTERNAL")
+    );
+    assert!(pending[1].decide_retry(true, now).is_none(), "answered once");
+    pending.remove(1);
+    let mut next = Harness::new(SessionRole::Main, Some("h1"));
+    for request in pending {
+        next.client.adopt(request, next.now);
+    }
+    next.advance(10.0);
+    let tags: Vec<u32> = next.flush_calls().iter().map(|call| call.2).collect();
+    assert_eq!(tags, [2], "the request with an open question waits for the host");
+    next.client.decide_retry(RequestId(1), true, next.now);
+    next.advance(10.0);
+    let tags: Vec<u32> = next.flush_calls().iter().map(|call| call.2).collect();
+    assert_eq!(tags, [1]);
+}
+
+#[test]
 fn quick_ack_events_only_for_requests_that_asked() {
     let mut h = Harness::new(SessionRole::Main, Some("h1"));
     h.send(1, RequestFlags { quick_ack: true, ..Default::default() });
@@ -939,4 +996,212 @@ fn oversized_or_unaligned_requests_fail_locally_instead_of_reaching_the_wire() {
         .collect();
     assert_eq!(failed, vec![1, 2, 3]);
     assert!(h.flush_calls().is_empty());
+}
+
+mod pfs {
+    use super::*;
+    use crate::message::decrypt_message_v1;
+    use crate::tl::TlRead;
+    use crate::tl::mtproto::BindAuthKeyInner;
+
+    fn perm_key() -> AuthKey {
+        AuthKey::new(core::array::from_fn(|i| (i as u8).wrapping_mul(7).wrapping_add(91)))
+    }
+
+    struct SentBind {
+        msg_id: i64,
+        perm_id: i64,
+        nonce: i64,
+        expires_at: i32,
+        inner_msg_id: i64,
+        inner_seq_no: i32,
+        inner: BindAuthKeyInner,
+    }
+
+    fn sent_bind(packet: &DecodedPacket) -> Option<SentBind> {
+        let message = packet.messages.iter().find(|message| message.constructor() == ids::AUTH_BIND_TEMP_AUTH_KEY)?;
+        let mut reader = Reader::new(&message.body[4..]);
+        let perm_id = reader.read_i64().unwrap();
+        let nonce = reader.read_i64().unwrap();
+        let expires_at = reader.read_i32().unwrap();
+        let encrypted = reader.read_bytes().unwrap().to_vec();
+        let decrypted = decrypt_message_v1(&perm_key(), &encrypted, crate::crypto::Side::Client).expect("perm key");
+        let inner = BindAuthKeyInner::read_from(&mut Reader::new(decrypted.body())).unwrap();
+        Some(SentBind {
+            msg_id: message.msg_id,
+            perm_id,
+            nonce,
+            expires_at,
+            inner_msg_id: decrypted.header.msg_id,
+            inner_seq_no: decrypted.header.seq_no,
+            inner,
+        })
+    }
+
+    fn transmit(h: &mut Harness) -> Option<DecodedPacket> {
+        h.advance(0.002);
+        let transmit = h.client.poll_transmit(h.now, &mut h.rng)?;
+        Some(h.server.decode(&transmit.data))
+    }
+
+    fn calls_in(packet: &DecodedPacket) -> Vec<u32> {
+        packet.messages.iter().filter_map(|message| unwrap_call(&message.body).1).collect()
+    }
+
+    #[test]
+    fn the_bind_goes_first_alone_and_carries_its_own_msg_id_and_session() {
+        let mut h = Harness::new(SessionRole::Main, None);
+        h.client.hold_until_bound();
+        h.send(1, RequestFlags::default());
+        h.send(2, RequestFlags::default());
+        let mut held = Vec::new();
+        while let Some(packet) = transmit(&mut h) {
+            held.extend(calls_in(&packet));
+        }
+        assert!(held.is_empty(), "no query before the bind: {held:?}");
+        h.client.bind_temporary_key(perm_key(), START as i32 + 86_400, h.now, &mut h.rng);
+        let packet = transmit(&mut h).expect("the bind");
+        let bind = sent_bind(&packet).expect("bind query");
+        assert!(calls_in(&packet).is_empty(), "the bind travels alone");
+        assert_eq!(bind.inner_msg_id, bind.msg_id, "inner msg_id is the bind's own");
+        assert_eq!(bind.inner_seq_no, 0);
+        assert_eq!(bind.perm_id, perm_key().id() as i64);
+        assert_eq!(bind.inner.perm_auth_key_id, perm_key().id() as i64);
+        assert_eq!(bind.inner.temp_auth_key_id, key().id() as i64);
+        assert_eq!(bind.inner.temp_session_id, packet.header.session_id);
+        assert_eq!(bind.inner.nonce, bind.nonce);
+        assert_eq!(bind.inner.expires_at, bind.expires_at);
+        assert!(transmit(&mut h).is_none_or(|packet| calls_in(&packet).is_empty()), "still held while unanswered");
+
+        let mut writer = Writer::new();
+        writer.write_u32(0x997275b5);
+        let reply = h.server.encode(vec![Outgoing::Content(rpc_result(bind.msg_id, &writer.into_inner()))]);
+        h.client.handle_packet(&reply, h.now, &mut h.rng).unwrap();
+        let events: Vec<RpcEvent> = h.client.drain_events();
+        assert!(events.contains(&RpcEvent::TemporaryKeyBound), "{events:?}");
+        let mut sent = Vec::new();
+        while let Some(packet) = transmit(&mut h) {
+            sent.extend(calls_in(&packet));
+        }
+        sent.sort_unstable();
+        assert_eq!(sent, vec![1, 2], "held queries go once bound");
+    }
+
+    #[test]
+    fn a_refused_bind_keeps_queries_held_until_a_bind_succeeds() {
+        let mut h = Harness::new(SessionRole::Main, None);
+        h.client.hold_until_bound();
+        h.send(1, RequestFlags::default());
+        h.client.bind_temporary_key(perm_key(), START as i32 + 86_400, h.now, &mut h.rng);
+        let first = sent_bind(&transmit(&mut h).unwrap()).unwrap();
+        let reply = h.server.encode(vec![Outgoing::Content(rpc_error(first.msg_id, 400, "ENCRYPTED_MESSAGE_INVALID"))]);
+        h.client.handle_packet(&reply, h.now, &mut h.rng).unwrap();
+        let events = h.client.drain_events();
+        assert!(
+            events
+                .contains(&RpcEvent::TemporaryKeyBindFailed { code: 400, message: "ENCRYPTED_MESSAGE_INVALID".into() }),
+            "{events:?}"
+        );
+        assert!(!events.iter().any(|event| matches!(event, RpcEvent::Failed { .. })), "no host request fails");
+        while let Some(packet) = transmit(&mut h) {
+            assert!(calls_in(&packet).is_empty(), "still held after a refusal");
+        }
+        h.client.bind_temporary_key(perm_key(), START as i32 + 86_400, h.now, &mut h.rng);
+        let second = sent_bind(&transmit(&mut h).unwrap()).unwrap();
+        assert_ne!(second.nonce, first.nonce);
+        let mut writer = Writer::new();
+        writer.write_u32(0x997275b5);
+        let reply = h.server.encode(vec![Outgoing::Content(rpc_result(second.msg_id, &writer.into_inner()))]);
+        h.client.handle_packet(&reply, h.now, &mut h.rng).unwrap();
+        let mut sent = Vec::new();
+        while let Some(packet) = transmit(&mut h) {
+            sent.extend(calls_in(&packet));
+        }
+        assert_eq!(sent, vec![1]);
+    }
+
+    #[test]
+    fn a_bind_resent_under_a_new_msg_id_is_encrypted_again_for_it() {
+        let mut h = Harness::new(SessionRole::Main, None);
+        h.client.hold_until_bound();
+        h.send(1, RequestFlags::default());
+        h.send(2, RequestFlags::default());
+        h.client.bind_temporary_key(perm_key(), START as i32 + 86_400, h.now, &mut h.rng);
+        let first = sent_bind(&transmit(&mut h).unwrap()).unwrap();
+        let reply = h.server.encode(vec![Outgoing::Service(bad_server_salt(first.msg_id, 1, 6))]);
+        h.client.handle_packet(&reply, h.now, &mut h.rng).unwrap();
+        let second = sent_bind(&transmit(&mut h).expect("resent")).expect("bind again");
+        assert_ne!(second.msg_id, first.msg_id);
+        assert_eq!(second.inner_msg_id, second.msg_id, "the inner message follows the new msg_id");
+    }
+
+    #[test]
+    fn a_rebind_goes_out_past_an_older_query_waiting_to_be_retransmitted() {
+        let mut h = Harness::new(SessionRole::Main, None);
+        h.send(1, RequestFlags::default());
+        assert_eq!(calls_in(&transmit(&mut h).expect("query 1")).len(), 1);
+        h.advance(0.5);
+        h.client.hold_until_bound();
+        h.client.bind_temporary_key(perm_key(), START as i32 + 86_400, h.now, &mut h.rng);
+        sent_bind(&transmit(&mut h).expect("bind packet")).expect("bind query");
+        h.client.connection_closed(h.now);
+        h.advance(0.5);
+        h.client.connection_opened(h.now);
+        let mut binds = 0;
+        while let Some(packet) = transmit(&mut h) {
+            binds += usize::from(sent_bind(&packet).is_some());
+            assert!(calls_in(&packet).is_empty(), "the held query stays held");
+        }
+        assert_eq!(binds, 1, "the bind goes again after the reconnect");
+        assert!(h.client.poll_timeout(h.now).is_none_or(|at| at > h.now.mono), "no deadline in the past");
+    }
+
+    #[test]
+    fn a_new_bind_goes_out_while_an_older_query_waits_to_be_retransmitted() {
+        let mut h = Harness::new(SessionRole::Main, None);
+        h.send(1, RequestFlags::default());
+        assert_eq!(calls_in(&transmit(&mut h).expect("query 1")).len(), 1);
+        h.client.connection_closed(h.now);
+        h.advance(0.5);
+        h.client.hold_until_bound();
+        h.client.bind_temporary_key(perm_key(), START as i32 + 86_400, h.now, &mut h.rng);
+        h.client.connection_opened(h.now);
+        let mut binds = 0;
+        while let Some(packet) = transmit(&mut h) {
+            binds += usize::from(sent_bind(&packet).is_some());
+        }
+        assert_eq!(binds, 1);
+        assert!(h.client.poll_timeout(h.now).is_none_or(|at| at > h.now.mono), "no deadline in the past");
+    }
+
+    #[test]
+    fn over_http_a_held_retransmission_neither_blocks_the_bind_nor_floods_requests() {
+        let mut h = Harness::new(SessionRole::Main, None);
+        h.client.session_mut().set_http(true);
+        h.send(1, RequestFlags::default());
+        h.advance(0.002);
+        let first = h
+            .client
+            .poll_http_transmit(h.now, &mut h.rng, crate::session::HttpWait::IMMEDIATE, false, true)
+            .expect("query 1");
+        h.client.http_packet_lost(first.packet_seq, h.now);
+        h.client.hold_until_bound();
+        h.client.bind_temporary_key(perm_key(), START as i32 + 86_400, h.now, &mut h.rng);
+        let (mut requests, mut binds) = (0, 0);
+        for _ in 0..100 {
+            h.advance(0.002);
+            if !h.client.wants_http_transmit(h.now) {
+                break;
+            }
+            if let Some(transmit) =
+                h.client.poll_http_transmit(h.now, &mut h.rng, crate::session::HttpWait::IMMEDIATE, false, true)
+            {
+                requests += 1;
+                binds += usize::from(sent_bind(&h.server.decode(&transmit.data)).is_some());
+                h.client.session_mut().http_packet_delivered(transmit.packet_seq, h.now);
+            }
+        }
+        assert_eq!(binds, 1);
+        assert!(requests < 5, "{requests} requests");
+    }
 }

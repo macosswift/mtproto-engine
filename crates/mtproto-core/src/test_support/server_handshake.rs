@@ -24,6 +24,8 @@ pub struct ServerHandshakeBehavior {
     pub bad_g: Option<i32>,
     pub small_g_a: bool,
     pub server_time: i32,
+    /// Each handshake reports the wall clock instead of `server_time`.
+    pub live_time: bool,
     pub pq_override: Option<Vec<u8>>,
     pub wrong_server_nonce_in_dh_params: bool,
     pub wrong_nonce_in_inner_data: bool,
@@ -62,7 +64,12 @@ pub struct ServerHandshake {
 const PQ: u64 = 0x17ED48941A08F981;
 
 impl ServerHandshake {
-    pub fn new(behavior: ServerHandshakeBehavior) -> Self {
+    pub fn new(mut behavior: ServerHandshakeBehavior) -> Self {
+        if behavior.live_time {
+            behavior.server_time = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_secs() as i32);
+        }
         Self {
             keys: test_rsa_key_pair(),
             behavior,

@@ -10,7 +10,7 @@ use mtproto_engine::mtproto_core::session::ServerSalt;
 use mtproto_engine::mtproto_core::tl::Writer;
 use mtproto_engine::{
     AuthKeyMaterial, DcAddress, Engine, EngineCallbacks, EngineConfig, EngineEvent, KeyGeneration, ProxyConfig,
-    SessionHandle, SessionSetup, unix_seconds,
+    SessionHandle, SessionSetup, TransportPreference, unix_seconds,
 };
 use mtproto_testserver::{TAG_SIZED, TAG_UPLOAD, call, parse_result, sized_call};
 
@@ -207,11 +207,23 @@ fn setup(args: &ClientArgs, role: SessionRole) -> SessionSetup {
         setup.proxy = Some(ProxyConfig::MtProxy { host: host.to_string(), port, secret: unhex(secret) });
         setup.addresses = vec![DcAddress { host: "149.154.167.51".into(), port: 443, secret: None }];
     }
+    setup.transport = match args.transport.as_str() {
+        "http" => TransportPreference::Http,
+        "auto" => TransportPreference::Auto,
+        _ => TransportPreference::Tcp,
+    };
+    setup.http_port = None;
     setup.environment = Some(environment());
     setup.keep_connected = true;
     setup.idle_disconnect_after = None;
     setup.online = args.online && role == SessionRole::Main;
-    if args.mode == "real" {
+    if args.mode == "real" && args.pfs {
+        setup.pfs = Some(mtproto_engine::PfsSetup {
+            lifetime: 3600,
+            public_keys: vec![RsaPublicKey::from_pem(PRODUCTION_KEY).expect("key")],
+            ..Default::default()
+        });
+    } else if args.mode == "real" {
         setup.key_generation = Some(KeyGeneration {
             public_keys: vec![RsaPublicKey::from_pem(PRODUCTION_KEY).expect("key")],
             temporary_expires_in: None,

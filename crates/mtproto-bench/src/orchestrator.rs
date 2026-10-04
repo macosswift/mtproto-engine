@@ -14,6 +14,8 @@ pub struct EngineBinary {
     pub label: String,
     pub path: String,
     pub prefix: Vec<String>,
+    /// Runs every scenario over this transport, whatever the scenario asks.
+    pub transport: Option<String>,
 }
 
 impl EngineBinary {
@@ -21,9 +23,10 @@ impl EngineBinary {
     /// workloads and no online flag, the tdlib client no real-server mode.
     pub fn unsupported(&self, scenario: &Scenario) -> Option<&'static str> {
         match self.label.as_str() {
+            "mtprotokit" if scenario.args.transport != "tcp" => Some("no HTTP transport"),
             "mtprotokit" if scenario.args.workload.contains("upload") => Some("no upload workload"),
             "mtprotokit" if scenario.args.online => Some("no online flag"),
-            "tdlib" if scenario.args.mode == "real" => Some("no real-server mode"),
+            "tdlib" | "tdlib-http" if scenario.args.mode == "real" => Some("no real-server mode"),
             _ => None,
         }
     }
@@ -125,9 +128,75 @@ pub fn weak_suite() -> Vec<Scenario> {
     scenarios
 }
 
+/// The quick suite's own-server scenarios over HTTP.
+pub fn http_suite() -> Vec<Scenario> {
+    suite("quick", false)
+        .into_iter()
+        .filter(|scenario| scenario.secret.is_none())
+        .map(|mut scenario| {
+            scenario.name = format!("http/{}", scenario.name);
+            scenario.args.transport = "http".into();
+            scenario
+        })
+        .collect()
+}
+
+/// Networks that only let HTTP through, and ordinary ones where Auto has to stay on TCP.
+pub fn auto_suite() -> Vec<Scenario> {
+    let mut scenarios = Vec::new();
+    for profile in ["http-only", "http-only-reset", "http-only-3g", "http-only-lossy"] {
+        scenarios.push(scenario(
+            &format!("auto/{profile}/steady"),
+            ClientArgs { rate: 4.0, duration: 20.0, deadline: 90.0, transport: "auto".into(), ..base("steady") },
+            profile,
+        ));
+        scenarios.push(scenario(
+            &format!("auto/{profile}/mixed"),
+            ClientArgs {
+                total_bytes: 4 * 1024 * 1024,
+                part_size: 128 * 1024,
+                rate: 4.0,
+                deadline: 180.0,
+                transport: "auto".into(),
+                ..base("mixed")
+            },
+            profile,
+        ));
+    }
+    for profile in ["perfect", "flaky", "dpi-half", "blackholes"] {
+        scenarios.push(scenario(
+            &format!("auto/{profile}/steady"),
+            ClientArgs { rate: 10.0, duration: 15.0, deadline: 120.0, transport: "auto".into(), ..base("steady") },
+            profile,
+        ));
+    }
+    scenarios.push(scenario(
+        "auto/perfect/latency",
+        ClientArgs { requests: 200, transport: "auto".into(), ..base("latency") },
+        "perfect",
+    ));
+    scenarios
+}
+
 pub fn suite(name: &str, include_real: bool) -> Vec<Scenario> {
     if name == "weak" {
         return weak_suite();
+    }
+    if name == "http" {
+        return http_suite();
+    }
+    if name == "http-weak" {
+        return weak_suite()
+            .into_iter()
+            .map(|mut scenario| {
+                scenario.name = format!("http-{}", scenario.name);
+                scenario.args.transport = "http".into();
+                scenario
+            })
+            .collect();
+    }
+    if name == "auto" {
+        return auto_suite();
     }
     let mut scenarios = Vec::new();
     let quick = name == "quick";
@@ -281,6 +350,11 @@ pub fn run(scenario: &Scenario, engine: &EngineBinary, seed: u64) -> RunResult {
     let sim = NetSim::start(upstream, profile, seed).expect("netsim");
     let mut args = scenario.args.clone();
     args.engine_label = engine.label.clone();
+    if let Some(transport) = &engine.transport {
+        args.transport = transport.clone();
+    } else if engine.label == "tdlib" && args.transport == "auto" {
+        args.transport = "tcp".into();
+    }
     args.address = sim.address.to_string();
     args.secret = scenario.secret.clone();
     if server.is_some() {

@@ -83,6 +83,7 @@ struct Args {
   double duration = 10.0;
   double deadline = 60.0;
   bool online = false;
+  std::string transport = "tcp";
 };
 
 Args parse_args(int argc, char **argv) {
@@ -124,6 +125,8 @@ Args parse_args(int argc, char **argv) {
       args.deadline = std::atof(value.c_str());
     } else if (flag == "--online") {
       args.online = value == "1" || value == "true";
+    } else if (flag == "--transport") {
+      args.transport = value;
     } else if (flag == "--mode" && value != "fake") {
       std::fprintf(stderr, "tdlib-bench: only --mode fake is supported\n");
       std::exit(2);
@@ -280,7 +283,8 @@ class Connector final : public td::Actor {
       , transport_type_(std::move(transport_type))
       , stat_(stat)
       , online_(online)
-      , proxied_(!transport_type_.secret.get_raw_secret().empty()) {
+      , proxied_(!transport_type_.secret.get_raw_secret().empty())
+      , http_(transport_type_.type == td::mtproto::TransportType::Http) {
     sanity_flood_control_.add_limit(5, 10);
     flood_control_.add_limit(1, 1);
     flood_control_.add_limit(4, 2);
@@ -346,6 +350,8 @@ class Connector final : public td::Actor {
   AddressStat *stat_;
   bool online_;
   bool proxied_;
+  // DcOptionsSet::find_connection: an HTTP option is always checked before use.
+  bool http_;
   td::FloodControlStrict sanity_flood_control_;
   td::FloodControlStrict flood_control_;
   td::FloodControlStrict flood_control_online_;
@@ -440,7 +446,7 @@ class Connector final : public td::Actor {
         backoff_wakeup_at_ = static_cast<td::int32>(td::Time::now()) + backoff_delay_;
         backoff_delay_ = std::min(MAX_BACKOFF, backoff_delay_ * 2);
       }
-      bool should_check = !stat_->is_ok() || stat_->error_at > td::Time::now() - 10;
+      bool should_check = !stat_->is_ok() || http_ || stat_->error_at > td::Time::now() - 10;
       if (!proxied_) {
         check_mode |= should_check;
       }
@@ -678,8 +684,12 @@ class Bench final : public td::Actor {
     if (!args_.secret.empty()) {
       secret = td::mtproto::ProxySecret::from_link(args_.secret).move_as_ok();
     }
-    transport_type_ = td::mtproto::TransportType{td::mtproto::TransportType::ObfuscatedTcp,
-                                                 static_cast<td::int16>(args_.dc), std::move(secret)};
+    if (args_.transport == "http") {
+      transport_type_ = td::mtproto::TransportType{td::mtproto::TransportType::Http, 0, td::mtproto::ProxySecret()};
+    } else {
+      transport_type_ = td::mtproto::TransportType{td::mtproto::TransportType::ObfuscatedTcp,
+                                                   static_cast<td::int16>(args_.dc), std::move(secret)};
+    }
 
     auto key = unhex(args_.key_hex);
     unsigned char sha[20];

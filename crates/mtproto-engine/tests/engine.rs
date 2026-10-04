@@ -343,6 +343,12 @@ fn run_proxy_case(options: ServerOptions, proxy: Option<ProxyConfig>, address_se
             ProxyConfig::MtProxy { secret, .. } => {
                 ProxyConfig::MtProxy { host: "localhost".into(), port: server.address.port(), secret: secret.clone() }
             }
+            ProxyConfig::Http { username, password, .. } => ProxyConfig::Http {
+                host: "127.0.0.1".into(),
+                port: server.address.port(),
+                username: username.clone(),
+                password: password.clone(),
+            },
         });
         config.addresses[0].host = "149.154.167.51".into();
         config.addresses[0].port = 443;

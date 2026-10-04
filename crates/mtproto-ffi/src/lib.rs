@@ -16,11 +16,11 @@ use mtproto_engine::mtproto_core::rpc::{
 use mtproto_engine::mtproto_core::session::{DestroyAuthKeyOutcome, ServerSalt};
 use mtproto_engine::mtproto_core::transport::Framing;
 use mtproto_engine::{
-    AuthKeyMaterial, DcAddress, Engine, EngineCallbacks, EngineConfig, EngineEvent, KeyGeneration, LogLevel,
-    ProxyConfig, SessionHandle, SessionSetup,
+    AuthKeyMaterial, BoundTemporaryKey, DcAddress, Engine, EngineCallbacks, EngineConfig, EngineEvent, KeyGeneration,
+    LogLevel, PfsSetup, ProxyConfig, SessionHandle, SessionSetup, TransportPreference,
 };
 
-pub const ABI_VERSION: u32 = 1;
+pub const ABI_VERSION: u32 = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -42,6 +42,19 @@ pub struct MTSaltEntry {
     pub salt: i64,
     pub valid_since: f64,
     pub valid_until: f64,
+}
+
+/// A temporary key the server has bound to the session's permanent key; `expires_at` in server time.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MTTemporaryKey {
+    pub key: MTBytes,
+    pub expires_at: i32,
+    pub bound_to: i64,
+    pub salts: *const MTSaltEntry,
+    pub salt_count: usize,
+    pub has_init_hash: u8,
+    pub init_hash: MTString,
 }
 
 #[repr(C)]
@@ -108,6 +121,9 @@ pub struct MTSessionSetup {
     pub keep_connected: u8,
     pub idle_disconnect_after: f64,
     pub request_timeout: f64,
+    pub pfs_lifetime: i32,
+    pub pfs_make_permanent_key: u8,
+    pub pfs_temporary_key: *const MTTemporaryKey,
 }
 
 #[repr(C)]
@@ -281,6 +297,21 @@ impl EngineCallbacks for Bridge {
                 self.emit(session, event, None);
             }
             EngineEvent::TransportFlood => self.emit(session, blank(23), None),
+            EngineEvent::PermanentKeyInvalid => self.emit(session, blank(32), None),
+            EngineEvent::TemporaryKeyInUse { key_id, expires_at, adopted, dc_id, permanent_key_id } => {
+                let mut event = blank(33);
+                event.code = dc_id;
+                event.request_id = permanent_key_id as u64;
+                event.integer1 = key_id;
+                event.integer2 = i64::from(expires_at);
+                event.flags = u32::from(adopted);
+                self.emit(session, event, None);
+            }
+            EngineEvent::TemporaryKeyDropped { key_id } => {
+                let mut event = blank(34);
+                event.integer1 = key_id;
+                self.emit(session, event, None);
+            }
             EngineEvent::NetworkUsage { incoming, outgoing, cellular } => {
                 let mut event = blank(24);
                 event.flags = u32::from(cellular);
@@ -413,6 +444,13 @@ impl Bridge {
                 self.emit(session, event, None);
             }
             RpcEvent::ConnectionShouldReset => {}
+            RpcEvent::TemporaryKeyBound => self.emit(session, blank(30), None),
+            RpcEvent::TemporaryKeyBindFailed { code, message } => {
+                let mut event = blank(31);
+                event.code = code;
+                event.text = string_ref(&message);
+                self.emit(session, event, None);
+            }
             RpcEvent::AuthKeyDestroyed { outcome } => {
                 let mut event = blank(28);
                 event.code = match outcome {
@@ -503,6 +541,16 @@ unsafe fn proxy(value: &MTProxy) -> Option<ProxyConfig> {
             port: value.port,
             secret: unsafe { bytes(value.secret) },
         }),
+        3 => {
+            let username = unsafe { text(value.username) };
+            let password = unsafe { text(value.password) };
+            Some(ProxyConfig::Http {
+                host: unsafe { text(value.host) },
+                port: value.port,
+                username: (!username.is_empty()).then_some(username),
+                password: (!password.is_empty() || value.username.length > 0).then_some(password),
+            })
+        }
         _ => None,
     }
 }
@@ -635,14 +683,28 @@ pub unsafe extern "C" fn mt_session_create(pointer: *mut MTEngine, setup: *const
             init_hash: (setup.has_init_hash != 0).then(|| unsafe { text(setup.init_hash) }),
         });
     }
-    if setup.generate_key != 0 {
-        let public_keys: Vec<RsaPublicKey> = unsafe { slice(setup.public_keys_pem, setup.public_key_count) }
+    let public_keys = || -> Vec<RsaPublicKey> {
+        unsafe { slice(setup.public_keys_pem, setup.public_key_count) }
             .iter()
             .filter_map(|pem| RsaPublicKey::from_pem(&unsafe { text(*pem) }).ok())
-            .collect();
+            .collect()
+    };
+    if setup.generate_key != 0 {
         config.key_generation = Some(KeyGeneration {
-            public_keys,
+            public_keys: public_keys(),
             temporary_expires_in: (setup.temp_key_expires_in > 0).then_some(setup.temp_key_expires_in),
+        });
+    }
+    if setup.pfs_lifetime > 0 {
+        config.pfs = Some(PfsSetup {
+            lifetime: setup.pfs_lifetime,
+            public_keys: public_keys(),
+            permanent_key_from_host: setup.pfs_make_permanent_key == 0,
+            temporary_key: if setup.pfs_temporary_key.is_null() {
+                None
+            } else {
+                unsafe { bound_temporary_key(&*setup.pfs_temporary_key) }
+            },
         });
     }
     if !setup.environment.is_null() {
@@ -742,6 +804,85 @@ pub unsafe extern "C" fn mt_session_set_proxy(pointer: *mut MTEngine, session: u
     if let Some(engine) = unsafe { engine(pointer) } {
         let proxy = if value.is_null() { None } else { unsafe { proxy(&*value) } };
         engine.set_proxy(SessionHandle(session), proxy);
+    }
+}
+
+/// The engine makes temporary keys that live `lifetime` seconds and binds them to the session's key,
+/// which becomes the permanent key, before anything else goes out. Without `make_permanent_key` a
+/// session with no key asks the host for the permanent key instead of making one. `temporary_key`, when
+/// not null, is a key already bound to the permanent key that the session starts under.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mt_session_enable_pfs(
+    pointer: *mut MTEngine,
+    session: u64,
+    lifetime: i32,
+    public_keys_pem: *const MTString,
+    public_key_count: usize,
+    make_permanent_key: u8,
+    temporary_key: *const MTTemporaryKey,
+) -> u8 {
+    let Some(engine) = (unsafe { engine(pointer) }) else {
+        return 0;
+    };
+    let public_keys: Vec<RsaPublicKey> = unsafe { slice(public_keys_pem, public_key_count) }
+        .iter()
+        .filter_map(|pem| RsaPublicKey::from_pem(&unsafe { text(*pem) }).ok())
+        .collect();
+    let temporary_key = if temporary_key.is_null() { None } else { unsafe { bound_temporary_key(&*temporary_key) } };
+    u8::from(engine.enable_pfs(
+        SessionHandle(session),
+        PfsSetup { lifetime, public_keys, permanent_key_from_host: make_permanent_key == 0, temporary_key },
+    ))
+}
+
+/// A temporary key bound to the session's permanent key elsewhere: taken instead of making one when
+/// the session needs a new key.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mt_session_offer_temporary_key(
+    pointer: *mut MTEngine,
+    session: u64,
+    key: *const MTTemporaryKey,
+) {
+    if let (Some(engine), false) = (unsafe { engine(pointer) }, key.is_null())
+        && let Some(key) = unsafe { bound_temporary_key(&*key) }
+    {
+        engine.offer_temporary_key(SessionHandle(session), key);
+    }
+}
+
+/// Whether a PFS session without a permanent key may make one itself (1) or waits for the host's (0).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mt_session_allow_permanent_key(pointer: *mut MTEngine, session: u64, allowed: u8) {
+    if let Some(engine) = unsafe { engine(pointer) } {
+        engine.allow_permanent_key(SessionHandle(session), allowed != 0);
+    }
+}
+
+unsafe fn bound_temporary_key(value: &MTTemporaryKey) -> Option<BoundTemporaryKey> {
+    let mut key = unsafe { bytes(value.key) };
+    let parsed = AuthKey::from_slice(&key);
+    key.zeroize();
+    Some(BoundTemporaryKey {
+        material: AuthKeyMaterial {
+            key: parsed?,
+            salts: unsafe { salts(value.salts, value.salt_count) },
+            init_hash: (value.has_init_hash != 0).then(|| unsafe { text(value.init_hash) }),
+        },
+        expires_at: value.expires_at,
+        bound_to: (value.bound_to != 0).then_some(value.bound_to as u64),
+    })
+}
+
+/// `transport`: 0 TCP, 1 HTTP, 2 TCP falling back to HTTP. `http_port` 0 keeps each address's port.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mt_session_set_transport(pointer: *mut MTEngine, session: u64, transport: u8, http_port: u16) {
+    if let Some(engine) = unsafe { engine(pointer) } {
+        let preference = match transport {
+            1 => TransportPreference::Http,
+            2 => TransportPreference::Auto,
+            _ => TransportPreference::Tcp,
+        };
+        engine.set_transport(SessionHandle(session), preference, (http_port != 0).then_some(http_port));
     }
 }
 

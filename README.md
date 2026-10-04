@@ -51,6 +51,15 @@ instead:
   connections are detected even without traffic (MtProtoKit has no keepalive).
 - **Robust parsing**: unknown constructors are delivered as updates and never reset the session;
   server `msg_resend_req`, `msgs_all_info`, `msgs_state_req` are handled.
+- **HTTP**: `TransportPreference::Http` speaks MTProto over HTTP/1.1 keep-alive (port 80, or each address's
+  own), and `Auto` stays on TCP but moves to HTTP while no TCP route answers and back once one does. Queries
+  travel in requests that wait briefly for their own answers, staggered long polls catch the rest, acks go out
+  within 20 ms, and a lost request resends only what it carried. HTTP proxies are `ProxyConfig::Http`: TCP goes
+  through CONNECT, HTTP is forwarded, and `Auto` forwards when CONNECT is refused. Behaviour and the production
+  facts it relies on: `docs/protocol-coverage.md` §17.
+- **PFS**: with `SessionSetup::pfs` (or `Engine::enable_pfs`) the engine makes temporary keys itself, binds
+  them with `auth.bindTempAuthKey` before anything else goes out, replaces them before they expire at a quiet
+  moment, and replaces them silently when the server loses them (§13).
 - **Errors**: see `docs/protocol-coverage.md` for the full matrix of transport errors, service
   messages, `bad_msg_notification` codes and RPC error classes with their tests.
 
@@ -111,6 +120,14 @@ requirement as pass, fail or untested. See `security/README.md`.
   server rejects forever (salt, clock and resend loops). `engine::hostile_server_faults_never_break_exactly_once_delivery`
   runs each against the engine; `mtproto-bench tc --suite hostile[-quick]` runs them through TelegramCore for both
   engines.
+- Session explorer (`crates/mtproto-engine/src/session_explorer_tests.rs`): seeded, simulated-time runs of one to
+  three sessions (TCP, HTTP, Auto; with and without engine PFS) against random host commands (calls, cancels, retry
+  decisions, network and pause flips, proxy, address, transport and key changes, `destroy_auth_key`) and network
+  or server faults (blackholes, resets, dropped answers, portal pages, refused or ignored binds, lost keys, DNS
+  changes, clock jumps). After every turn it checks that no session spins, every call ends once the route heals,
+  nothing runs twice and nothing panics; failing seeds shrink to a minimal event list. `explorer_quick` runs in
+  `cargo test`; the long run is `EXPLORER_SEEDS=300 EXPLORER_JOBS=8 cargo test --release -p mtproto-engine --lib
+  explorer_long -- --ignored`.
 - `mtproto-bench soak --minutes N`: the engine under continuous load with chaos, network flaps, connection resets
   and session churn against a test server in a child process; samples RSS, live heap, threads and descriptors.
 

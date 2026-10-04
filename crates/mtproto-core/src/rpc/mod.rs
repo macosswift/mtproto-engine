@@ -10,8 +10,8 @@ pub use wrap::{
 use crate::crypto::SecureRandom;
 use crate::msg_id::msg_id_time;
 use crate::session::{
-    CancelOutcome, DestroyAuthKeyOutcome, Now, PROTOCOL_ERROR_PREFIX, QueryId, QueryOptions, RESPONSE_UNPACK_FAILED,
-    ServerSalt, Session, SessionError, SessionEvent, Transmit,
+    BindRequest, CancelOutcome, DestroyAuthKeyOutcome, HttpWait, Now, PROTOCOL_ERROR_PREFIX, QueryId, QueryOptions,
+    RESPONSE_UNPACK_FAILED, ServerSalt, Session, SessionError, SessionEvent, Transmit,
 };
 
 pub const SERVER_ERROR_RETRY_DELAY: f64 = 2.0;
@@ -26,6 +26,9 @@ pub const TEMPORARY_KEY_RETRY_DELAY: f64 = 1.0;
 pub const TEMPORARY_KEY_MAX_RETRY_DELAY: f64 = 30.0;
 pub const CDN_TEMPORARY_KEY_REJECTIONS: u32 = 2;
 pub const TEMPORARY_KEY_REPORT_INTERVAL: f64 = 30.0;
+/// Query ids the client uses for its own `auth.bindTempAuthKey`, far above any host request id.
+pub const BIND_QUERY_ID_BASE: u64 = u64::MAX - (1 << 32);
+const BOOL_TRUE: u32 = 0x997275b5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RequestId(pub u64);
@@ -140,6 +143,13 @@ pub enum RpcEvent {
     AuthKeyDestroyed {
         outcome: DestroyAuthKeyOutcome,
     },
+    /// The server accepted `auth.bindTempAuthKey`: queries go out under the temporary key.
+    TemporaryKeyBound,
+    /// The server refused the binding, or answered false.
+    TemporaryKeyBindFailed {
+        code: i32,
+        message: String,
+    },
     RetryDecisionRequired {
         id: RequestId,
         code: i32,
@@ -178,6 +188,86 @@ struct RequestState {
     temporary_key_rejections: u32,
 }
 
+impl RequestState {
+    fn new(request: RpcRequest, seq: u64, now: Now) -> Self {
+        Self {
+            request,
+            seq,
+            wrapped_with_init: false,
+            in_session: false,
+            not_before: 0.0,
+            server_errors: 0,
+            not_inited_retries: 0,
+            waiting_for_token: false,
+            waiting_for_dependency: None,
+            verification: None,
+            pending_verification: false,
+            sent_at_unix: now.unix,
+            flood_wait_seconds: 0,
+            flood_wait_text: None,
+            pending_decision: None,
+            rejected_key: None,
+            temporary_key_rejections: 0,
+        }
+    }
+}
+
+/// A request between two sessions, with what the client learned about it: a FLOOD_WAIT, a retry
+/// question the host still has to answer, a verification it waits for. A new session's client takes it
+/// up where the old one left it.
+#[derive(Debug, Clone)]
+pub struct PendingRequest(RequestState);
+
+impl PendingRequest {
+    pub fn new(request: RpcRequest, now: Now) -> Self {
+        Self(RequestState::new(request, 0, now))
+    }
+
+    pub fn id(&self) -> RequestId {
+        self.0.request.id
+    }
+
+    pub fn request(&self) -> &RpcRequest {
+        &self.0.request
+    }
+
+    pub fn into_request(self) -> RpcRequest {
+        self.0.request
+    }
+
+    /// The host's answer to a retry question an earlier session asked. With `retry` the request goes
+    /// once its delay passed; without, the failure the question was about, to report. None, and
+    /// nothing changes, when no question is open.
+    pub fn decide_retry(&mut self, retry: bool, now: Now) -> Option<Option<RpcEvent>> {
+        let decision = self.0.pending_decision.take()?;
+        if retry {
+            self.0.not_before = now.mono + decision.delay.max(0.0);
+            return Some(None);
+        }
+        Some(Some(RpcEvent::Failed {
+            id: self.0.request.id,
+            code: decision.code,
+            message: decision.message,
+            response_time: decision.response_time,
+            duration: (now.unix - self.0.sent_at_unix).max(0.0),
+        }))
+    }
+
+    pub fn resolve_verification(&mut self, verification: Verification) {
+        self.0.verification = Some(verification);
+        self.0.pending_verification = false;
+    }
+
+    /// The host has the auth token again: a request an earlier session parked for it may go.
+    pub fn auth_token_ready(&mut self) {
+        self.0.waiting_for_token = false;
+    }
+}
+
+fn has_invalid_size(body: &[u8]) -> bool {
+    body.len() > MAX_REQUEST_BYTES || !body.len().is_multiple_of(4) || body.len() < 4
+}
+
 #[derive(Debug, Clone)]
 struct PendingDecision {
     code: i32,
@@ -199,6 +289,7 @@ pub struct RpcClient {
     events: VecDeque<RpcEvent>,
     auth_token_ready: bool,
     temporary_key_reported: Option<(u64, f64)>,
+    binds: u64,
 }
 
 impl RpcClient {
@@ -221,6 +312,7 @@ impl RpcClient {
             events: VecDeque::new(),
             auth_token_ready: true,
             temporary_key_reported: None,
+            binds: 0,
         }
     }
 
@@ -295,7 +387,7 @@ impl RpcClient {
         if self.requests.contains_key(&id) {
             return;
         }
-        if request.body.len() > MAX_REQUEST_BYTES || !request.body.len().is_multiple_of(4) || request.body.len() < 4 {
+        if has_invalid_size(&request.body) {
             self.events.push_back(RpcEvent::Failed {
                 id,
                 code: 400,
@@ -307,30 +399,37 @@ impl RpcClient {
         }
         let seq = self.next_seq;
         self.next_seq += 1;
-        self.requests.insert(
-            id,
-            RequestState {
-                request,
-                seq,
-                wrapped_with_init: false,
-                in_session: false,
-                not_before: 0.0,
-                server_errors: 0,
-                not_inited_retries: 0,
-                waiting_for_token: false,
-                waiting_for_dependency: None,
-                verification: None,
-                pending_verification: false,
-                sent_at_unix: now.unix,
-                flood_wait_seconds: 0,
-                flood_wait_text: None,
-                pending_decision: None,
-                rejected_key: None,
-                temporary_key_rejections: 0,
-            },
-        );
+        self.requests.insert(id, RequestState::new(request, seq, now));
         self.order.insert(seq, id);
         self.parked.insert(seq, id);
+        self.dispatch_ready(now);
+    }
+
+    /// Takes up a request an earlier session's client gave away with `into_pending`.
+    pub fn adopt(&mut self, pending: PendingRequest, now: Now) {
+        let mut state = pending.0;
+        let id = state.request.id;
+        if self.requests.contains_key(&id) {
+            return;
+        }
+        if has_invalid_size(&state.request.body) {
+            self.events.push_back(RpcEvent::Failed {
+                id,
+                code: 400,
+                message: REQUEST_INVALID_SIZE.to_string(),
+                response_time: now.unix,
+                duration: 0.0,
+            });
+            return;
+        }
+        state.temporary_key_rejections = 0;
+        state.seq = self.next_seq;
+        self.next_seq += 1;
+        state.in_session = false;
+        state.wrapped_with_init = false;
+        self.order.insert(state.seq, id);
+        self.parked.insert(state.seq, id);
+        self.requests.insert(id, state);
         self.dispatch_ready(now);
     }
 
@@ -371,6 +470,42 @@ impl RpcClient {
             state.pending_verification = false;
         }
         self.dispatch_ready(now);
+    }
+
+    /// Requests the server may have received under this session: moved to another session they could
+    /// run twice.
+    pub fn transmitted_requests(&self) -> Vec<RequestId> {
+        self.requests
+            .iter()
+            .filter(|(id, state)| state.in_session && self.session.was_transmitted(QueryId::from(**id)))
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// Puts request ids in the order they were submitted: failures reported in that order let a host
+    /// that sends them again keep calls chained with `invoke_after` in their order.
+    pub fn sort_by_submission(&self, ids: &mut [RequestId]) {
+        ids.sort_by_key(|id| self.requests.get(id).map_or(u64::MAX, |state| state.seq));
+    }
+
+    pub fn has_transmitted_requests(&self) -> bool {
+        self.requests.iter().any(|(id, state)| state.in_session && self.session.was_transmitted(QueryId::from(*id)))
+    }
+
+    /// The requests chained after one of `ids` with `invoke_after`, directly or through each other.
+    pub fn dependents_of(&self, ids: &[RequestId]) -> Vec<RequestId> {
+        let mut found: Vec<RequestId> = Vec::new();
+        let mut frontier: Vec<RequestId> = ids.to_vec();
+        while let Some(dependency) = frontier.pop() {
+            for (id, state) in &self.requests {
+                if state.request.invoke_after == Some(dependency) && !ids.contains(id) && !found.contains(id) {
+                    found.push(*id);
+                    frontier.push(*id);
+                }
+            }
+        }
+        found.sort_by_key(|id| self.requests.get(id).map_or(u64::MAX, |state| state.seq));
+        found
     }
 
     pub fn fail_request(&mut self, id: RequestId, code: i32, message: &str, now: Now) {
@@ -519,6 +654,19 @@ impl RpcClient {
 
     fn handle_session_event(&mut self, event: SessionEvent, now: Now) {
         match event {
+            SessionEvent::Result { id, body, .. } if self.session.bind_query() == Some(id) => {
+                let bound = body.len() >= 4 && u32::from_le_bytes(body[..4].try_into().expect("4")) == BOOL_TRUE;
+                self.session.finish_bind(id, bound, now);
+                self.events.push_back(if bound {
+                    RpcEvent::TemporaryKeyBound
+                } else {
+                    RpcEvent::TemporaryKeyBindFailed { code: 0, message: "BIND_RETURNED_FALSE".into() }
+                });
+            }
+            SessionEvent::Error { id, code, message, .. } if self.session.bind_query() == Some(id) => {
+                self.session.finish_bind(id, false, now);
+                self.events.push_back(RpcEvent::TemporaryKeyBindFailed { code, message });
+            }
             SessionEvent::Result { id, body, response_msg_id, .. } => {
                 let id = RequestId::from(id);
                 if let Some(state) = self.finish(id) {
@@ -809,6 +957,52 @@ impl RpcClient {
         transmit
     }
 
+    /// Binds the session's temporary key to `perm_key` until `expires_at` (server time) before any
+    /// other query goes out.
+    pub fn bind_temporary_key(
+        &mut self,
+        perm_key: crate::auth_key::AuthKey,
+        expires_at: i32,
+        now: Now,
+        rng: &mut impl SecureRandom,
+    ) -> RequestId {
+        self.binds += 1;
+        let id = QueryId(BIND_QUERY_ID_BASE + self.binds);
+        self.session.start_bind(id, BindRequest { perm_key, nonce: rng.next_u64() as i64, expires_at }, now);
+        RequestId::from(id)
+    }
+
+    /// The key is temporary and not bound yet: queries wait for `bind_temporary_key`'s answer.
+    pub fn hold_until_bound(&mut self) {
+        self.session.hold_until_bound();
+    }
+
+    pub fn poll_http_transmit(
+        &mut self,
+        now: Now,
+        rng: &mut impl SecureRandom,
+        wait: HttpWait,
+        force: bool,
+        queries: bool,
+    ) -> Option<Transmit> {
+        self.dispatch_ready(now);
+        let transmit = self.session.poll_http_transmit(now, rng, wait, force, queries);
+        self.pump_session_events(now);
+        transmit
+    }
+
+    pub fn wants_http_transmit(&mut self, now: Now) -> bool {
+        self.dispatch_ready(now);
+        let wants = self.session.wants_http_transmit(now);
+        self.pump_session_events(now);
+        wants
+    }
+
+    pub fn http_packet_lost(&mut self, seq: u64, now: Now) {
+        self.session.http_packet_lost(seq, now);
+        self.pump_session_events(now);
+    }
+
     pub fn poll_timeout(&mut self, now: Now) -> Option<f64> {
         let mut deadline = self.session.poll_timeout(now).unwrap_or(f64::INFINITY);
         for state in self.parked.values().filter_map(|id| self.requests.get(id)) {
@@ -839,6 +1033,18 @@ impl RpcClient {
 
     pub fn poll_event(&mut self) -> Option<RpcEvent> {
         self.events.pop_front()
+    }
+
+    /// Every request still open, oldest first, with what this client learned about each.
+    pub fn into_pending(mut self) -> Vec<PendingRequest> {
+        let order = std::mem::take(&mut self.order);
+        let mut pending = Vec::with_capacity(order.len());
+        for id in order.into_values() {
+            if let Some(state) = self.requests.remove(&id) {
+                pending.push(PendingRequest(state));
+            }
+        }
+        pending
     }
 
     pub fn into_requests(mut self) -> Vec<RpcRequest> {
