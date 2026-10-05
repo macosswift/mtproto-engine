@@ -51,7 +51,7 @@ fn c_abi_end_to_end() {
     let sink: &'static Sink = Box::leak(Box::default());
     let engine = unsafe { mt_engine_create(2, sink as *const Sink as *mut c_void, Some(on_event), None) };
     assert!(!engine.is_null());
-    assert_eq!(mt_engine_abi_version(), 2);
+    assert_eq!(mt_engine_abi_version(), 3);
     let host = server.address.ip().to_string();
     let address = MTAddress { host: string(&host), port: server.address.port(), secret: bytes(&[]) };
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64();
@@ -165,6 +165,10 @@ fn c_header_layout_matches_rust() {
 #define O(T, F) printf(#T "." #F " %zu\n", offsetof(T, F));
 int main(void) {
     S(MTBytes) S(MTString) S(MTSaltEntry) S(MTAddress) S(MTTemporaryKey) S(MTProxy) S(MTEnvironment) S(MTSessionSetup) S(MTRequest) S(MTEvent)
+    S(MTStreamTarget) S(MTStreamHost) S(MTWebEndpoint)
+    O(MTStreamTarget, port) O(MTStreamTarget, tls) O(MTStreamTarget, server_name) O(MTStreamTarget, alpn)
+    O(MTStreamHost, write) O(MTStreamHost, close) O(MTStreamHost, resume)
+    O(MTWebEndpoint, port) O(MTWebEndpoint, path) O(MTWebEndpoint, address) O(MTWebEndpoint, ws_path)
     O(MTTemporaryKey, expires_at) O(MTTemporaryKey, bound_to) O(MTTemporaryKey, salts) O(MTTemporaryKey, salt_count) O(MTTemporaryKey, has_init_hash) O(MTTemporaryKey, init_hash)
     O(MTAddress, port) O(MTAddress, secret)
     O(MTProxy, host) O(MTProxy, port) O(MTProxy, secret)
@@ -199,12 +203,26 @@ int main(void) {
         ("MTSessionSetup".into(), size_of::<MTSessionSetup>()),
         ("MTRequest".into(), size_of::<MTRequest>()),
         ("MTEvent".into(), size_of::<MTEvent>()),
+        ("MTStreamTarget".into(), size_of::<MTStreamTarget>()),
+        ("MTStreamHost".into(), size_of::<MTStreamHost>()),
+        ("MTWebEndpoint".into(), size_of::<MTWebEndpoint>()),
     ];
     macro_rules! o {
         ($t:ty, $f:ident) => {
             expected.push((format!("{}.{}", stringify!($t), stringify!($f)), offset_of!($t, $f)));
         };
     }
+    o!(MTStreamTarget, port);
+    o!(MTStreamTarget, tls);
+    o!(MTStreamTarget, server_name);
+    o!(MTStreamTarget, alpn);
+    o!(MTStreamHost, write);
+    o!(MTStreamHost, close);
+    o!(MTStreamHost, resume);
+    o!(MTWebEndpoint, port);
+    o!(MTWebEndpoint, path);
+    o!(MTWebEndpoint, address);
+    o!(MTWebEndpoint, ws_path);
     o!(MTTemporaryKey, expires_at);
     o!(MTTemporaryKey, bound_to);
     o!(MTTemporaryKey, salts);

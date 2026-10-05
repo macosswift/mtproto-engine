@@ -1,8 +1,10 @@
 pub mod api;
 pub mod chaos;
 mod http;
+mod web_front;
 
 pub use http::{HttpStats, INLINE_RESEND_MAX};
+pub use web_front::{Blackhole, WEB_FRONT_NAME, WebFront, WebFrontStats};
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{ErrorKind, Read, Write};

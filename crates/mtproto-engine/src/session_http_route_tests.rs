@@ -197,3 +197,78 @@ fn a_handshake_left_between_steps_by_an_offline_probe_does_not_spin() {
     runtime.shutdown(poll.registry(), probe);
     assert!(immediate < 3, "{immediate} turns asked to be driven at once, first {first:?} s after the probe");
 }
+
+struct Fixed(Vec<std::net::SocketAddr>);
+
+impl Resolve for Fixed {
+    fn resolve(&mut self, _session: SessionHandle, _host: &str, _port: u16) -> Resolution {
+        Resolution::Resolved(self.0.clone())
+    }
+}
+
+/// A front may answer the WebSocket probe and still cut every session's connection: the probe backoff
+/// earned before the adoption has to outlast it until the WebSocket carries the session, or such a
+/// front is probed and adopted every 5 s for good.
+#[test]
+fn an_adopted_websocket_keeps_the_probe_backoff_until_it_carries_the_session() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let poll = mio::Poll::new().unwrap();
+    let registry = poll.registry();
+    let mut rng = OsRandom::new();
+    let start = Now { mono: 1000.0, unix: 1_727_000_000.0 };
+    let mut setup = SessionSetup::new(
+        2,
+        SessionRole::Main,
+        vec![DcAddress { host: "127.0.0.1".into(), port: address.port(), secret: None }],
+    );
+    setup.transport = TransportPreference::Auto;
+    setup.http_port = None;
+    setup.web = Some(crate::types::WebEndpoint {
+        host: "venus.web.telegram.org".into(),
+        port: 443,
+        path: "/apiw1".into(),
+        ws_path: "/apiws".into(),
+        address: None,
+    });
+    setup.auth_key = Some(AuthKeyMaterial {
+        key: AuthKey::new([7u8; 256]),
+        salts: vec![ServerSalt { salt: 1, valid_since: start.unix - 60.0, valid_until: start.unix + 3600.0 }],
+        init_hash: None,
+    });
+    let mut runtime = SessionRuntime::new(SessionHandle(1), setup, Token(16), start, &mut rng);
+    runtime.send(
+        RpcRequest {
+            id: mtproto_core::rpc::RequestId(1),
+            body: vec![1, 2, 3, 4, 5, 6, 7, 8],
+            flags: RequestFlags::default(),
+            invoke_after: None,
+        },
+        start,
+    );
+    for _ in 0..3 {
+        runtime.note_probes_failed(start);
+    }
+    let token = runtime.probe_token(http::ProbeKind::WebSocket);
+    let transport =
+        TransportConfig { framing: runtime.setup.framing, dc_id: 2, secret: None, unix_time: start.unix as i32 };
+    let connection = Connection::connect(registry, token, address, &transport, None, 0, start.mono, &mut rng).unwrap();
+    runtime.auto.probes.push(http::Probe::new(
+        http::ProbeKind::WebSocket,
+        http::ProbeLink::Stream(Box::new(connection)),
+        [0u8; 16],
+        start.mono,
+    ));
+    let callbacks: Arc<dyn EngineCallbacks> = Arc::new(Null);
+    runtime.adopt_websocket_probe(token, registry, start, &callbacks, &mut rng);
+    let adopted = runtime.auto.describe(start.mono);
+    assert!(adopted.contains("probe_failures 3"), "{adopted}");
+    let now = Now { mono: start.mono + 0.01, unix: start.unix + 0.01 };
+    runtime.drive(registry, now, &mut Fixed(vec![address]), &EngineConfig::default(), &callbacks, &mut rng);
+    let driven = runtime.auto.describe(now.mono);
+    assert!(driven.contains("on_websocket true"), "{driven}");
+    assert!(
+        driven.contains("probe_failures 3"),
+        "the backoff was gone before the WebSocket carried anything: {driven}"
+    );
+}

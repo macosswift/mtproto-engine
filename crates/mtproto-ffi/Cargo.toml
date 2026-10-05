@@ -16,3 +16,4 @@ zeroize.workspace = true
 
 [dev-dependencies]
 mtproto-testserver = { path = "../mtproto-testserver" }
+rustls = { workspace = true }

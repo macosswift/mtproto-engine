@@ -23,6 +23,7 @@ zeroize = "=1.9.0"
 thiserror = "=2.0.17"
 hex = "=0.4.3"
 proptest = "=1.11.0"
+rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
 
 [profile.release]
 opt-level = 3

@@ -17,10 +17,11 @@ use mtproto_engine::mtproto_core::session::{DestroyAuthKeyOutcome, ServerSalt};
 use mtproto_engine::mtproto_core::transport::Framing;
 use mtproto_engine::{
     AuthKeyMaterial, BoundTemporaryKey, DcAddress, Engine, EngineCallbacks, EngineConfig, EngineEvent, KeyGeneration,
-    LogLevel, PfsSetup, ProxyConfig, SessionHandle, SessionSetup, TransportPreference,
+    LogLevel, PfsSetup, ProxyConfig, SessionHandle, SessionSetup, StreamHost, StreamId, StreamTarget,
+    TransportPreference, WebEndpoint,
 };
 
-pub const ABI_VERSION: u32 = 2;
+pub const ABI_VERSION: u32 = 3;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -164,6 +165,40 @@ impl Drop for MTBuffer {
             self.data.zeroize();
         }
     }
+}
+
+/// Where a host stream goes; the strings live for the duration of the call.
+#[repr(C)]
+pub struct MTStreamTarget {
+    pub host: MTString,
+    pub port: u16,
+    /// 1: TLS with `server_name`, offering `alpn` (comma-separated), without checking the certificate.
+    pub tls: u8,
+    pub server_name: MTString,
+    pub alpn: MTString,
+    /// 1: the host's WEB proxy carrier rather than a network connection; host and port are the
+    /// datacenter's, which the relay ignores.
+    pub carrier: u8,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MTStreamHost {
+    pub open: Option<unsafe extern "C" fn(context: *mut c_void, stream: u64, target: *const MTStreamTarget)>,
+    pub write: Option<unsafe extern "C" fn(context: *mut c_void, stream: u64, bytes: MTBytes)>,
+    pub close: Option<unsafe extern "C" fn(context: *mut c_void, stream: u64)>,
+    pub resume: Option<unsafe extern "C" fn(context: *mut c_void, stream: u64)>,
+}
+
+#[repr(C)]
+pub struct MTWebEndpoint {
+    pub host: MTString,
+    pub port: u16,
+    pub path: MTString,
+    /// Where to connect instead of looking `host` up; empty for none.
+    pub address: MTString,
+    /// The WebSocket endpoint on the same front; empty for none.
+    pub ws_path: MTString,
 }
 
 pub type MTEventCallback = Option<unsafe extern "C" fn(context: *mut c_void, session: u64, event: *const MTEvent)>;
@@ -333,6 +368,7 @@ impl EngineCallbacks for Bridge {
                 self.emit(session, event, None);
             }
             EngineEvent::Closed => self.emit(session, blank(26), None),
+            EngineEvent::RouteMemory { memory } => self.emit(session, blank(35), Some(memory)),
         }
     }
 
@@ -551,6 +587,7 @@ unsafe fn proxy(value: &MTProxy) -> Option<ProxyConfig> {
                 password: (!password.is_empty() || value.username.length > 0).then_some(password),
             })
         }
+        4 => Some(ProxyConfig::Web { host: unsafe { text(value.host) }, secret: unsafe { bytes(value.secret) } }),
         _ => None,
     }
 }
@@ -642,6 +679,157 @@ pub unsafe extern "C" fn mt_engine_next_request_id(pointer: *mut MTEngine) -> u6
 pub unsafe extern "C" fn mt_engine_set_network_available(pointer: *mut MTEngine, available: u8) {
     if let Some(engine) = unsafe { engine(pointer) } {
         engine.set_network_available(available != 0);
+    }
+}
+
+/// The network the device is on now: an opaque key (a salted hash of what identifies the network),
+/// empty when unknown. What sessions learn about TCP and HTTP is remembered per key.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mt_engine_set_network(pointer: *mut MTEngine, key: MTBytes) {
+    if let Some(engine) = unsafe { engine(pointer) } {
+        engine.set_network(&unsafe { bytes(key) });
+    }
+}
+
+/// The route memory an earlier run reported with `MTEventKindRouteMemoryChanged`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mt_engine_set_route_memory(pointer: *mut MTEngine, memory: MTBytes) {
+    if let Some(engine) = unsafe { engine(pointer) } {
+        engine.set_route_memory(&unsafe { bytes(memory) });
+    }
+}
+
+/// The host's side of streams the engine cannot open itself; its callbacks get the engine's context.
+struct FfiStreamHost {
+    bridge: Arc<Bridge>,
+    callbacks: MTStreamHost,
+}
+
+impl FfiStreamHost {
+    fn live(&self) -> bool {
+        !self.bridge.closed.load(Ordering::Acquire)
+    }
+}
+
+impl StreamHost for FfiStreamHost {
+    fn open(&self, stream: StreamId, target: &StreamTarget) {
+        let Some(open) = self.callbacks.open.filter(|_| self.live()) else {
+            return;
+        };
+        let server_name = target.tls_server_name.clone().unwrap_or_default();
+        let alpn = target.alpn.join(",");
+        let target = MTStreamTarget {
+            host: string_ref(&target.host),
+            port: target.port,
+            tls: u8::from(target.tls_server_name.is_some()),
+            server_name: string_ref(&server_name),
+            alpn: string_ref(&alpn),
+            carrier: u8::from(target.carrier),
+        };
+        unsafe { open(self.bridge.context.0, stream.0, &target) };
+    }
+
+    fn write(&self, stream: StreamId, bytes: &[u8]) {
+        if let Some(write) = self.callbacks.write.filter(|_| self.live()) {
+            unsafe { write(self.bridge.context.0, stream.0, MTBytes { data: bytes.as_ptr(), length: bytes.len() }) };
+        }
+    }
+
+    /// Delivered during `mt_engine_destroy` too: the host still has to let go of the stream.
+    fn close(&self, stream: StreamId) {
+        if let Some(close) = self.callbacks.close {
+            unsafe { close(self.bridge.context.0, stream.0) };
+        }
+    }
+
+    fn resume(&self, stream: StreamId) {
+        if let Some(resume) = self.callbacks.resume.filter(|_| self.live()) {
+            unsafe { resume(self.bridge.context.0, stream.0) };
+        }
+    }
+}
+
+/// The host that opens streams for the engine (Telegram Web's HTTPS endpoint over the platform's TLS);
+/// NULL removes it. The callbacks get the context given to mt_engine_create and may call back into
+/// the engine.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mt_engine_set_stream_host(pointer: *mut MTEngine, host: *const MTStreamHost) {
+    if pointer.is_null() {
+        return;
+    }
+    let wrapper = unsafe { &*pointer };
+    let host: Option<Arc<dyn StreamHost>> = if host.is_null() {
+        None
+    } else {
+        Some(Arc::new(FfiStreamHost { bridge: wrapper.bridge.clone(), callbacks: unsafe { *host } }))
+    };
+    wrapper.engine.set_stream_host(host);
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mt_stream_opened(pointer: *mut MTEngine, stream: u64) {
+    if let Some(engine) = unsafe { engine(pointer) } {
+        engine.stream_opened(StreamId(stream));
+    }
+}
+
+/// 1 while the host may go on receiving; 0 when it should wait for the resume callback.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mt_stream_received(pointer: *mut MTEngine, stream: u64, bytes: MTBytes) -> u8 {
+    let Some(engine) = (unsafe { engine(pointer) }) else {
+        return 0;
+    };
+    let data: &[u8] = unsafe { slice(bytes.data, bytes.length) };
+    u8::from(engine.stream_received(StreamId(stream), data))
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mt_stream_sent(pointer: *mut MTEngine, stream: u64, count: usize) {
+    if let Some(engine) = unsafe { engine(pointer) } {
+        engine.stream_sent(StreamId(stream), count);
+    }
+}
+
+/// The stream ended: `error` empty for a clean end.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mt_stream_closed(pointer: *mut MTEngine, stream: u64, error: MTString) {
+    if let Some(engine) = unsafe { engine(pointer) } {
+        let error = unsafe { text(error) };
+        engine.stream_closed(StreamId(stream), (!error.is_empty()).then_some(error));
+    }
+}
+
+/// Telegram Web's endpoints for the session (NULL: none): WebSocket and HTTPS on one front. They are
+/// used only while a stream host is set and no proxy is.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mt_session_set_web_endpoint(
+    pointer: *mut MTEngine,
+    session: u64,
+    endpoint: *const MTWebEndpoint,
+) {
+    let Some(engine) = (unsafe { engine(pointer) }) else {
+        return;
+    };
+    let endpoint = (!endpoint.is_null()).then(|| {
+        let endpoint = unsafe { &*endpoint };
+        let address = unsafe { text(endpoint.address) };
+        WebEndpoint {
+            host: unsafe { text(endpoint.host) },
+            port: endpoint.port,
+            path: unsafe { text(endpoint.path) },
+            ws_path: unsafe { text(endpoint.ws_path) },
+            address: (!address.is_empty()).then_some(address),
+        }
+    });
+    engine.set_web_endpoint(SessionHandle(session), endpoint);
+}
+
+/// Telegram Web's own endpoints for the session's datacenter (`*.web.telegram.org`, `/apiws` and
+/// `/apiw1`, or `/apiws_test` and `/apiw_test1` for the test servers).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mt_session_use_telegram_web(pointer: *mut MTEngine, session: u64, test: u8) {
+    if let Some(engine) = unsafe { engine(pointer) } {
+        engine.use_telegram_web(SessionHandle(session), test != 0);
     }
 }
 

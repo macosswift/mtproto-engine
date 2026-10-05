@@ -349,6 +349,7 @@ fn run_proxy_case(options: ServerOptions, proxy: Option<ProxyConfig>, address_se
                 username: username.clone(),
                 password: password.clone(),
             },
+            ProxyConfig::Web { host, secret } => ProxyConfig::Web { host: host.clone(), secret: secret.clone() },
         });
         config.addresses[0].host = "149.154.167.51".into();
         config.addresses[0].port = 443;

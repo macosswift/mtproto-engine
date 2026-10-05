@@ -52,6 +52,13 @@ pub enum ProxyConfig {
         username: Option<String>,
         password: Option<String>,
     },
+    /// A WEB proxy: the MTProxy transport, obfuscated with `secret`, over the host's carrier to the relay
+    /// at `host` (a page in a web view the host runs). The engine opens no connection of its own and
+    /// looks nothing up; without the host's carrier the session does not connect at all.
+    Web {
+        host: String,
+        secret: Vec<u8>,
+    },
 }
 
 impl Drop for ProxyConfig {
@@ -62,7 +69,9 @@ impl Drop for ProxyConfig {
                     mtproto_core::Zeroize::zeroize(password);
                 }
             }
-            ProxyConfig::MtProxy { secret, .. } => mtproto_core::Zeroize::zeroize(secret),
+            ProxyConfig::MtProxy { secret, .. } | ProxyConfig::Web { secret, .. } => {
+                mtproto_core::Zeroize::zeroize(secret)
+            }
         }
     }
 }
@@ -73,6 +82,7 @@ impl core::fmt::Debug for ProxyConfig {
             ProxyConfig::Socks5 { host, port, .. } => write!(f, "Socks5({host}:{port})"),
             ProxyConfig::MtProxy { host, port, .. } => write!(f, "MtProxy({host}:{port})"),
             ProxyConfig::Http { host, port, .. } => write!(f, "Http({host}:{port})"),
+            ProxyConfig::Web { host, .. } => write!(f, "Web({host})"),
         }
     }
 }
@@ -83,6 +93,7 @@ impl ProxyConfig {
             ProxyConfig::Socks5 { host, port, .. }
             | ProxyConfig::MtProxy { host, port, .. }
             | ProxyConfig::Http { host, port, .. } => format!("{host}:{port}"),
+            ProxyConfig::Web { host, .. } => host.clone(),
         }
     }
 }
@@ -167,6 +178,51 @@ pub struct SessionSetup {
     pub tcp_recheck_after: f64,
     /// The engine makes and binds temporary keys itself; `auth_key` is then the permanent key.
     pub pfs: Option<PfsSetup>,
+    /// Telegram Web's HTTPS endpoint, tried as one more HTTP route through the host's streams.
+    pub web: Option<WebEndpoint>,
+}
+
+/// Telegram Web's endpoints for a datacenter on one web front, inside TLS the host opens (`StreamHost`)
+/// with the platform's own TLS, so the traffic looks like a browser on Telegram Web: the WebSocket
+/// endpoint carries the obfuscated stream transport as TCP would, the HTTPS endpoint the same MTProto
+/// messages as plain HTTP.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WebEndpoint {
+    /// The name TLS presents and the Host header carries, as `venus.web.telegram.org`.
+    pub host: String,
+    pub port: u16,
+    /// `/apiw1`, or `/apiw_test1` on the test servers.
+    pub path: String,
+    /// The WebSocket endpoint on the same front: `/apiws`, or `/apiws_test`.
+    pub ws_path: String,
+    /// Where the host connects instead of looking `host` up: tests, or a front known to work.
+    pub address: Option<String>,
+}
+
+const WEB_HOSTS: [&str; 5] = ["pluto", "venus", "aurora", "vesta", "flora"];
+
+impl WebEndpoint {
+    /// The Host header: the name, with the port unless it is HTTPS's own.
+    pub fn authority(&self) -> String {
+        if self.port == 443 { self.host.clone() } else { format!("{}:{}", self.host, self.port) }
+    }
+
+    /// Telegram Web's own endpoint for datacenter 1-5, production or test. Sessions other than the
+    /// main one use the `-1` fronts, as Telegram Web does for downloads and uploads.
+    pub fn telegram(datacenter_id: i32, role: SessionRole, test: bool) -> Option<Self> {
+        if role == SessionRole::Cdn {
+            return None;
+        }
+        let name = WEB_HOSTS.get(usize::try_from(datacenter_id).ok()?.checked_sub(1)?)?;
+        let suffix = if role == SessionRole::Main { "" } else { "-1" };
+        Some(Self {
+            host: format!("{name}{suffix}.web.telegram.org"),
+            port: 443,
+            path: if test { "/apiw_test1".into() } else { "/apiw1".into() },
+            ws_path: if test { "/apiws_test".into() } else { "/apiws".into() },
+            address: None,
+        })
+    }
 }
 
 impl SessionSetup {
@@ -194,6 +250,7 @@ impl SessionSetup {
             http_port: Some(80),
             tcp_recheck_after: 60.0,
             pfs: None,
+            web: None,
         }
     }
 
@@ -202,13 +259,24 @@ impl SessionSetup {
             Some(ProxyConfig::Socks5 { host, port, .. })
             | Some(ProxyConfig::MtProxy { host, port, .. })
             | Some(ProxyConfig::Http { host, port, .. }) => Some((host.as_str(), *port)),
-            None => None,
+            Some(ProxyConfig::Web { .. }) | None => None,
         }
+    }
+
+    /// No HTTP route goes through the proxy: an MTProxy or a WEB proxy carries the stream transport only.
+    pub fn proxy_blocks_http(&self) -> bool {
+        matches!(self.proxy, Some(ProxyConfig::MtProxy { .. }) | Some(ProxyConfig::Web { .. }))
+    }
+
+    pub fn web_proxy(&self) -> bool {
+        matches!(self.proxy, Some(ProxyConfig::Web { .. }))
     }
 
     pub fn proxy_secret(&self, address: &DcAddress) -> Option<ProxySecret> {
         match &self.proxy {
-            Some(ProxyConfig::MtProxy { secret, .. }) => ProxySecret::from_binary(secret, true).ok(),
+            Some(ProxyConfig::MtProxy { secret, .. }) | Some(ProxyConfig::Web { secret, .. }) => {
+                ProxySecret::from_binary(secret, true).ok()
+            }
             Some(ProxyConfig::Socks5 { .. }) | Some(ProxyConfig::Http { .. }) => None,
             None => address.secret.as_ref().and_then(|secret| ProxySecret::from_binary(secret, true).ok()),
         }
@@ -355,6 +423,11 @@ pub enum EngineEvent {
         age: f64,
     },
     Closed,
+    /// Engine-wide, reported for session 0: what was learned about named networks changed; the host
+    /// stores it and gives it back with `Engine::set_route_memory` on the next run.
+    RouteMemory {
+        memory: Vec<u8>,
+    },
 }
 
 pub trait EngineCallbacks: Send + Sync + 'static {

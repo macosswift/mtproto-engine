@@ -707,6 +707,21 @@ impl NetSim {
         begin_outage(&self.shared, duration);
     }
 
+    /// A tunnel that lasts until `end_tunnel`: new connections are refused, live ones wait it out.
+    pub fn begin_tunnel(&self) {
+        begin_tunnel(&self.shared, Duration::from_secs(24 * 3600));
+    }
+
+    pub fn end_tunnel(&self) {
+        *self.shared.outage_until.lock().unwrap() = None;
+        end_tunnel(&self.shared);
+    }
+
+    /// Ends an outage early: new connections get through again, the ones it killed stay dead.
+    pub fn end_outage(&self) {
+        *self.shared.outage_until.lock().unwrap() = None;
+    }
+
     pub fn reset_all(&self) {
         let live: Vec<Arc<ConnectionControl>> = self.shared.live.lock().unwrap().drain(..).collect();
         for control in live {

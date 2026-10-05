@@ -53,6 +53,10 @@ enum {
     MTProxyKindMTProxy = 2,
     /* TCP through a CONNECT tunnel; HTTP forwarded by the proxy. */
     MTProxyKindHttp = 3,
+    /* A WEB proxy: the MTProxy transport obfuscated with secret, over the stream host's carrier
+       (MTStreamTarget.carrier); host is the relay, for display only. Nothing connects without the
+       stream host. */
+    MTProxyKindWeb = 4,
 };
 
 typedef struct {
@@ -189,6 +193,9 @@ typedef enum {
     /* PFS: the server no longer takes this temporary key (integer1 key id); a copy kept for other
        sessions should go. */
     MTEventKindTemporaryKeyDropped = 34,
+    /* Engine-wide, for session 0: what was learned about named networks changed (payload); store it and
+       give it back with mt_engine_set_route_memory on the next run. */
+    MTEventKindRouteMemoryChanged = 35,
 } MTEventKind;
 
 enum {
@@ -232,6 +239,50 @@ void mt_engine_destroy(MTEngine *engine);
 MTRequestId mt_engine_next_request_id(MTEngine *engine);
 void mt_engine_set_network_available(MTEngine *engine, uint8_t available);
 void mt_engine_reset_connections(MTEngine *engine);
+/* The network the device is on now: an opaque key (a salted hash of what identifies it), empty when
+   unknown. A network known to block TCP gets HTTP early from the first connection. */
+void mt_engine_set_network(MTEngine *engine, MTBytes key);
+void mt_engine_set_route_memory(MTEngine *engine, MTBytes memory);
+
+/* Host streams: byte streams the host opens for the engine, as TLS to Telegram Web's fronts with the
+   platform's own TLS. Strings in the target live for the duration of the call. */
+typedef struct {
+    MTString host;
+    uint16_t port;
+    /* 1: TLS with server_name, offering alpn (comma-separated), without checking the certificate:
+       TLS only makes the connection look like a browser's, MTProto protects what it carries. */
+    uint8_t tls;
+    MTString server_name;
+    MTString alpn;
+    /* 1: the host's WEB proxy carrier rather than a network connection. host and port are the
+       datacenter's, which the relay ignores (it reads the datacenter from the obfuscated stream). */
+    uint8_t carrier;
+} MTStreamTarget;
+
+/* Callbacks get the context given to mt_engine_create and may call the mt_stream_* functions. The host
+   reports each stream's end with mt_stream_closed unless the engine closed it first (close). Each
+   stream stays with the host that opened it. Once mt_engine_destroy is called the host must not call
+   mt_stream_* any more; the close callbacks it gets during mt_engine_destroy only let it free the
+   streams. */
+typedef struct {
+    void (*open)(void *context, uint64_t stream, const MTStreamTarget *target);
+    /* Bytes to send in order; confirm them with mt_stream_sent once the platform took them. */
+    void (*write)(void *context, uint64_t stream, MTBytes bytes);
+    /* The engine is done with the stream; it is not reported on any more. Also during mt_engine_destroy. */
+    void (*close)(void *context, uint64_t stream);
+    /* The host may receive again on a stream it stopped (mt_stream_received returned 0). */
+    void (*resume)(void *context, uint64_t stream);
+} MTStreamHost;
+
+/* NULL removes the host; routes that need one are then not tried. */
+void mt_engine_set_stream_host(MTEngine *engine, const MTStreamHost *host);
+/* The stream is open (TLS done): bytes may go both ways. */
+void mt_stream_opened(MTEngine *engine, uint64_t stream);
+/* 1 while the host may go on receiving; 0: stop until the resume callback. */
+uint8_t mt_stream_received(MTEngine *engine, uint64_t stream, MTBytes bytes);
+void mt_stream_sent(MTEngine *engine, uint64_t stream, size_t count);
+/* The stream ended, cleanly when error is empty; before mt_stream_opened, it could not be opened. */
+void mt_stream_closed(MTEngine *engine, uint64_t stream, MTString error);
 
 MTSessionHandle mt_session_create(MTEngine *engine, const MTSessionSetup *setup);
 void mt_session_destroy(MTEngine *engine, MTSessionHandle session);
@@ -253,6 +304,25 @@ enum {
 /* Which transports the session may use; HTTP goes to `http_port`, or to each address's own port
    when it is 0. Auto stays on TCP while TCP answers and moves to HTTP while it does not. */
 void mt_session_set_transport(MTEngine *engine, MTSessionHandle session, uint8_t transport, uint16_t http_port);
+
+/* Telegram Web's endpoints on one front, through host streams; used only while a stream host is set
+   and no proxy is. When TCP gets no answer, Auto tries the WebSocket endpoint (ws_path, carrying the
+   stream transport) beside plain HTTP, and the HTTPS endpoint (path) once the WebSocket one fails or
+   keeps silent. address, when not empty, is connected to instead of looking host up. */
+typedef struct {
+    MTString host;
+    uint16_t port;
+    MTString path;
+    MTString address;
+    MTString ws_path;
+} MTWebEndpoint;
+
+/* NULL: none. */
+void mt_session_set_web_endpoint(MTEngine *engine, MTSessionHandle session, const MTWebEndpoint *endpoint);
+/* Telegram Web's own endpoints for the session's datacenter: {pluto,venus,aurora,vesta,flora}.web.telegram.org
+   (the -1 fronts for sessions other than the main one), /apiws and /apiw1, or /apiws_test and
+   /apiw_test1 for the test servers. */
+void mt_session_use_telegram_web(MTEngine *engine, MTSessionHandle session, uint8_t test);
 
 /* The engine makes temporary keys that live `lifetime` seconds with these RSA keys and binds them to
    the session's key, which becomes the permanent key, before anything else goes out. 0 when none of

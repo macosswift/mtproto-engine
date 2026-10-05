@@ -36,6 +36,29 @@ RustEngineRuntime (process-wide, lazy) ── mt_engine_create(0 = engine defaul
   `MTContext`, which keeps them for other sessions, later launches and MtProtoKit. CDN sessions still
   take their keys from `MTContext` (`generate_key = 0`) and install them with `mt_session_set_auth_key`.
 - Every non-CDN session runs `MTTransportAuto`: TCP while it answers, HTTP on port 80 while it does not.
+- Route memory: the runtime names the network the device is on (`mt_engine_set_network`, a salted hash
+  of the active interfaces' IPv4 networks and IPv6 /64s plus their services' routers on macOS; VPN
+  tunnels, virtual machine links and link-local addresses ignored, cellular alone is one network) at
+  start and whenever the system reports an interface or route change (SCDynamicStore on macOS,
+  NWPathMonitor on iOS), all on one serial queue. It loads the stored memory at start
+  (`mt_engine_set_route_memory`) and stores what `MTEventKindRouteMemoryChanged` (session 0, reported
+  in the order the memory changed) reports in `UserDefaults` (`mtproto.routeMemory.v1`). On a network
+  where TCP did not get through in the last 7 days, Auto sessions without a proxy try HTTP after 0.3 s
+  of TCP silence instead of 2.5 s; the network is forgotten as soon as such a session's TCP connection
+  there answers. Sessions behind a proxy neither learn nor use the memory.
+- Telegram Web's endpoints: on macOS 10.14+ and iOS 12+ the runtime registers a stream host
+  (`RustStreamHost`, `mt_engine_set_stream_host`) that opens TLS streams with Network.framework: the
+  web host as SNI, ALPN `http/1.1`, no certificate check (TLS only disguises the connection; MTProto
+  protects what it carries), and the system's own TLS stack, so the ClientHello is the platform's.
+  Every non-CDN session gets Telegram Web's endpoints for its datacenter
+  (`mt_session_use_telegram_web`: `{pluto,venus,aurora,vesta,flora}.web.telegram.org`, the `-1` fronts
+  for sessions other than the main one, `/apiws` and `/apiw1`, `/apiws_test` and `/apiw_test1` on the
+  test servers). Once TCP is silent, Auto probes the WebSocket endpoint beside plain HTTP, and HTTPS
+  once the WebSocket fails or stays silent for 1.5 s. A WebSocket that answers carries the session's
+  stream transport as TCP would (obfuscated, pings at least every 45 s because the fronts close idle
+  WebSockets after 91 s), until a TCP recheck answers or it fails twice in a row; HTTP sessions use
+  HTTPS as one more route. A proxy turns them off. The engine opens, writes, confirms and closes host streams like sockets: writes wait while 1 MB
+  is unconfirmed (`mt_stream_sent`), and the host stops receiving at 4 MB held until `resume`.
 - The factory declines (TelegramCore then uses MtProtoKit) in app extensions, when the engine fails to
   start or reports an unknown ABI version, when the active proxy is a WEB proxy, and when
   `apiEnvironment.datacenterAddressOverrides` is set.
@@ -336,8 +359,9 @@ Status (2026-10-02): items 1, 2, 4, 5 and 6 are fixed in the engine by `72d7e51f
 across key swaps, `set_auth_key(None)` keeps requests, live `set_obfuscation_dc_id`, connect
 timeouts report the address, `NetworkUsage` reports cellular). Item 7 is addressed by
 `RustEngineEndToEndTests`, which drives the `mtproto-testserver` binary. Item 8: the iOS Bazel
-targets exist (§2); `build.sh` still builds no iOS slices, which iOS does not use. Item 3 remains
-open. The design agreed for iOS: mirror MtProtoKit's selection, i.e. own sockets when
+targets exist (§2); `build.sh` still builds no iOS slices, which iOS does not use. Item 3 is open
+for stream connections: the host-stream ABI exists and carries HTTP connections (Telegram Web's
+HTTPS endpoint, 2026-10-05), the WEB proxy carrier and WSS are next. The design agreed for iOS: mirror MtProtoKit's selection, i.e. own sockets when
 `context.makeTcpConnectionInterface` is nil and the injected interface (Network.framework,
 the WEB proxy carrier) when set; a host-stream C ABI (`open`/`write`/`read`/`close` callbacks,
 host-to-engine `connected`/`received`/`closed` keyed by session and a never-reused `conn_id`, one

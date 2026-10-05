@@ -6,6 +6,7 @@ mod proxy_secret;
 mod socks5;
 mod stream;
 mod tls;
+mod websocket;
 
 pub use buffer::InputBuffer;
 pub use codec::{
@@ -28,6 +29,9 @@ pub use tls::{
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use tls::{server_hello_for_tests, verify_client_hello_for_tests};
+pub use websocket::{
+    WS_MAX_FRAME_PAYLOAD, WS_MAX_INBOUND_FRAME, WsDeframer, WsError, WsHandshake, accept_for, encode_ws_frames,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TransportError {

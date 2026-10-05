@@ -34,12 +34,14 @@ impl HttpCredentials {
     }
 }
 
-/// Where a POST goes: straight to the datacenter, or to a forwarding proxy that is given the
-/// datacenter's address in the request line.
+/// Where a POST goes: straight to the datacenter, to a forwarding proxy that is given the
+/// datacenter's address in the request line, or to Telegram Web's endpoint on a web front (inside
+/// TLS) at its own path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HttpRoute {
     Direct { authority: String },
     Forwarded { authority: String, credentials: Option<HttpCredentials> },
+    Web { host: String, path: String },
 }
 
 pub fn authority(host: &str, port: u16) -> String {
@@ -67,6 +69,13 @@ pub fn write_post_head(route: &HttpRoute, body_len: usize, out: &mut Vec<u8>) {
                 out.extend_from_slice(credentials.header_value().as_bytes());
                 out.extend_from_slice(b"\r\n");
             }
+        }
+        HttpRoute::Web { host, path } => {
+            out.extend_from_slice(b"POST ");
+            out.extend_from_slice(path.as_bytes());
+            out.extend_from_slice(b" HTTP/1.1\r\nHost: ");
+            out.extend_from_slice(host.as_bytes());
+            out.extend_from_slice(b"\r\nConnection: keep-alive\r\n");
         }
     }
     out.extend_from_slice(b"Content-Type: application/octet-stream\r\nContent-Length: ");
@@ -556,6 +565,12 @@ mod tests {
         assert!(text.starts_with("POST http://[2001:b28:f23d:f001::a]:80/api HTTP/1.1\r\n"), "{text}");
         assert!(text.contains("\r\nProxy-Authorization: Basic dXNlcjpwYXNz\r\n"), "{text}");
         assert!(text.ends_with("Content-Length: 0\r\n\r\n"));
+        let mut out = Vec::new();
+        encode_post(&HttpRoute::Web { host: "venus.web.telegram.org".into(), path: "/apiw1".into() }, b"ab", &mut out);
+        assert_eq!(
+            out,
+            b"POST /apiw1 HTTP/1.1\r\nHost: venus.web.telegram.org\r\nConnection: keep-alive\r\nContent-Type: application/octet-stream\r\nContent-Length: 2\r\n\r\nab"
+        );
     }
 
     #[test]

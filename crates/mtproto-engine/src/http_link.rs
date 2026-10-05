@@ -2,14 +2,15 @@ use std::collections::VecDeque;
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::SocketAddr;
 
-use mio::net::TcpStream;
-use mio::{Interest, Registry, Token};
+use mio::{Registry, Token};
 use mtproto_core::transport::{
     HttpError, HttpResponse, HttpResponseReader, HttpRoute, InputBuffer, Socks5Auth, Socks5Error, Socks5Handshake,
     Socks5Progress, Socks5Target, write_post_head,
 };
 
-use crate::connection::{WRITE_COMPACT_THRESHOLD, kernel_send_queue};
+use crate::connection::WRITE_COMPACT_THRESHOLD;
+use crate::host_stream::HostPipe;
+use crate::pipe::Pipe;
 
 /// Connections one session keeps to the HTTP endpoint at most; browsers allow six per host.
 pub const HTTP_MAX_CONNECTIONS: usize = 6;
@@ -74,7 +75,7 @@ pub enum HttpIo {
 
 /// One keep-alive HTTP/1.1 connection carrying one request at a time.
 pub struct HttpConn {
-    socket: TcpStream,
+    pipe: Pipe,
     token: Token,
     phase: Phase,
     pending_socks: Option<(Socks5Target, Option<Socks5Auth>)>,
@@ -97,7 +98,12 @@ pub struct HttpConn {
     pub last_progress_at: f64,
     pub idle_since: f64,
     pub responses: u32,
+    /// Response bytes came on it, whole or not: the server, or something on the way, answered.
+    pub heard: bool,
     pub keep_alive: bool,
+    /// What it carries went again elsewhere after its answer ran late; it is kept until then for the
+    /// late answer, rather than paying for a new connection on a slow link.
+    pub hedged_at: Option<f64>,
     pub cellular: bool,
     pub bytes_in: u64,
     pub bytes_out: u64,
@@ -113,10 +119,25 @@ impl HttpConn {
         address_index: usize,
         now: f64,
     ) -> io::Result<Self> {
-        let mut socket = TcpStream::connect(address)?;
-        registry.register(&mut socket, token, Interest::READABLE | Interest::WRITABLE)?;
-        Ok(Self {
-            socket,
+        let pipe = Pipe::connect(registry, token, address)?;
+        Ok(Self::over(pipe, token, route, socks, address_index, now))
+    }
+
+    /// A connection over a stream the host opened, TLS included.
+    pub fn over_host(pipe: HostPipe, token: Token, route: HttpRoute, address_index: usize, now: f64) -> Self {
+        Self::over(Pipe::Host(pipe), token, route, None, address_index, now)
+    }
+
+    fn over(
+        pipe: Pipe,
+        token: Token,
+        route: HttpRoute,
+        socks: Option<(Socks5Target, Option<Socks5Auth>)>,
+        address_index: usize,
+        now: f64,
+    ) -> Self {
+        Self {
+            pipe,
             token,
             phase: Phase::Connecting,
             pending_socks: socks,
@@ -138,11 +159,17 @@ impl HttpConn {
             last_progress_at: now,
             idle_since: now,
             responses: 0,
+            heard: false,
             keep_alive: true,
+            hedged_at: None,
             cellular: false,
             bytes_in: 0,
             bytes_out: 0,
-        })
+        }
+    }
+
+    pub fn is_host_stream(&self) -> bool {
+        self.pipe.is_host()
     }
 
     pub fn token(&self) -> Token {
@@ -158,6 +185,34 @@ impl HttpConn {
         self.in_flight.is_empty() && self.keep_alive
     }
 
+    /// Its requests go again elsewhere; it keeps waiting for their answers, takes nothing new until
+    /// they come, and is free again once they did.
+    pub fn hedge(&mut self, now: f64) -> Vec<RequestMeta> {
+        self.hedged_at = Some(now);
+        self.in_flight.iter().map(|request| request.meta).collect()
+    }
+
+    /// Bytes of the uploads (requests from `upload_min` bytes on) it carries that were not answered.
+    pub fn upload_bytes_in_flight(&self, upload_min: usize) -> usize {
+        if self.hedged_at.is_some() {
+            return 0;
+        }
+        self.in_flight.iter().map(|request| request.meta.bytes).filter(|bytes| *bytes >= upload_min).sum()
+    }
+
+    /// Some request it carries is of the kind `matches` picks.
+    pub fn carries(&self, matches: impl Fn(&RequestMeta) -> bool) -> bool {
+        self.in_flight.iter().any(|request| matches(&request.meta))
+    }
+
+    /// Uploads (requests from `upload_min` bytes on) it is sending or sent that were not answered.
+    pub fn uploads_in_flight(&self, upload_min: usize) -> usize {
+        if self.hedged_at.is_some() || !self.is_ready() {
+            return 0;
+        }
+        self.in_flight.iter().filter(|request| request.meta.bytes >= upload_min).count()
+    }
+
     pub fn in_flight_len(&self) -> usize {
         self.in_flight.len()
     }
@@ -167,14 +222,17 @@ impl HttpConn {
     pub fn takes_pipelined(&self, depth: usize) -> bool {
         self.is_ready()
             && self.keep_alive
+            && self.hedged_at.is_none()
             && self.in_flight.len() < depth
             && self.in_flight.iter().all(|request| request.meta.max_wait == 0.0)
-            && matches!(self.route, HttpRoute::Direct { .. })
+            && matches!(self.route, HttpRoute::Direct { .. } | HttpRoute::Web { .. })
     }
 
-    /// A request carrying queries is held at the server for their answers.
+    /// A request carrying queries is held at the server for their answers. Not on a hedged connection:
+    /// its queries went again elsewhere.
     pub fn waits_on_queries(&self) -> bool {
-        self.in_flight.iter().any(|request| !request.meta.slot && request.meta.max_wait > 0.0)
+        self.hedged_at.is_none()
+            && self.in_flight.iter().any(|request| !request.meta.slot && request.meta.max_wait > 0.0)
     }
 
     pub fn has_slot(&self) -> bool {
@@ -203,8 +261,7 @@ impl HttpConn {
     }
 
     pub fn deregister(&mut self, registry: &Registry) {
-        let _ = registry.deregister(&mut self.socket);
-        let _ = self.socket.shutdown(std::net::Shutdown::Both);
+        self.pipe.close(registry);
     }
 
     pub fn submit(
@@ -228,21 +285,10 @@ impl HttpConn {
     pub fn handle_writable(&mut self, registry: &Registry, now: f64) -> Result<bool, HttpConnError> {
         let mut became_ready = false;
         if matches!(self.phase, Phase::Connecting) {
-            if let Some(error) = self.socket.take_error().map_err(HttpConnError::Io)? {
-                return Err(HttpConnError::Io(error));
+            if !self.pipe.finish_connect().map_err(HttpConnError::Io)? {
+                return Ok(false);
             }
-            match self.socket.peer_addr() {
-                Ok(_) => {}
-                Err(error) if error.kind() == ErrorKind::NotConnected => return Ok(false),
-                Err(error) => return Err(HttpConnError::Io(error)),
-            }
-            let _ = self.socket.set_nodelay(true);
-            self.cellular = self
-                .socket
-                .local_addr()
-                .ok()
-                .and_then(|address| crate::interface::interface_name_for(address.ip()))
-                .is_some_and(|name| crate::interface::is_cellular_interface(&name));
+            self.cellular = self.pipe.is_cellular();
             match self.pending_socks.take() {
                 Some((target, auth)) => {
                     let (handshake, greeting) = Socks5Handshake::new(target, auth).map_err(HttpConnError::Socks)?;
@@ -265,7 +311,7 @@ impl HttpConn {
             Phase::Connecting => return Ok(()),
             Phase::Socks(_) => {
                 while !self.socks_out.is_empty() {
-                    match self.socket.write(&self.socks_out) {
+                    match self.pipe.write(&self.socks_out) {
                         Ok(0) => return Err(HttpConnError::Closed),
                         Ok(written) => {
                             self.bytes_out += written as u64;
@@ -279,7 +325,7 @@ impl HttpConn {
             }
             Phase::Ready => {
                 while self.write_offset < self.write_buffer.len() {
-                    match self.socket.write(&self.write_buffer[self.write_offset..]) {
+                    match self.pipe.write(&self.write_buffer[self.write_offset..]) {
                         Ok(0) => return Err(HttpConnError::Closed),
                         Ok(written) => {
                             self.write_offset += written;
@@ -311,8 +357,7 @@ impl HttpConn {
             Phase::Ready => self.write_offset < self.write_buffer.len(),
         };
         if needs_writable != self.writable_interest {
-            let interest = if needs_writable { Interest::READABLE | Interest::WRITABLE } else { Interest::READABLE };
-            registry.reregister(&mut self.socket, self.token, interest).map_err(HttpConnError::Io)?;
+            self.pipe.set_writable_interest(registry, self.token, needs_writable).map_err(HttpConnError::Io)?;
             self.writable_interest = needs_writable;
         }
         Ok(())
@@ -320,7 +365,7 @@ impl HttpConn {
 
     /// The peer acknowledged request bytes it had not before: an upload is crossing.
     pub fn note_outbound_progress(&mut self, now: f64) {
-        let Some(queued) = kernel_send_queue(&self.socket) else {
+        let Some(queued) = self.pipe.send_queue() else {
             return;
         };
         let acknowledged = self.written_total.saturating_sub(queued as u64);
@@ -335,8 +380,7 @@ impl HttpConn {
 
     /// Bytes handed over for requests the peer has not acknowledged yet, where the kernel says.
     pub fn unacknowledged_out(&self) -> Option<u64> {
-        kernel_send_queue(&self.socket)
-            .map(|queued| queued as u64 + (self.write_buffer.len() - self.write_offset) as u64)
+        self.pipe.send_queue().map(|queued| queued as u64 + (self.write_buffer.len() - self.write_offset) as u64)
     }
 
     /// Reads up to `budget` bytes. Ok(true) when the budget ran out with more possibly waiting.
@@ -353,7 +397,7 @@ impl HttpConn {
             if read_total >= budget {
                 return Ok(true);
             }
-            let read = match self.socket.read(scratch) {
+            let read = match self.pipe.read(scratch) {
                 Ok(0) => {
                     if let Some(response) = self.reader.finish().map_err(HttpConnError::Http)? {
                         self.complete(response, now, out)?;
@@ -402,6 +446,7 @@ impl HttpConn {
             return Ok(());
         }
         self.last_progress_at = now;
+        self.heard = true;
         self.head_started_at.get_or_insert(now);
         loop {
             if self.in_flight.is_empty() {
@@ -434,6 +479,7 @@ impl HttpConn {
         self.keep_alive &= response.keep_alive;
         if self.in_flight.is_empty() {
             self.idle_since = now;
+            self.hedged_at = None;
         }
         let waited = now - request.written_at.unwrap_or(request.meta.queued_at);
         out.push(HttpIo::Response { meta: request.meta, response, waited });

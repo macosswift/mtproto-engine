@@ -15,6 +15,7 @@ libc = "=0.2.189"
 mtproto-core = { path = "../mtproto-core", features = ["test-support"] }
 mtproto-testserver = { path = "../mtproto-testserver" }
 mtproto-netsim = { path = "../mtproto-netsim" }
+rustls = { workspace = true }
 
 [lints]
 workspace = true

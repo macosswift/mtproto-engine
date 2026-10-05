@@ -38,6 +38,8 @@ pub enum Command {
     SetObfuscationDcId(SessionHandle, i16),
     SetProxy(SessionHandle, Option<ProxyConfig>),
     SetTransport(SessionHandle, crate::types::TransportPreference, Option<u16>),
+    SetWebEndpoint(SessionHandle, Option<Box<crate::types::WebEndpoint>>),
+    UseTelegramWeb(SessionHandle, bool),
     EnablePfs(SessionHandle, Box<crate::types::PfsSetup>),
     OfferTemporaryKey(SessionHandle, Box<crate::types::BoundTemporaryKey>),
     AllowPermanentKey(SessionHandle, bool),
@@ -108,6 +110,8 @@ pub struct Worker {
     more_readable: VecDeque<SessionHandle>,
     uploads: Arc<Uploads>,
     hints: Arc<crate::route_hints::RouteHints>,
+    streams: Arc<crate::host_stream::HostStreams>,
+    signal: Option<Arc<crate::host_stream::WorkerSignal>>,
 }
 
 impl Worker {
@@ -137,7 +141,20 @@ impl Worker {
             more_readable: VecDeque::new(),
             uploads: Arc::default(),
             hints: Arc::default(),
+            streams: Arc::default(),
+            signal: None,
         }
+    }
+
+    /// Lets the sessions use streams the host opens; their news reaches this worker through `signal`.
+    pub fn sharing_host_streams(
+        mut self,
+        streams: Arc<crate::host_stream::HostStreams>,
+        signal: Arc<crate::host_stream::WorkerSignal>,
+    ) -> Self {
+        self.streams = streams;
+        self.signal = Some(signal);
+        self
     }
 
     /// Lets the sessions learn from the other workers' sessions which transports get through.
@@ -176,29 +193,13 @@ impl Worker {
                 if event.token() == WAKER_TOKEN {
                     continue;
                 }
-                let Some(handle) = self.tokens.get(&session_token(event.token())).copied() else {
-                    continue;
-                };
-                if let Some(session) = self.sessions.get_mut(&handle) {
-                    let readable = event.is_readable() || event.is_read_closed() || event.is_error();
-                    let writable = event.is_writable() || event.is_write_closed();
-                    if readable {
-                        carried.retain(|other| *other != handle);
-                    }
-                    let more = session.handle_io(
-                        event.token(),
-                        readable,
-                        writable,
-                        self.poll.registry(),
-                        &mut self.scratch,
-                        now,
-                        &self.callbacks,
-                        &mut self.rng,
-                    );
-                    if more {
-                        self.more_readable.push_back(handle);
-                    }
-                }
+                let readable = event.is_readable() || event.is_read_closed() || event.is_error();
+                let writable = event.is_writable() || event.is_write_closed();
+                self.dispatch_io(event.token(), readable, writable, now, &mut carried);
+            }
+            let host_ready = self.signal.as_ref().map(|signal| signal.take()).unwrap_or_default();
+            for token in host_ready {
+                self.dispatch_io(token, true, true, now, &mut carried);
             }
             for handle in carried {
                 if let Some(session) = self.sessions.get_mut(&handle)
@@ -232,6 +233,9 @@ impl Worker {
                     &mut self.rng,
                 );
             }
+            self.hints.report_change(now.unix, |memory| {
+                self.callbacks.on_event(SessionHandle(0), EngineEvent::RouteMemory { memory });
+            });
             if now.mono - self.last_shrink > SHRINK_INTERVAL {
                 self.last_shrink = now.mono;
                 for session in self.sessions.values_mut() {
@@ -243,6 +247,38 @@ impl Worker {
                     self.scratch = vec![0u8; 256 * 1024];
                 }
             }
+        }
+    }
+
+    fn dispatch_io(
+        &mut self,
+        token: Token,
+        readable: bool,
+        writable: bool,
+        now: mtproto_core::session::Now,
+        carried: &mut VecDeque<SessionHandle>,
+    ) {
+        let Some(handle) = self.tokens.get(&session_token(token)).copied() else {
+            return;
+        };
+        let Some(session) = self.sessions.get_mut(&handle) else {
+            return;
+        };
+        if readable && session.active_token() == Some(token) {
+            carried.retain(|other| *other != handle);
+        }
+        let more = session.handle_io(
+            token,
+            readable,
+            writable,
+            self.poll.registry(),
+            &mut self.scratch,
+            now,
+            &self.callbacks,
+            &mut self.rng,
+        );
+        if more {
+            self.more_readable.push_back(handle);
         }
     }
 
@@ -264,6 +300,9 @@ impl Worker {
                     let mut runtime = SessionRuntime::new(handle, *setup, token, now, &mut self.rng);
                     runtime.share_uploads(self.uploads.clone());
                     runtime.share_route_hints(self.hints.clone());
+                    if let Some(signal) = &self.signal {
+                        runtime.share_host_streams(self.streams.clone(), signal.clone());
+                    }
                     runtime.set_network_available(self.network_available, now, self.poll.registry());
                     self.tokens.insert(token, handle);
                     self.sessions.insert(handle, runtime);
@@ -344,6 +383,18 @@ impl Worker {
                 Command::SetTransport(handle, transport, http_port) => {
                     if let Some(session) = self.sessions.get_mut(&handle) {
                         session.set_transport(transport, http_port, now, self.poll.registry());
+                    }
+                }
+                Command::SetWebEndpoint(handle, endpoint) => {
+                    if let Some(session) = self.sessions.get_mut(&handle) {
+                        session.set_web_endpoint(endpoint.map(|endpoint| *endpoint), self.poll.registry(), now);
+                    }
+                }
+                Command::UseTelegramWeb(handle, test) => {
+                    if let Some(session) = self.sessions.get_mut(&handle) {
+                        let endpoint =
+                            crate::types::WebEndpoint::telegram(session.datacenter_id(), session.role(), test);
+                        session.set_web_endpoint(endpoint, self.poll.registry(), now);
                     }
                 }
                 Command::UpdateEnvironment(handle, environment, noop) => {

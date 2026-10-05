@@ -34,16 +34,35 @@ pub const HTTP_SPARE_IDLE_AFTER: f64 = 5.0;
 pub const HTTP_RESPONSE_TIMEOUT_INITIAL: f64 = 4.0;
 pub const HTTP_RESPONSE_TIMEOUT_MIN: f64 = 1.0;
 pub const HTTP_RESPONSE_TIMEOUT_MAX: f64 = 8.0;
-/// The uplink assumed for a request body until one was measured.
-pub const HTTP_UPLINK_INITIAL: f64 = 32.0 * 1024.0;
+/// The uplink assumed for request bodies until one was measured: as slow as GPRS, since a body taken
+/// for lost while it is still on its way goes again over the same starved uplink.
+pub const HTTP_UPLINK_INITIAL: f64 = 4.0 * 1024.0;
+/// Request bodies from this size on are uploads: their deadline allows for the uplink, and a late one
+/// is never sent twice at once.
+pub const HTTP_UPLOAD_MIN: usize = 16 * 1024;
 pub const HTTP_UPLINK_MIN: f64 = 4.0 * 1024.0;
 pub const HTTP_TRANSFER_ALLOWANCE_MAX: f64 = 120.0;
 pub const HTTP_MAX_CONNECTING: usize = 2;
 pub const HTTP_READ_BUDGET: usize = 512 * 1024;
 pub const HTTP_PIPELINE_DEPTH: usize = 2;
+/// A connection whose answer ran late is kept at least this long after its requests went again
+/// elsewhere: on a slow link the late answer usually comes, and a new connection costs round trips.
+pub const HTTP_HEDGE_HOLD_MIN: f64 = 8.0;
+pub const HTTP_MAX_HEDGED: usize = 2;
+/// The longest a cut waits while the latest connection cut got no response bytes: a link that refuses
+/// every connection, as through an outage, gets its first one through soon after it comes back.
+pub const HTTP_UNHEARD_CUT_MAX_DELAY: f64 = 4.0;
 
 /// A name a connection was opened to, and which of its addresses.
 type NamedAddress = ((String, u16), SocketAddr);
+
+/// One way to the HTTP endpoint: a datacenter address on a port, or Telegram Web's endpoint over TLS.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct HttpCandidate {
+    pub(super) host: String,
+    pub(super) port: u16,
+    pub(super) web: bool,
+}
 
 #[derive(Default)]
 pub(super) struct HttpState {
@@ -55,8 +74,11 @@ pub(super) struct HttpState {
     /// Connections to an address of a name: which name, and which of its addresses.
     named: Vec<(Token, NamedAddress)>,
     /// Connections in a row that opened and then went without a single answer, as when a middlebox
-    /// cuts every request: they back off like flapping stream connections.
+    /// cuts every request: they back off like flapping stream connections, up to
+    /// `HTTP_UNHEARD_CUT_MAX_DELAY` while the latest of them was cut before any response bytes.
     cut_in_a_row: u32,
+    /// The latest of those got response bytes before it was cut.
+    cut_after_bytes: bool,
     health: HashMap<(String, u16), AddressHealth>,
     cursor: usize,
     more_readable: Vec<Token>,
@@ -65,7 +87,8 @@ pub(super) struct HttpState {
     /// Connections that decrypted a packet, by token.
     proven: Vec<Token>,
     handshake_token: Option<Token>,
-    /// Bytes per second request bodies crossed the uplink at, lately.
+    /// Bytes per second the whole uplink carried request bodies at, lately: one upload's rate times the
+    /// uploads that shared the link with it.
     uplink_rate: Option<f64>,
     logged_proxy: bool,
     /// Nothing is sent before then: the server asked to back off (-429) or refused the request.
@@ -108,6 +131,7 @@ impl HttpState {
         self.next_open_at = 0.0;
         self.open_failures = 0;
         self.cut_in_a_row = 0;
+        self.cut_after_bytes = false;
     }
 
     /// Long polls parked. While a reset waits for the old session's answers only those on connections
@@ -180,12 +204,13 @@ impl HttpState {
             })
             .collect();
         format!(
-            "http(opened {} next_open {:+.3} hold {:+.3} open_failures {} cut {} route_checked {} check_needed {} check_sent {} handshake_token {:?} answered {} named {} conns {})",
+            "http(opened {} next_open {:+.3} hold {:+.3} open_failures {} cut {} after_bytes {} route_checked {} check_needed {} check_sent {} handshake_token {:?} answered {} named {} conns {})",
             self.opened,
             self.next_open_at - now,
             self.hold_until - now,
             self.open_failures,
             self.cut_in_a_row,
+            self.cut_after_bytes,
             self.route_checked,
             self.route_check_needed,
             self.route_check_nonce.is_some(),
@@ -251,20 +276,32 @@ impl SessionRuntime {
         self.http = Some(http);
     }
 
-    fn http_candidates(&self) -> Vec<(usize, String, u16)> {
-        self.setup
+    fn http_candidates(&self) -> Vec<HttpCandidate> {
+        let mut candidates: Vec<HttpCandidate> = self
+            .setup
             .addresses
             .iter()
-            .enumerate()
-            .filter(|(_, address)| address.secret.is_none())
-            .flat_map(|(index, address)| {
+            .filter(|address| address.secret.is_none())
+            .flat_map(|address| {
                 let mut ports = vec![self.setup.http_port.unwrap_or(address.port)];
                 if !ports.contains(&address.port) {
                     ports.push(address.port);
                 }
-                ports.into_iter().map(move |port| (index, address.host.clone(), port))
+                ports.into_iter().map(move |port| HttpCandidate { host: address.host.clone(), port, web: false })
             })
-            .collect()
+            .collect();
+        if let Some(web) = self.web_endpoint() {
+            candidates.push(HttpCandidate { host: web.host.clone(), port: web.port, web: true });
+        }
+        candidates
+    }
+
+    /// Telegram Web's endpoint, when the host can open streams to it and no proxy is set (the proxy is
+    /// the way around then).
+    pub(super) fn web_endpoint(&self) -> Option<&crate::types::WebEndpoint> {
+        self.setup.web.as_ref().filter(|_| {
+            self.setup.proxy.is_none() && self.host_streams.as_ref().is_some_and(|(streams, _)| streams.available())
+        })
     }
 
     fn http_route(&self, host: &str, port: u16) -> HttpRoute {
@@ -298,12 +335,12 @@ impl SessionRuntime {
         {
             return None;
         }
-        if matches!(self.setup.proxy, Some(ProxyConfig::MtProxy { .. })) {
+        if self.setup.proxy_blocks_http() {
             if let Some(http) = &mut self.http
                 && !http.logged_proxy
             {
                 http.logged_proxy = true;
-                self.log(callbacks, LogLevel::Warning, "HTTP cannot go through an MTProxy");
+                self.log(callbacks, LogLevel::Warning, "HTTP cannot go through an MTProxy or a WEB proxy");
             }
             return None;
         }
@@ -313,13 +350,13 @@ impl SessionRuntime {
         }
         let ranked = {
             let http = self.http.as_ref()?;
-            let rank =
-                |host: &String, port: u16| http.health.get(&(host.clone(), port)).copied().unwrap_or_default().rank();
+            let rank = |candidate: &HttpCandidate| {
+                http.health.get(&(candidate.host.clone(), candidate.port)).copied().unwrap_or_default().rank()
+            };
             let mut order: Vec<usize> = (0..candidates.len()).collect();
             let start = http.cursor % candidates.len();
             order.sort_by(|a, b| {
-                let (left, right) =
-                    (rank(&candidates[*a].1, candidates[*a].2), rank(&candidates[*b].1, candidates[*b].2));
+                let (left, right) = (rank(&candidates[*a]), rank(&candidates[*b]));
                 let distance = |index: usize| (index + candidates.len() - start) % candidates.len();
                 left.0.cmp(&right.0).then(left.1.total_cmp(&right.1)).then(distance(*a).cmp(&distance(*b)))
             });
@@ -331,14 +368,45 @@ impl SessionRuntime {
             .conns
             .iter()
             .filter(|conn| !conn.is_ready())
-            .filter_map(|conn| candidates.get(conn.address_index).map(|(_, host, port)| (host.clone(), *port)))
+            .filter_map(|conn| {
+                candidates.get(conn.address_index).map(|candidate| (candidate.host.clone(), candidate.port))
+            })
             .collect();
-        let choice = ranked
-            .iter()
-            .copied()
-            .find(|index| !connecting.contains(&(candidates[*index].1.clone(), candidates[*index].2)))
-            .unwrap_or(ranked[0]);
-        let (_, host, port) = candidates[choice].clone();
+        let proven = {
+            let http = self.http.as_ref()?;
+            let best = &candidates[ranked[0]];
+            let patience = self.http_response_timeout().max(2.0);
+            let stuck = http.conns.iter().any(|conn| {
+                !conn.is_ready() && conn.address_index == ranked[0] && now.mono - conn.started_at > patience
+            });
+            !stuck && http.health.get(&(best.host.clone(), best.port)).copied().unwrap_or_default().rank().0 == 0
+        };
+        let choice = if proven {
+            ranked[0]
+        } else {
+            ranked
+                .iter()
+                .copied()
+                .find(|index| !connecting.contains(&(candidates[*index].host.clone(), candidates[*index].port)))
+                .unwrap_or(ranked[0])
+        };
+        if candidates[choice].web {
+            let token = self.http_free_token()?;
+            return match self.open_web_conn(choice, token, now) {
+                Some(conn) => {
+                    let http = self.http.as_mut()?;
+                    http.cursor = choice + 1;
+                    http.conns.push(conn);
+                    Some(http.conns.len() - 1)
+                }
+                None => {
+                    self.note_http_address(choice, false, now);
+                    self.note_http_open_failure(now);
+                    None
+                }
+            };
+        }
+        let HttpCandidate { host, port, .. } = candidates[choice].clone();
         let (connect_host, connect_port, socks) = match &self.setup.proxy {
             Some(ProxyConfig::Socks5 { host: proxy_host, port: proxy_port, username, password }) => {
                 let target = match parse_literal(&host, port) {
@@ -457,13 +525,16 @@ impl SessionRuntime {
                 reconnect_delay(http.open_failures, jitter)
             };
             let cut = mtproto_core::transport::flap_delay(http.cut_in_a_row, jitter);
+            let cap = HTTP_UNHEARD_CUT_MAX_DELAY
+                * (1.0 - mtproto_core::transport::RECONNECT_JITTER * f64::from(jitter) / f64::from(u32::MAX));
+            let cut = if http.cut_after_bytes { cut } else { cut.min(cap) };
             http.next_open_at = http.next_open_at.max(now.mono + delay.max(cut).max(0.05));
         }
     }
 
     fn note_http_address(&mut self, candidate: usize, success: bool, now: Now) {
         let candidates = self.http_candidates();
-        let Some((_, host, port)) = candidates.get(candidate).cloned() else {
+        let Some(HttpCandidate { host, port, .. }) = candidates.get(candidate).cloned() else {
             return;
         };
         if let Some(http) = &mut self.http {
@@ -507,7 +578,7 @@ impl SessionRuntime {
 
     /// Some HTTP route exists at all: an address without a secret, and no MTProxy in the way.
     pub(super) fn http_route_possible(&self) -> bool {
-        !matches!(self.setup.proxy, Some(ProxyConfig::MtProxy { .. })) && !self.http_candidates().is_empty()
+        !self.setup.proxy_blocks_http() && !self.http_candidates().is_empty()
     }
 
     /// A request could go out now: a connection takes one, or one may be opened.
@@ -524,7 +595,7 @@ impl SessionRuntime {
         now.mono >= http.next_open_at
             && http.conns.len() < HTTP_MAX_CONNECTIONS
             && http.conns.iter().filter(|conn| !conn.is_ready()).count() < HTTP_MAX_CONNECTING
-            && !matches!(self.setup.proxy, Some(ProxyConfig::MtProxy { .. }))
+            && !self.setup.proxy_blocks_http()
             && !self.http_candidates().is_empty()
     }
 
@@ -534,16 +605,18 @@ impl SessionRuntime {
         })
     }
 
+    /// The time an upload gets to cross the uplink: every upload in flight shares it, at half the
+    /// measured rate of the whole uplink, or at the initial rate before one is measured.
     fn http_transfer_allowance(&self, bytes: usize) -> f64 {
-        if bytes < 16 * 1024 {
+        if bytes < HTTP_UPLOAD_MIN {
             return 0.0;
         }
-        let rate = self
-            .http
-            .as_ref()
-            .and_then(|http| http.uplink_rate)
-            .map_or(HTTP_UPLINK_INITIAL, |rate| (rate * 0.5).max(HTTP_UPLINK_MIN));
-        (bytes as f64 / rate).min(HTTP_TRANSFER_ALLOWANCE_MAX)
+        let Some(http) = self.http.as_ref() else {
+            return 0.0;
+        };
+        let rate = http.uplink_rate.map_or(HTTP_UPLINK_INITIAL, |rate| (rate * 0.5).max(HTTP_UPLINK_MIN));
+        let in_flight: usize = http.conns.iter().map(|conn| conn.upload_bytes_in_flight(HTTP_UPLOAD_MIN)).sum();
+        (in_flight.max(bytes) as f64 / rate).min(HTTP_TRANSFER_ALLOWANCE_MAX)
     }
 
     /// When connection `index` has to have shown progress by, or is given up on.
@@ -552,6 +625,15 @@ impl SessionRuntime {
             return Some(conn.started_at + config.connect_timeout);
         }
         let timeout = self.http_response_timeout();
+        if let Some(hedged_at) = conn.hedged_at
+            && conn.response_in_progress().is_none()
+        {
+            let deadline = hedged_at.max(conn.last_progress_at) + (timeout * 2.0).max(HTTP_HEDGE_HOLD_MIN);
+            return Some(match conn.head_in_progress() {
+                Some(started) => deadline.min(started + timeout + FRAME_PROGRESS_GRACE),
+                None => deadline,
+            });
+        }
         if let Some((received, started_at)) = conn.response_in_progress() {
             let stalled = conn.last_progress_at + timeout.max(FRAME_PROGRESS_GRACE / 2.0);
             let trickle = started_at + FRAME_PROGRESS_GRACE + received as f64 / FRAME_MIN_RATE;
@@ -954,9 +1036,72 @@ impl SessionRuntime {
             })
             .unwrap_or_default();
         for (token, reason) in expired {
+            if reason == DropReason::RequestTimeout && self.hedge_http_conn(token, now) {
+                self.log(callbacks, LogLevel::Info, "HTTP answer late; its requests go again elsewhere");
+                continue;
+            }
             self.log(callbacks, LogLevel::Info, &format!("HTTP {}", reason.name()));
             self.fail_http_conn_token(token, reason, true, registry, now, callbacks);
         }
+    }
+
+    /// A connection whose answer is late although it carried the request whole: its queries go again
+    /// elsewhere while it waits on. A route check stays its own (asked anew, the late answer would no
+    /// longer match). Not a long poll (one past its wait is dead, and kept it would hold the slot an
+    /// answer needs), not one carrying an upload (twice at once would halve a starved uplink) or a
+    /// handshake step (nothing goes again for it), not twice, and not more than `HTTP_MAX_HEDGED` at
+    /// once, so dead connections never take every slot from fresh ones.
+    fn hedge_http_conn(&mut self, token: Token, now: Now) -> bool {
+        let Some(http) = &mut self.http else {
+            return false;
+        };
+        if http.conns.iter().filter(|conn| conn.hedged_at.is_some()).count() >= HTTP_MAX_HEDGED {
+            return false;
+        }
+        let Some(conn) = http.conns.iter_mut().find(|conn| conn.token() == token) else {
+            return false;
+        };
+        if conn.hedged_at.is_some()
+            || conn.has_slot()
+            || conn.carries(|meta| meta.bytes >= HTTP_UPLOAD_MIN || (meta.packet_seq.is_none() && !meta.probe))
+            || conn.head().is_none_or(|(written_at, _)| written_at.is_none())
+        {
+            return false;
+        }
+        let lost: Vec<RequestMeta> = conn.hedge(now.mono).into_iter().filter(|meta| !meta.probe).collect();
+        self.note_http_requests_lost(&lost, now);
+        true
+    }
+
+    /// Closes the connections to Telegram Web's endpoint, before it changes: what they carried goes
+    /// again. A change the host asked for, not a failure of the old endpoint.
+    pub(super) fn retire_web_conns(&mut self, registry: &Registry, now: Now) {
+        let Some(http) = &mut self.http else {
+            return;
+        };
+        let tokens: Vec<Token> = http.conns.iter().filter(|conn| conn.is_host_stream()).map(HttpConn::token).collect();
+        let mut lost = Vec::new();
+        let mut usage = (0, 0);
+        let mut handshake = false;
+        for token in tokens {
+            let Some(index) = http.index(token) else {
+                continue;
+            };
+            let mut conn = http.conns.remove(index);
+            http.more_readable.retain(|other| *other != token);
+            http.proven.retain(|other| *other != token);
+            http.named.retain(|(other, _)| *other != token);
+            handshake |= http.handshake_token == Some(token);
+            lost.extend(conn.lost_requests());
+            usage = (usage.0 + conn.bytes_in, usage.1 + conn.bytes_out);
+            conn.deregister(registry);
+        }
+        self.reported_in += usage.0;
+        self.reported_out += usage.1;
+        if handshake {
+            self.abandon_http_handshake();
+        }
+        self.note_http_requests_lost(&lost, now);
     }
 
     /// Gives up on a connection: what it carried counts as lost, so its queries go again elsewhere.
@@ -989,6 +1134,7 @@ impl SessionRuntime {
         let named = http.named.iter().position(|(other, _)| *other == token).map(|at| http.named.remove(at).1);
         let age = now.mono - conn.started_at;
         let established = conn.established_at.is_some();
+        let heard = conn.heard;
         let candidate = conn.address_index;
         self.reported_in += conn.bytes_in;
         self.reported_out += conn.bytes_out;
@@ -1014,6 +1160,7 @@ impl SessionRuntime {
                 && let Some(http) = &mut self.http
             {
                 http.cut_in_a_row = http.cut_in_a_row.saturating_add(1);
+                http.cut_after_bytes = heard;
             }
             self.note_http_address(candidate, false, now);
             self.note_http_open_failure(now);
@@ -1233,11 +1380,11 @@ impl SessionRuntime {
             | Some(ProxyConfig::Http { host: proxy_host, port: proxy_port, .. }) => {
                 proxy_host == host && *proxy_port == port
             }
-            Some(ProxyConfig::MtProxy { .. }) => false,
+            Some(ProxyConfig::MtProxy { .. }) | Some(ProxyConfig::Web { .. }) => false,
             None => self
                 .http_candidates()
                 .iter()
-                .any(|(_, candidate, candidate_port)| candidate == host && *candidate_port == port),
+                .any(|candidate| !candidate.web && candidate.host == host && candidate.port == port),
         }
     }
 
@@ -1422,12 +1569,15 @@ impl SessionRuntime {
                     rpc.session_mut().note_rtt_sample(sample);
                 }
             }
-            if meta.bytes >= 16 * 1024 && waited > 0.0 && !meta.slot {
-                let sample = meta.bytes as f64 / waited;
-                if let Some(http) = &mut self.http {
-                    http.uplink_rate =
-                        Some(http.uplink_rate.map_or(sample, |rate| rate * 0.7 + sample.min(rate * 4.0) * 0.3));
-                }
+            if meta.bytes >= HTTP_UPLOAD_MIN
+                && waited > 0.0
+                && !meta.slot
+                && let Some(http) = &mut self.http
+            {
+                let alongside: usize = http.conns.iter().map(|conn| conn.uploads_in_flight(HTTP_UPLOAD_MIN)).sum();
+                let sample = meta.bytes as f64 / waited * (1 + alongside) as f64;
+                http.uplink_rate =
+                    Some(http.uplink_rate.map_or(sample, |rate| rate * 0.7 + sample.min(rate * 4.0) * 0.3));
             }
         } else if waited > 0.0
             && current
@@ -1448,6 +1598,7 @@ impl SessionRuntime {
                     if installed && let Some(http) = &mut self.http {
                         http.open_failures = 0;
                         http.cut_in_a_row = 0;
+                        http.cut_after_bytes = false;
                         http.handshake_token = None;
                     }
                     Ok(())
@@ -1486,6 +1637,8 @@ impl SessionRuntime {
                     http.route_check_needed = false;
                     http.open_failures = 0;
                     http.cut_in_a_row = 0;
+                    http.cut_after_bytes = false;
+                    http.next_open_at = http.next_open_at.min(now.mono.max(http.hold_until));
                     let first_on_conn = !http.proven.contains(&token);
                     let named = http.named.iter().find(|(other, _)| *other == token).map(|(_, named)| named.clone());
                     if first_on_conn {
@@ -1581,16 +1734,84 @@ pub const AUTO_PROBE_RETRY_MAX: f64 = 60.0;
 /// after every try that failed).
 pub const AUTO_TCP_RECHECK_MAX: f64 = 900.0;
 
+/// Auto: how long the WebSocket probe has the web front to itself before HTTPS is tried there too.
+pub const WEBSOCKET_HEAD_START: f64 = 1.5;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ProbeKind {
+    /// HTTP to a datacenter address.
+    Plain,
+    /// Telegram Web's HTTPS endpoint.
+    Https,
+    /// Telegram Web's WebSocket endpoint, carrying the stream transport.
+    WebSocket,
+}
+
+pub(super) enum ProbeLink {
+    Http(Box<HttpConn>),
+    Stream(Box<crate::connection::Connection>),
+}
+
+/// A plain req_pq on a route, asking whether it reaches Telegram while TCP does not.
+pub(super) struct Probe {
+    pub(super) kind: ProbeKind,
+    pub(super) link: ProbeLink,
+    named: Option<NamedAddress>,
+    pub(super) nonce: [u8; 16],
+    started_at: f64,
+}
+
+impl Probe {
+    pub(super) fn new(kind: ProbeKind, link: ProbeLink, nonce: [u8; 16], now: f64) -> Self {
+        Self { kind, link, named: None, nonce, started_at: now }
+    }
+
+    pub(super) fn token(&self) -> Token {
+        match &self.link {
+            ProbeLink::Http(conn) => conn.token(),
+            ProbeLink::Stream(connection) => connection.token(),
+        }
+    }
+
+    fn usage(&self) -> (u64, u64) {
+        match &self.link {
+            ProbeLink::Http(conn) => (conn.bytes_in, conn.bytes_out),
+            ProbeLink::Stream(connection) => (connection.bytes_in, connection.bytes_out),
+        }
+    }
+
+    fn answered(&self) -> bool {
+        match &self.link {
+            ProbeLink::Http(conn) => conn.responses > 0,
+            ProbeLink::Stream(connection) => connection.received_bytes,
+        }
+    }
+
+    fn close(&mut self, registry: &Registry) {
+        match &mut self.link {
+            ProbeLink::Http(conn) => conn.deregister(registry),
+            ProbeLink::Stream(connection) => connection.deregister(registry),
+        }
+    }
+}
+
 #[derive(Default)]
 pub(super) struct AutoState {
-    probe: Option<HttpConn>,
-    probe_named: Option<NamedAddress>,
-    probe_nonce: [u8; 16],
+    /// The probes of a round, side by side: one on a datacenter address, one on Telegram Web's WebSocket
+    /// endpoint and, once that one failed or keeps silent, one on its HTTPS endpoint. A network that
+    /// blocks the addresses outright still reaches the web fronts without waiting.
+    pub(super) probes: Vec<Probe>,
+    /// A round of probes is under way; HTTPS has been tried in it.
+    round_open: bool,
+    https_tried: bool,
     probe_failures: u32,
     probe_retry_at: f64,
     probe_cursor: usize,
     /// The session moved to HTTP on its own and goes back to TCP once a TCP route answers.
     pub(super) on_http: bool,
+    /// The session moved its stream transport to Telegram Web's WebSocket endpoint on its own and goes
+    /// back to TCP once a TCP route answers, or after the endpoint failed a few times in a row.
+    pub(super) on_websocket: bool,
     tcp_recheck_at: f64,
     tcp_recheck_failures: u32,
     /// TCP replaced HTTP then; it has to answer before the recheck counts as a success.
@@ -1599,7 +1820,17 @@ pub(super) struct AutoState {
 
 impl AutoState {
     pub(super) fn probe_token(&self) -> Option<Token> {
-        self.probe.as_ref().map(HttpConn::token)
+        self.probes.first().map(Probe::token)
+    }
+
+    /// A TCP recheck was cut short by the connection it raced (a WebSocket reconnect): the next goes
+    /// at once instead of a full interval later.
+    pub(super) fn recheck_soon(&mut self) {
+        self.tcp_recheck_at = 0.0;
+    }
+
+    pub(super) fn owns_probe(&self, token: Token) -> bool {
+        self.probes.iter().any(|probe| probe.token() == token)
     }
 
     /// A lookup the HTTP probe waits for came back: the probe may go at once.
@@ -1612,9 +1843,10 @@ impl AutoState {
     #[cfg(test)]
     pub(super) fn describe(&self, now: f64) -> String {
         format!(
-            "auto(on_http {} probe {} probe_failures {} probe_retry {:+.2} recheck {:+.2} recheck_failures {} back_on_tcp {:?})",
+            "auto(on_http {} on_websocket {} probes {:?} probe_failures {} probe_retry {:+.2} recheck {:+.2} recheck_failures {} back_on_tcp {:?})",
             self.on_http,
-            self.probe.is_some(),
+            self.on_websocket,
+            self.probes.iter().map(|probe| probe.kind).collect::<Vec<_>>(),
             self.probe_failures,
             self.probe_retry_at - now,
             self.tcp_recheck_at - now,
@@ -1629,11 +1861,17 @@ fn recheck_interval(base: f64, failures: u32) -> f64 {
 }
 
 impl SessionRuntime {
-    fn probe_http_token(&self) -> Token {
-        Token(self.token.0 + HTTP_FIRST_TOKEN_OFFSET + HTTP_MAX_CONNECTIONS)
+    pub(super) fn probe_token(&self, kind: ProbeKind) -> Token {
+        let offset = match kind {
+            ProbeKind::Plain => 0,
+            ProbeKind::Https => 1,
+            ProbeKind::WebSocket => 2,
+        };
+        Token(self.token.0 + HTTP_FIRST_TOKEN_OFFSET + HTTP_MAX_CONNECTIONS + offset)
     }
 
-    /// Opens a connection to HTTP candidate `choice` on `token`, through the SOCKS5 proxy if one is set.
+    /// Opens a connection to HTTP candidate `choice` on `token`: through the SOCKS5 proxy if one is set,
+    /// or a host stream for Telegram Web's endpoint. The name and address it went to, when looked up.
     fn connect_http_candidate(
         &mut self,
         registry: &Registry,
@@ -1641,11 +1879,15 @@ impl SessionRuntime {
         resolver: &mut dyn Resolve,
         choice: usize,
         token: Token,
-    ) -> Result<Option<HttpConn>, ()> {
+    ) -> Result<Option<(HttpConn, Option<NamedAddress>)>, ()> {
         let candidates = self.http_candidates();
-        let Some((_, host, port)) = candidates.get(choice).cloned() else {
+        let Some(candidate) = candidates.get(choice).cloned() else {
             return Err(());
         };
+        if candidate.web {
+            return self.open_web_conn(choice, token, now).map(|conn| Some((conn, None))).ok_or(());
+        }
+        let (host, port) = (candidate.host, candidate.port);
         let (connect_host, connect_port, socks) = match &self.setup.proxy {
             Some(ProxyConfig::Socks5 { host: proxy_host, port: proxy_port, username, password }) => {
                 let target = match parse_literal(&host, port) {
@@ -1664,7 +1906,7 @@ impl SessionRuntime {
             Some(ProxyConfig::Http { host: proxy_host, port: proxy_port, .. }) => {
                 (proxy_host.clone(), *proxy_port, None)
             }
-            Some(ProxyConfig::MtProxy { .. }) => return Err(()),
+            Some(ProxyConfig::MtProxy { .. }) | Some(ProxyConfig::Web { .. }) => return Err(()),
             None => (host.clone(), port, None),
         };
         let mut named = None;
@@ -1683,10 +1925,7 @@ impl SessionRuntime {
         };
         let route = self.http_route(&host, port);
         match HttpConn::connect(registry, token, socket_address, route, socks, choice, now.mono) {
-            Ok(conn) => {
-                self.auto.probe_named = named;
-                Ok(Some(conn))
-            }
+            Ok(conn) => Ok(Some((conn, named))),
             Err(_) => {
                 if let Some((key, address)) = named {
                     self.note_named_address_failed(key, address);
@@ -1694,6 +1933,32 @@ impl SessionRuntime {
                 Err(())
             }
         }
+    }
+
+    /// A connection to Telegram Web's endpoint over a TLS stream the host opens.
+    fn open_web_conn(&self, choice: usize, token: Token, now: Now) -> Option<HttpConn> {
+        let web = self.web_endpoint()?;
+        let (streams, signal) = self.host_streams.as_ref()?;
+        let target = crate::host_stream::StreamTarget {
+            host: web.address.clone().unwrap_or_else(|| web.host.clone()),
+            port: web.port,
+            tls_server_name: Some(web.host.clone()),
+            alpn: vec!["http/1.1".into()],
+            carrier: false,
+        };
+        let pipe = streams.open(&target, token, signal).ok()?;
+        let route = HttpRoute::Web { host: web.authority(), path: web.path.clone() };
+        Some(HttpConn::over_host(pipe, token, route, choice, now.mono))
+    }
+
+    /// What a session finds about TCP holds for the network only on a direct Auto session: through a proxy,
+    /// or on TCP alone, it says nothing about the network's own routes.
+    pub(super) fn learns_route_hints(&self) -> bool {
+        self.setup.transport == crate::types::TransportPreference::Auto && self.setup.proxy.is_none()
+    }
+
+    fn http_hinted(&self, now: Now) -> bool {
+        self.learns_route_hints() && self.hints.http_likely(now.unix)
     }
 
     /// Auto on TCP: tries an HTTP route alongside once TCP gets nowhere.
@@ -1706,44 +1971,66 @@ impl SessionRuntime {
     ) {
         if self.setup.transport != crate::types::TransportPreference::Auto
             || self.http.is_some()
-            || self.auto.probe.is_some()
+            || self.auto.on_websocket
+            || self.auto.round_open
+            || !self.auto.probes.is_empty()
             || now.mono < self.auto.probe_retry_at
             || !self.wants_connection(now)
-            || matches!(self.setup.proxy, Some(ProxyConfig::MtProxy { .. }))
+            || self.setup.proxy_blocks_http()
         {
             return;
         }
-        let silence = if self.hints.http_likely(now.mono) { AUTO_HTTP_AFTER_HINT } else { AUTO_HTTP_AFTER_SILENCE };
         let answering = self.connection.as_ref().is_some_and(|connection| connection.heard_from_server);
         let struggling = !answering
             && (self.failures >= AUTO_HTTP_AFTER_FAILURES
-                || self.connection.as_ref().is_some_and(|connection| now.mono - connection.started_at >= silence));
+                || self.connection.as_ref().is_some_and(|connection| {
+                    let age = now.mono - connection.started_at;
+                    age >= AUTO_HTTP_AFTER_SILENCE || (age >= AUTO_HTTP_AFTER_HINT && self.http_hinted(now))
+                }));
         if !struggling {
             return;
         }
-        let candidates = self.http_candidates().len();
-        if candidates == 0 {
-            return;
+        let candidates = self.http_candidates();
+        let plain: Vec<usize> = (0..candidates.len()).filter(|index| !candidates[*index].web).collect();
+        self.auto.round_open = true;
+        self.auto.https_tried = false;
+        let mut pending = false;
+        if !plain.is_empty() {
+            let choice = plain[self.auto.probe_cursor % plain.len()];
+            self.auto.probe_cursor = self.auto.probe_cursor.wrapping_add(1);
+            pending |= self.start_http_probe(ProbeKind::Plain, choice, registry, now, resolver, rng);
         }
-        let choice = self.auto.probe_cursor % candidates;
-        self.auto.probe_cursor = choice + 1;
-        let token = self.probe_http_token();
-        let mut conn = match self.connect_http_candidate(registry, now, resolver, choice, token) {
-            Ok(Some(conn)) => conn,
-            Ok(None) => {
+        if !(self.websocket_possible() && self.start_websocket_probe(registry, now, rng)) {
+            self.maybe_start_https_probe(registry, now, resolver, rng);
+        }
+        if self.auto.probes.is_empty() {
+            self.auto.round_open = false;
+            if pending {
                 self.auto.probe_retry_at = now.mono + super::RESOLVE_WAIT;
-                return;
+            } else {
+                self.note_probes_failed(now);
             }
-            Err(()) => {
-                self.fail_http_probe(registry, now);
-                return;
-            }
+        }
+    }
+
+    /// Starts a probe on HTTP candidate `choice`. True when it waits for a name lookup instead.
+    fn start_http_probe(
+        &mut self,
+        kind: ProbeKind,
+        choice: usize,
+        registry: &Registry,
+        now: Now,
+        resolver: &mut dyn Resolve,
+        rng: &mut OsRandom,
+    ) -> bool {
+        let token = self.probe_token(kind);
+        let (mut conn, named) = match self.connect_http_candidate(registry, now, resolver, choice, token) {
+            Ok(Some(opened)) => opened,
+            Ok(None) => return true,
+            Err(()) => return false,
         };
         let nonce: [u8; 16] = rng.array();
-        let mut writer = mtproto_core::tl::Writer::with_capacity(24);
-        mtproto_core::tl::TlWrite::write_to(&mtproto_core::tl::mtproto::ReqPqMulti { nonce }, &mut writer);
-        let msg_id = mtproto_core::msg_id::msg_id_for_time(now.unix + self.time_difference()) & !3;
-        let packet = mtproto_core::message::encode_plain_message(msg_id, &writer.into_inner());
+        let packet = self.plain_req_pq(nonce, now);
         let meta = RequestMeta {
             packet_seq: None,
             max_wait: 0.0,
@@ -1755,64 +2042,175 @@ impl SessionRuntime {
         };
         if conn.submit(registry, &packet, meta, now.mono).is_err() {
             conn.deregister(registry);
-            self.fail_http_probe(registry, now);
-            return;
-        }
-        self.auto.probe_nonce = nonce;
-        self.auto.probe = Some(conn);
-    }
-
-    fn fail_http_probe(&mut self, registry: &Registry, now: Now) {
-        let named = self.auto.probe_named.take();
-        if let Some(mut probe) = self.auto.probe.take() {
-            if probe.responses == 0
-                && let Some((key, address)) = named
-            {
+            if let Some((key, address)) = named {
                 self.note_named_address_failed(key, address);
             }
-            self.reported_in += probe.bytes_in;
-            self.reported_out += probe.bytes_out;
-            probe.deregister(registry);
+            return false;
         }
+        self.auto.probes.push(Probe {
+            kind,
+            link: ProbeLink::Http(Box::new(conn)),
+            named,
+            nonce,
+            started_at: now.mono,
+        });
+        false
+    }
+
+    pub(super) fn plain_req_pq(&self, nonce: [u8; 16], now: Now) -> Vec<u8> {
+        let mut writer = mtproto_core::tl::Writer::with_capacity(24);
+        mtproto_core::tl::TlWrite::write_to(&mtproto_core::tl::mtproto::ReqPqMulti { nonce }, &mut writer);
+        let msg_id = mtproto_core::msg_id::msg_id_for_time(now.unix + self.time_difference()) & !3;
+        mtproto_core::message::encode_plain_message(msg_id, &writer.into_inner())
+    }
+
+    /// HTTPS on the web front, once the WebSocket probe there failed or kept silent for its head start.
+    pub(super) fn maybe_start_https_probe(
+        &mut self,
+        registry: &Registry,
+        now: Now,
+        resolver: &mut dyn Resolve,
+        rng: &mut OsRandom,
+    ) {
+        if !self.auto.round_open || self.auto.https_tried {
+            return;
+        }
+        if self
+            .auto
+            .probes
+            .iter()
+            .any(|probe| probe.kind == ProbeKind::WebSocket && now.mono - probe.started_at < WEBSOCKET_HEAD_START)
+        {
+            return;
+        }
+        self.auto.https_tried = true;
+        let candidates = self.http_candidates();
+        if let Some(web) = (0..candidates.len()).find(|index| candidates[*index].web) {
+            self.start_http_probe(ProbeKind::Https, web, registry, now, resolver, rng);
+        }
+        if self.auto.probes.is_empty() {
+            self.auto.round_open = false;
+            self.note_probes_failed(now);
+        }
+    }
+
+    /// One probe failed. Once none is left HTTPS gets its turn if it had none, and then the next round
+    /// waits.
+    pub(super) fn fail_http_probe(&mut self, token: Token, registry: &Registry, now: Now) {
+        let Some(at) = self.auto.probes.iter().position(|probe| probe.token() == token) else {
+            return;
+        };
+        let mut probe = self.auto.probes.remove(at);
+        if !probe.answered()
+            && let Some((key, address)) = probe.named.take()
+        {
+            self.note_named_address_failed(key, address);
+        }
+        let (bytes_in, bytes_out) = probe.usage();
+        self.reported_in += bytes_in;
+        self.reported_out += bytes_out;
+        probe.close(registry);
+        if self.auto.probes.is_empty() && !self.https_turn_pending() {
+            self.auto.round_open = false;
+            self.note_probes_failed(now);
+        }
+    }
+
+    /// HTTPS has yet to be tried in the round under way; the next drive starts it.
+    fn https_turn_pending(&self) -> bool {
+        self.auto.round_open && !self.auto.https_tried && self.web_endpoint().is_some()
+    }
+
+    /// The WebSocket probe answered and the round ends. The backoff earned stays until the WebSocket
+    /// carries the session: a front may answer a probe and still cut every session's connection.
+    pub(super) fn end_round_for_websocket(&mut self, registry: &Registry) {
+        let failures = self.auto.probe_failures;
+        self.cancel_http_probe(registry);
+        self.auto.probe_failures = failures;
+    }
+
+    pub(super) fn note_websocket_adopted(&mut self, now: Now) {
+        self.auto.back_on_tcp_at = None;
+        self.auto.tcp_recheck_at =
+            now.mono + recheck_interval(self.setup.tcp_recheck_after, self.auto.tcp_recheck_failures);
+    }
+
+    pub(super) fn note_websocket_answered(&mut self) {
+        self.auto.probe_failures = 0;
+    }
+
+    pub(super) fn note_left_websocket(&mut self, now: Now) {
+        self.auto.back_on_tcp_at = Some(now.mono);
+    }
+
+    pub(super) fn note_probes_failed(&mut self, now: Now) {
         self.auto.probe_failures = self.auto.probe_failures.saturating_add(1);
         let backoff = AUTO_PROBE_RETRY_BASE * f64::from(1u32 << self.auto.probe_failures.saturating_sub(1).min(8));
         self.auto.probe_retry_at = now.mono + backoff.min(AUTO_PROBE_RETRY_MAX);
     }
 
     pub(super) fn cancel_http_probe(&mut self, registry: &Registry) {
-        if let Some(mut probe) = self.auto.probe.take() {
-            self.reported_in += probe.bytes_in;
-            self.reported_out += probe.bytes_out;
-            probe.deregister(registry);
+        for mut probe in self.auto.probes.drain(..) {
+            let (bytes_in, bytes_out) = probe.usage();
+            self.reported_in += bytes_in;
+            self.reported_out += bytes_out;
+            probe.close(registry);
         }
+        self.auto.round_open = false;
         self.auto.probe_failures = 0;
         self.auto.probe_retry_at = 0.0;
     }
 
-    pub(super) fn expire_http_probe(&mut self, registry: &Registry, now: Now) {
-        if self.auto.probe.as_ref().is_some_and(|probe| now.mono - probe.started_at > AUTO_PROBE_TIMEOUT) {
-            self.fail_http_probe(registry, now);
+    pub(super) fn expire_http_probe(
+        &mut self,
+        registry: &Registry,
+        now: Now,
+        resolver: &mut dyn Resolve,
+        rng: &mut OsRandom,
+    ) {
+        let expired: Vec<Token> = self
+            .auto
+            .probes
+            .iter()
+            .filter(|probe| now.mono - probe.started_at > AUTO_PROBE_TIMEOUT)
+            .map(Probe::token)
+            .collect();
+        for token in expired {
+            self.fail_http_probe(token, registry, now);
         }
+        self.maybe_start_https_probe(registry, now, resolver, rng);
     }
 
     pub(super) fn auto_deadline(&self, now: Now) -> Option<f64> {
-        if let Some(probe) = &self.auto.probe {
-            return Some(probe.started_at + AUTO_PROBE_TIMEOUT + 0.01);
+        if self.auto.probes.is_empty() && self.https_turn_pending() {
+            return Some(now.mono);
+        }
+        if let Some(started_at) = self.auto.probes.iter().map(|probe| probe.started_at).reduce(f64::min) {
+            let https_turn = self
+                .auto
+                .probes
+                .iter()
+                .filter(|probe| probe.kind == ProbeKind::WebSocket && self.auto.round_open && !self.auto.https_tried)
+                .map(|probe| probe.started_at + WEBSOCKET_HEAD_START)
+                .reduce(f64::min)
+                .unwrap_or(f64::INFINITY);
+            return Some((started_at + AUTO_PROBE_TIMEOUT).min(https_turn) + 0.01);
         }
         if self.setup.transport != crate::types::TransportPreference::Auto {
             return None;
         }
-        if !self.auto.on_http && !self.http_route_possible() {
+        if !self.auto.on_http && !self.auto.on_websocket && !self.http_route_possible() {
             return None;
         }
-        if self.auto.on_http {
+        if self.auto.on_http || self.auto.on_websocket {
             return self.wants_connection(now).then(|| self.auto.tcp_recheck_at.max(self.racer_retry_at));
         }
         if self.http.is_none()
             && let Some(connection) = &self.connection
             && !connection.heard_from_server
         {
-            let silence = if self.hints.http_likely(now.mono) { AUTO_HTTP_AFTER_HINT } else { AUTO_HTTP_AFTER_SILENCE };
+            let young = now.mono - connection.started_at < AUTO_HTTP_AFTER_SILENCE;
+            let silence = if young && self.http_hinted(now) { AUTO_HTTP_AFTER_HINT } else { AUTO_HTTP_AFTER_SILENCE };
             return Some((connection.started_at + silence).max(self.auto.probe_retry_at) + 0.01);
         }
         None
@@ -1821,58 +2219,81 @@ impl SessionRuntime {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn handle_http_probe_io(
         &mut self,
+        token: Token,
         readable: bool,
         writable: bool,
         registry: &Registry,
         scratch: &mut [u8],
         now: Now,
         callbacks: &Arc<dyn EngineCallbacks>,
+        rng: &mut OsRandom,
     ) {
-        let Some(probe) = &mut self.auto.probe else {
+        let Some(probe) = self.auto.probes.iter_mut().find(|probe| probe.token() == token) else {
             return;
+        };
+        let ProbeLink::Http(conn) = &mut probe.link else {
+            return self.handle_websocket_probe_io(token, readable, registry, scratch, now, callbacks, rng);
         };
         let mut events = Vec::new();
         let mut failed = false;
-        if writable && probe.handle_writable(registry, now.mono).is_err() {
+        if writable && conn.handle_writable(registry, now.mono).is_err() {
             failed = true;
         }
-        if readable && !failed && probe.read(registry, scratch, HTTP_READ_BUDGET, now.mono, &mut events).is_err() {
+        if readable && !failed && conn.read(registry, scratch, HTTP_READ_BUDGET, now.mono, &mut events).is_err() {
             failed = true;
         }
-        let nonce = self.auto.probe_nonce;
+        let nonce = probe.nonce;
         for event in events {
             if let HttpIo::Response { response, .. } = event {
                 if response.status == 200 && super::is_res_pq_for(&response.body, &nonce) {
-                    self.adopt_http_probe(registry, now, callbacks);
+                    self.adopt_http_probe(token, registry, now, callbacks);
                     return;
                 }
                 failed = true;
             }
         }
         if failed {
-            self.fail_http_probe(registry, now);
+            self.fail_http_probe(token, registry, now);
         }
     }
 
-    fn adopt_http_probe(&mut self, registry: &Registry, now: Now, callbacks: &Arc<dyn EngineCallbacks>) {
-        let Some(probe) = self.auto.probe.take() else {
+    fn adopt_http_probe(&mut self, token: Token, registry: &Registry, now: Now, callbacks: &Arc<dyn EngineCallbacks>) {
+        let Some(at) = self.auto.probes.iter().position(|probe| probe.token() == token) else {
             return;
         };
-        self.log(callbacks, LogLevel::Info, "TCP gets no answer but HTTP does; moving to HTTP");
+        let probe = self.auto.probes.remove(at);
+        self.cancel_http_probe(registry);
+        let ProbeLink::Http(conn) = probe.link else {
+            return;
+        };
+        let web = conn.is_host_stream();
+        self.log(
+            callbacks,
+            LogLevel::Info,
+            if web {
+                "TCP gets no answer but Telegram Web's HTTPS endpoint does; moving to HTTPS"
+            } else {
+                "TCP gets no answer but HTTP does; moving to HTTP"
+            },
+        );
         if self.connection.is_some() {
             self.report_drop(DropReason::TransportSwitch, now, callbacks);
         }
         self.enter_http(registry, now);
-        let named = self.auto.probe_named.take();
+        let candidate = conn.address_index;
+        let token = conn.token();
         if let Some(http) = &mut self.http {
-            if let Some(named) = named {
-                http.named.push((probe.token(), named));
+            if let Some(named) = probe.named {
+                http.named.push((token, named));
             }
-            http.conns.push(probe);
+            http.conns.push(*conn);
             http.route_checked = true;
         }
+        self.note_http_address(candidate, true, now);
         self.auto.on_http = true;
-        self.hints.note_http_needed(now.mono);
+        if self.learns_route_hints() {
+            self.hints.note_http_needed(now.unix);
+        }
         self.auto.probe_failures = 0;
         self.auto.back_on_tcp_at = None;
         self.auto.tcp_recheck_at =
@@ -1891,7 +2312,7 @@ impl SessionRuntime {
         resolver: &mut dyn Resolve,
         rng: &mut OsRandom,
     ) {
-        if !self.auto.on_http
+        if !(self.auto.on_http || self.auto.on_websocket)
             || self.racer.is_some()
             || now.mono < self.auto.tcp_recheck_at
             || !self.wants_connection(now)
@@ -1940,7 +2361,9 @@ impl SessionRuntime {
     /// The TCP recheck answered: the session leaves HTTP, and the verified connection takes over.
     pub(super) fn switch_back_to_tcp(&mut self, registry: &Registry, now: Now, callbacks: &Arc<dyn EngineCallbacks>) {
         self.log(callbacks, LogLevel::Info, "a TCP route answers again; leaving HTTP");
-        self.hints.note_tcp_answered(now.mono);
+        if self.learns_route_hints() {
+            self.hints.note_tcp_answered(now.unix);
+        }
         self.leave_http(registry, now);
         self.auto.on_http = false;
         self.auto.back_on_tcp_at = Some(now.mono);
@@ -1978,6 +2401,8 @@ impl SessionRuntime {
             self.auto.on_http = false;
             self.leave_http(registry, now);
         }
+        self.auto.on_websocket = false;
+        self.apply_keepalive();
     }
 }
 

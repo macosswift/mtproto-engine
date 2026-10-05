@@ -1,7 +1,7 @@
 use std::io::BufRead;
 
 use mtproto_core::auth_key::AuthKey;
-use mtproto_testserver::{SERVER_SALT, ServerOptions, TestServer, random_key};
+use mtproto_testserver::{Blackhole, SERVER_SALT, ServerOptions, TestServer, WebFront, random_key};
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -16,8 +16,10 @@ fn main() {
     let mut key: Option<AuthKey> = None;
     let mut options = ServerOptions::default();
     options.handshake.live_time = true;
+    let mut web_front = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--web-front" => web_front = true,
             "--key-hex" => key = AuthKey::from_slice(&unhex(&args.next().expect("value"))),
             "--secret" => options.secret = Some(unhex(&args.next().expect("value"))),
             "--socks5" => options.socks5 = true,
@@ -26,13 +28,18 @@ fn main() {
     }
     let key = key.unwrap_or_else(|| random_key(std::process::id() as u64));
     let server = TestServer::start(vec![key.clone()], options);
+    let front = web_front.then(|| (WebFront::start(server.address), Blackhole::start()));
     let pem = mtproto_core::test_support::test_rsa_public_key_pem().replace('\n', "\\n");
+    let web = front.as_ref().map_or(String::new(), |(front, blackhole)| {
+        format!(",\"web_front\":\"{}\",\"blackhole\":\"{}\"", front.address, blackhole.address)
+    });
     println!(
-        "{{\"address\":\"{}\",\"key_hex\":\"{}\",\"salt\":{},\"public_key_pem\":\"{}\"}}",
+        "{{\"address\":\"{}\",\"key_hex\":\"{}\",\"salt\":{},\"public_key_pem\":\"{}\"{}}}",
         server.address,
         hex(key.bytes()),
         SERVER_SALT,
-        pem
+        pem,
+        web
     );
     for line in std::io::stdin().lock().lines() {
         let Ok(line) = line else { break };
@@ -72,6 +79,27 @@ fn main() {
                     )
                 });
                 println!("{summary}");
+            }
+            "web-front-stats" => {
+                let stats = front.as_ref().map(|(front, _)| front.stats()).unwrap_or_default();
+                let quoted =
+                    |items: &[String]| items.iter().map(|item| format!("{item:?}")).collect::<Vec<_>>().join(",");
+                println!(
+                    "{{\"connections\":{},\"handshakes\":{},\"server_names\":[{}],\"alpn\":[{}],\"requests\":[{}],\"websockets\":{},\"frames_in\":{},\"violations\":{}}}",
+                    stats.connections,
+                    stats.handshakes,
+                    quoted(&stats.server_names),
+                    quoted(&stats.alpn),
+                    quoted(&stats.requests),
+                    stats.websockets,
+                    stats.frames_in,
+                    stats.violations
+                );
+            }
+            "websocket-refused on" | "websocket-refused off" => {
+                if let Some((front, _)) = &front {
+                    front.set_websocket_refused(line.trim().ends_with("on"));
+                }
             }
             "tcp-blackhole on" => server.set_tcp_blackhole(true),
             "tcp-blackhole off" => server.set_tcp_blackhole(false),

@@ -2,8 +2,10 @@
 
 mod clock;
 mod connection;
+mod host_stream;
 mod http_link;
 mod interface;
+mod pipe;
 mod resolver;
 mod route_hints;
 mod session_runtime;
@@ -22,9 +24,11 @@ pub use mtproto_core;
 use mtproto_core::rpc::{ApiEnvironment, RequestId, RpcRequest, SessionRole, Verification};
 
 pub use clock::{monotonic_seconds, now, unix_seconds};
+pub use host_stream::{HOST_READ_WINDOW, HOST_WRITE_WINDOW, StreamHost, StreamId, StreamTarget};
 pub use types::{
     AuthKeyMaterial, BoundTemporaryKey, ConnectionState, DcAddress, DropReason, EngineCallbacks, EngineConfig,
     EngineEvent, KeyGeneration, LogLevel, PfsSetup, ProxyConfig, SessionHandle, SessionSetup, TransportPreference,
+    WebEndpoint,
 };
 use uploads::Uploads;
 use worker::{Command, WAKER_TOKEN, Worker};
@@ -49,6 +53,8 @@ struct EngineInner {
     next_session: AtomicU64,
     next_request: AtomicU64,
     round_robin: AtomicUsize,
+    hints: Arc<route_hints::RouteHints>,
+    streams: Arc<host_stream::HostStreams>,
 }
 
 #[derive(Clone)]
@@ -61,14 +67,17 @@ const WORKER_BITS: u64 = 8;
 impl Engine {
     pub fn new(config: EngineConfig, callbacks: Arc<dyn EngineCallbacks>) -> io::Result<Self> {
         let count = config.worker_threads.clamp(1, 16);
+        let hints = Arc::new(route_hints::RouteHints::default());
+        let streams = Arc::new(host_stream::HostStreams::default());
         let mut inner = EngineInner {
             workers: Vec::with_capacity(count),
             next_session: AtomicU64::new(1),
             next_request: AtomicU64::new(1),
             round_robin: AtomicUsize::new(0),
+            hints: hints.clone(),
+            streams: streams.clone(),
         };
         let uploads = Arc::new(Uploads::default());
-        let hints = Arc::new(route_hints::RouteHints::default());
         for index in 0..count {
             let poll = Poll::new()?;
             let waker = Arc::new(Waker::new(poll.registry(), WAKER_TOKEN)?);
@@ -84,7 +93,8 @@ impl Engine {
                 config.clone(),
             )
             .sharing_uploads(uploads.clone())
-            .sharing_route_hints(hints.clone());
+            .sharing_route_hints(hints.clone())
+            .sharing_host_streams(streams.clone(), Arc::new(host_stream::WorkerSignal::new(waker.clone())));
             let thread = std::thread::Builder::new()
                 .name(if index == 0 { "mtproto-main".into() } else { format!("mtproto-worker-{index}") })
                 .stack_size(512 * 1024)
@@ -244,6 +254,65 @@ impl Engine {
 
     pub fn reset_connections(&self) {
         self.broadcast(|| Command::ResetConnections);
+    }
+
+    /// The network the device is on now, as an opaque key the host derives (a salted hash of what
+    /// identifies the network); empty when unknown. What sessions learn about TCP and HTTP is kept per
+    /// key, so a network known to block TCP gets HTTP early from the first connection.
+    pub fn set_network(&self, key: &[u8]) {
+        if self.inner.hints.set_network(key, clock::unix_seconds()) {
+            for worker in &self.inner.workers {
+                worker.notify();
+            }
+        }
+    }
+
+    /// What `EngineEvent::RouteMemory` reported in an earlier run.
+    pub fn set_route_memory(&self, memory: &[u8]) {
+        self.inner.hints.load(memory, clock::unix_seconds());
+    }
+
+    /// The memory of named networks now, as `EngineEvent::RouteMemory` reports it.
+    pub fn route_memory(&self) -> Vec<u8> {
+        self.inner.hints.export(clock::unix_seconds())
+    }
+
+    /// The host that opens streams the engine cannot open itself (TLS to Telegram Web's fronts with
+    /// the platform's TLS). Without one, routes that need it are not tried.
+    pub fn set_stream_host(&self, host: Option<Arc<dyn StreamHost>>) {
+        self.inner.streams.set_host(host);
+    }
+
+    /// The host's stream is open (its TLS handshake done): bytes may go both ways.
+    pub fn stream_opened(&self, stream: StreamId) {
+        self.inner.streams.opened(stream);
+    }
+
+    /// Bytes the host's stream received. False when the engine holds `HOST_READ_WINDOW` bytes
+    /// already: the host stops receiving on the stream until `StreamHost::resume`.
+    pub fn stream_received(&self, stream: StreamId, bytes: &[u8]) -> bool {
+        self.inner.streams.received(stream, bytes)
+    }
+
+    /// The platform took `count` more bytes of what the engine wrote on the stream.
+    pub fn stream_sent(&self, stream: StreamId, count: usize) {
+        self.inner.streams.sent(stream, count);
+    }
+
+    /// The host's stream ended: cleanly (None) or with an error. Before `stream_opened`, it could not
+    /// be opened.
+    pub fn stream_closed(&self, stream: StreamId, error: Option<String>) {
+        self.inner.streams.closed(stream, error);
+    }
+
+    /// Telegram Web's HTTPS endpoint the session may use as one more HTTP route (None: none).
+    pub fn set_web_endpoint(&self, handle: SessionHandle, endpoint: Option<WebEndpoint>) {
+        self.post(handle, Command::SetWebEndpoint(handle, endpoint.map(Box::new)));
+    }
+
+    /// Telegram Web's own endpoint for the session's datacenter and role (`WebEndpoint::telegram`).
+    pub fn use_telegram_web(&self, handle: SessionHandle, test: bool) {
+        self.post(handle, Command::UseTelegramWeb(handle, test));
     }
 
     pub fn shutdown(&self) {

@@ -474,6 +474,9 @@ pub struct Session {
     /// The transport is HTTP: every packet is a request carrying an `http_wait`, the server answers
     /// only in responses, there is no quick ack and no ping; the host times each request instead.
     http: bool,
+    /// The longest an idle connection goes without a ping of its own: Telegram Web's fronts close a
+    /// WebSocket after 91 s of silence.
+    keepalive_cap: Option<f64>,
     http_packets: VecDeque<HttpPacket>,
     /// HTTP: queries whose request was answered, with when they must be acknowledged by.
     http_awaiting_ack: VecDeque<(QueryId, i64, f64)>,
@@ -581,6 +584,7 @@ impl Session {
             pending_reset: false,
             drain_reset_at: None,
             http: false,
+            keepalive_cap: None,
             http_packets: VecDeque::new(),
             http_awaiting_ack: VecDeque::new(),
             http_receiving_until: 0.0,
@@ -1253,7 +1257,13 @@ impl Session {
     }
 
     fn ping_must_delay(&self) -> f64 {
-        if self.uses_fast_liveness() { self.rtt_estimate() } else { 60.0 + self.random_delay }
+        let delay = if self.uses_fast_liveness() { self.rtt_estimate() } else { 60.0 + self.random_delay };
+        self.keepalive_cap.map_or(delay, |cap| delay.min(cap))
+    }
+
+    /// Caps the time an idle connection goes without a ping (None: no cap).
+    pub fn set_keepalive_cap(&mut self, cap: Option<f64>) {
+        self.keepalive_cap = cap;
     }
 
     fn liveness_at(&self) -> f64 {

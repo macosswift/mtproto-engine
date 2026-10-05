@@ -784,3 +784,147 @@ fn auto_sessions_learn_from_each_other_that_only_http_gets_through() {
     assert!(started.elapsed() < Duration::from_millis(1500), "the second session took {:?}", started.elapsed());
     engine.shutdown();
 }
+
+/// A link whose round trip is longer than the response timeout the engine starts with (behind a local
+/// accept the connect time says nothing of it), as on GPRS/EDGE: the late request goes again
+/// elsewhere while its connection waits on, and the late answer is taken. Giving up on the connection
+/// instead threw the answer away every time and paid for a new connection.
+#[test]
+fn answers_slower_than_the_timeout_are_waited_for_while_the_request_goes_again() {
+    let key = random_key(171);
+    let server = TestServer::start(vec![key.clone()], ServerOptions::default());
+    let profile = mtproto_netsim::Profile {
+        name: "slow-round-trips".into(),
+        latency: Duration::from_millis(1500),
+        ..mtproto_netsim::Profile::perfect()
+    };
+    let sim = mtproto_netsim::NetSim::start(server.address, profile, 17).unwrap();
+    let collector = Arc::new(Collector::default());
+    let engine = engine(&collector);
+    let mut setup = http_setup(&server, &key, SessionRole::Main);
+    setup.addresses[0].port = sim.address.port();
+    let started = Instant::now();
+    let session = engine.create_session(setup);
+    for id in 1..=3 {
+        engine.send(session, request(id, id as u32));
+    }
+    assert!(
+        collector.wait(Duration::from_secs(30), |events| completions(events, session) == 3),
+        "{:?}",
+        collector.drops()
+    );
+    eprintln!("answers after {:?}, drops {:?}", started.elapsed(), collector.drops());
+    assert!(started.elapsed() < Duration::from_secs(12), "the late answers were taken: {:?}", started.elapsed());
+    assert!(
+        collector.drops().iter().all(|(reason, _)| *reason != DropReason::RequestTimeout),
+        "no connection given up for a late answer: {:?}",
+        collector.drops()
+    );
+    for tag in 1..=3 {
+        assert_eq!(server.executions(tag), 1, "call {tag} ran once");
+    }
+    engine.shutdown();
+}
+
+/// A tunnel refuses every new connection while the ones already open wait it out, and the refusals pile
+/// up a long reconnect backoff. Once a connection that waited answers, the link is back: what was asked
+/// meanwhile goes out at once, not after that backoff (benchmark train/steady stalled up to 21 s).
+#[test]
+fn calls_made_in_a_tunnel_go_out_once_a_connection_answers_after_it() {
+    let key = random_key(181);
+    let server = TestServer::start(vec![key.clone()], ServerOptions::default());
+    let profile = mtproto_netsim::Profile {
+        name: "tunnel".into(),
+        latency: Duration::from_millis(40),
+        ..mtproto_netsim::Profile::perfect()
+    };
+    let sim = mtproto_netsim::NetSim::start(server.address, profile, 19).unwrap();
+    let collector = Arc::new(Collector::default());
+    let engine = engine(&collector);
+    let mut setup = http_setup(&server, &key, SessionRole::Main);
+    setup.addresses[0].port = sim.address.port();
+    let session = engine.create_session(setup);
+    engine.send(session, request(1, 1));
+    assert!(collector.wait(Duration::from_secs(2), |events| completions(events, session) == 1), "first call");
+    sim.begin_tunnel();
+    let entered = Instant::now();
+    let mut issued = 1;
+    let mut last_call = Instant::now() - Duration::from_secs(1);
+    while sim.stats().refused < 7 {
+        assert!(entered.elapsed() < Duration::from_secs(20), "connections were refused: {:?}", sim.stats());
+        if last_call.elapsed() >= Duration::from_millis(250) {
+            issued += 1;
+            engine.send(session, request(issued, issued as u32));
+            last_call = Instant::now();
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    sim.end_tunnel();
+    let left = Instant::now();
+    let done = collector.wait(Duration::from_secs(2), |events| completions(events, session) == issued as usize);
+    eprintln!(
+        "{} calls in a {:?} tunnel, {} done {:?} after it, {:?}",
+        issued - 1,
+        left - entered,
+        collector.completed(session).len() - 1,
+        left.elapsed(),
+        sim.stats()
+    );
+    assert!(done, "the calls made in the tunnel went out once the link was back");
+    for tag in 1..=issued as u32 {
+        assert_eq!(server.executions(tag), 1, "call {tag} ran once");
+    }
+    engine.shutdown();
+}
+
+/// An outage kills the open connections and refuses every new one, and each refusal is a cut in a
+/// row. While the latest cut got no response bytes, the cut backoff stays at most
+/// `HTTP_UNHEARD_CUT_MAX_DELAY`: once the link is back the calls go out within it, not after the
+/// 8-16 s a flapping link earns (benchmark http/steady/outage-8s recovered in up to 14 s).
+#[test]
+fn calls_go_out_soon_after_an_outage_that_refused_every_connection() {
+    let key = random_key(182);
+    let server = TestServer::start(vec![key.clone()], ServerOptions::default());
+    let profile = mtproto_netsim::Profile {
+        name: "outage".into(),
+        latency: Duration::from_millis(40),
+        ..mtproto_netsim::Profile::perfect()
+    };
+    let sim = mtproto_netsim::NetSim::start(server.address, profile, 23).unwrap();
+    let collector = Arc::new(Collector::default());
+    let engine = engine(&collector);
+    let mut setup = http_setup(&server, &key, SessionRole::Main);
+    setup.addresses[0].port = sim.address.port();
+    let session = engine.create_session(setup);
+    engine.send(session, request(1, 1));
+    assert!(collector.wait(Duration::from_secs(2), |events| completions(events, session) == 1), "first call");
+    sim.outage(Duration::from_secs(3600));
+    let entered = Instant::now();
+    let mut issued = 1;
+    let mut last_call = Instant::now() - Duration::from_secs(1);
+    while sim.stats().refused < 8 {
+        assert!(entered.elapsed() < Duration::from_secs(40), "connections were refused: {:?}", sim.stats());
+        if last_call.elapsed() >= Duration::from_millis(500) {
+            issued += 1;
+            engine.send(session, request(issued, issued as u32));
+            last_call = Instant::now();
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    sim.end_outage();
+    let left = Instant::now();
+    let done = collector.wait(Duration::from_millis(5500), |events| completions(events, session) == issued as usize);
+    eprintln!(
+        "{} calls in a {:?} outage, {} done {:?} after it, {:?}",
+        issued - 1,
+        left - entered,
+        collector.completed(session).len() - 1,
+        left.elapsed(),
+        sim.stats()
+    );
+    assert!(done, "the calls made in the outage went out soon after it");
+    for tag in 1..=issued as u32 {
+        assert_eq!(server.executions(tag), 1, "call {tag} ran once");
+    }
+    engine.shutdown();
+}

@@ -29,8 +29,12 @@ use crate::uploads::Uploads;
 #[path = "session_http.rs"]
 mod http;
 use http::{AutoState, HttpState};
+#[path = "session_carrier.rs"]
+mod carrier;
 #[path = "session_pfs.rs"]
 mod pfs;
+#[path = "session_websocket.rs"]
+mod websocket;
 use pfs::PfsState;
 
 /// Requests failed by a temporary key change that a later chained call is checked against.
@@ -212,6 +216,8 @@ pub struct SessionRuntime {
     /// Counts the sessions (keys) the runtime installed, so that answers for an earlier one are told apart.
     rpc_generation: u64,
     hints: Arc<crate::route_hints::RouteHints>,
+    /// Streams the host opens (Telegram Web's HTTPS endpoint), and how their news reaches the worker.
+    host_streams: Option<(Arc<crate::host_stream::HostStreams>, Arc<crate::host_stream::WorkerSignal>)>,
 }
 
 impl SessionRuntime {
@@ -276,6 +282,7 @@ impl SessionRuntime {
             pfs: None,
             rpc_generation: 0,
             hints: Arc::default(),
+            host_streams: None,
             setup,
         };
         if let Some(pfs) = runtime.setup.pfs.take().filter(|pfs| !pfs.public_keys.is_empty()) {
@@ -307,6 +314,14 @@ impl SessionRuntime {
     fn free_token(&self) -> Token {
         let used = self.connection.as_ref().or(self.racer.as_ref()).map(Connection::token);
         if used == Some(self.token) { self.race_token() } else { self.token }
+    }
+
+    pub fn datacenter_id(&self) -> i32 {
+        self.setup.datacenter_id
+    }
+
+    pub fn role(&self) -> SessionRole {
+        self.setup.role
     }
 
     pub fn token(&self) -> Token {
@@ -357,6 +372,9 @@ impl SessionRuntime {
                 if let Some(http) = &mut self.http {
                     rpc.session_mut().set_http(true);
                     http.forget_opened();
+                }
+                if self.auto.on_websocket {
+                    rpc.session_mut().set_keepalive_cap(Some(websocket::WEBSOCKET_KEEPALIVE));
                 }
                 if self.connection.as_ref().is_some_and(Connection::is_established) && self.handshake.is_none() {
                     rpc.connection_opened(now);
@@ -760,6 +778,25 @@ impl SessionRuntime {
         self.hints = hints;
     }
 
+    pub fn share_host_streams(
+        &mut self,
+        streams: Arc<crate::host_stream::HostStreams>,
+        signal: Arc<crate::host_stream::WorkerSignal>,
+    ) {
+        self.host_streams = Some((streams, signal));
+    }
+
+    /// A new web endpoint, for the routes tried from now on. HTTP connections to the old one close; a
+    /// stream on its WebSocket stays until it ends.
+    pub fn set_web_endpoint(&mut self, endpoint: Option<crate::types::WebEndpoint>, registry: &Registry, now: Now) {
+        if self.setup.web == endpoint {
+            return;
+        }
+        self.retire_web_conns(registry, now);
+        self.setup.web = endpoint;
+        self.cancel_http_probe(registry);
+    }
+
     pub fn share_uploads(&mut self, uploads: Arc<Uploads>) {
         self.uploads.change(self.published_upload, 0);
         uploads.change(0, self.published_upload);
@@ -907,6 +944,9 @@ impl SessionRuntime {
     }
 
     fn report_address(&mut self, index: usize, success: bool, now: Now, callbacks: &Arc<dyn EngineCallbacks>) {
+        if index >= self.setup.addresses.len() {
+            return;
+        }
         self.note_address(index, success, now);
         callbacks.on_event(self.handle, EngineEvent::AddressResult { index, success });
     }
@@ -966,7 +1006,7 @@ impl SessionRuntime {
             self.note_address(index, false, now);
         }
         self.back_off_racing(now);
-        if self.auto.on_http {
+        if self.auto.on_http || self.auto.on_websocket {
             self.note_tcp_recheck_failed(now);
         }
     }
@@ -978,10 +1018,14 @@ impl SessionRuntime {
     }
 
     fn drop_racer(&mut self, registry: &Registry) {
+        let rechecking = self.auto.on_websocket && self.racer.is_some() && self.racer_check.is_some();
         self.racer_check = None;
         if let Some(mut racer) = self.racer.take() {
             self.account_usage(&racer);
             racer.deregister(registry);
+        }
+        if rechecking {
+            self.auto.recheck_soon();
         }
     }
 
@@ -1001,7 +1045,9 @@ impl SessionRuntime {
                 let jitter = self.next_jitter();
                 let delay = self.reconnect_delay().max(flap_delay(self.flaps, jitter));
                 self.next_attempt_at = self.next_attempt_at.max(now.mono + delay);
-                self.address_cursor = index + 1;
+                if index < self.setup.addresses.len() {
+                    self.address_cursor = index + 1;
+                }
             }
             if let Some(rpc) = &mut self.rpc {
                 rpc.connection_closed(now);
@@ -1014,6 +1060,18 @@ impl SessionRuntime {
         }
     }
 
+    /// Closes a connection that failed. On the WebSocket, a TCP recheck that got no answer in half its
+    /// time counts as failed rather than starting over with the next connection.
+    fn close_failed_connection(&mut self, registry: &Registry, now: Now, failed: bool) {
+        let recheck_unanswered = self.auto.on_websocket
+            && self.racer_check.is_some_and(|check| check.promote_at.is_none())
+            && self.racer.as_ref().is_some_and(|racer| now.mono - racer.started_at >= RACE_VERIFY_TIMEOUT / 2.0);
+        self.close_connection(registry, now, failed);
+        if recheck_unanswered {
+            self.note_tcp_recheck_failed(now);
+        }
+    }
+
     fn close_dropped_connection(&mut self, registry: &Registry, now: Now, failed: bool) {
         if let Some(connection) = &self.connection
             && connection.received_packet
@@ -1022,7 +1080,7 @@ impl SessionRuntime {
             let productive = self.deliveries != self.deliveries_at_open;
             self.flaps = if lived < STABLE_CONNECTION_AFTER && !productive { self.flaps.saturating_add(1) } else { 0 };
         }
-        self.close_connection(registry, now, failed);
+        self.close_failed_connection(registry, now, failed);
         let jitter = self.next_jitter();
         self.next_attempt_at = self.next_attempt_at.max(now.mono + flap_delay(self.flaps, jitter));
     }
@@ -1169,6 +1227,12 @@ impl SessionRuntime {
         if !self.network_available {
             self.unavailable_probe_at = now.mono + UNAVAILABLE_PROBE_INTERVAL;
         }
+        if self.setup.web_proxy() {
+            return self.start_carrier_connection(registry, now, rng);
+        }
+        if self.auto.on_websocket {
+            return self.start_websocket_connection(registry, now, rng);
+        }
         let (index, socket_address, address) = match self.pick_address(resolver, now) {
             Pick::Ready(index, socket_address, address) => (index, socket_address, address),
             pick => return self.defer_connection(pick, now),
@@ -1227,6 +1291,7 @@ impl SessionRuntime {
             return false;
         };
         if !connection.received_packet
+            || self.auto.on_websocket
             || self.setup.proxy.is_some()
             || self.setup.addresses.is_empty()
             || self.suspect_since.is_some_and(|since| now.mono - since >= SUSPECT_HOLD)
@@ -1254,6 +1319,7 @@ impl SessionRuntime {
             return;
         };
         if self.racer.is_some()
+            || self.auto.on_websocket
             || self.setup.proxy.is_some()
             || self.setup.addresses.is_empty()
             || now.mono < self.racer_retry_at
@@ -1489,6 +1555,13 @@ impl SessionRuntime {
         if verified {
             if self.http.is_some() {
                 self.switch_back_to_tcp(registry, now, callbacks);
+            } else if self.auto.on_websocket {
+                let index = self.racer.as_ref().map_or(0, |racer| racer.address_index);
+                self.racer_failures = 0;
+                self.note_address(index, true, now);
+                self.leave_websocket_for_tcp(now, callbacks);
+                self.promote_racer(registry, now, callbacks, rng, Some(DropReason::TransportSwitch));
+                return;
             }
             let Some(racer) = self.racer.as_ref() else {
                 return;
@@ -1559,8 +1632,8 @@ impl SessionRuntime {
         if self.http.as_ref().is_some_and(|http| http.owns(token)) {
             return self.handle_http_io(token, readable, writable, registry, scratch, now, callbacks, rng);
         }
-        if self.auto.probe_token() == Some(token) {
-            self.handle_http_probe_io(readable, writable, registry, scratch, now, callbacks);
+        if self.auto.owns_probe(token) {
+            self.handle_http_probe_io(token, readable, writable, registry, scratch, now, callbacks, rng);
             return false;
         }
         if self.racer.as_ref().is_some_and(|racer| racer.token() == token) {
@@ -1632,8 +1705,10 @@ impl SessionRuntime {
             if let Err(error) = self.process_incoming(registry, now, callbacks, rng) {
                 failure = Some(error);
             }
-        } else if matches!(failure, Some(ConnectionError::Closed) | Some(ConnectionError::Io(_)))
-            && let Err(error) = self.process_incoming(registry, now, callbacks, rng)
+        } else if matches!(
+            failure,
+            Some(ConnectionError::Closed) | Some(ConnectionError::Io(_)) | Some(ConnectionError::WebSocket(_))
+        ) && let Err(error) = self.process_incoming(registry, now, callbacks, rng)
         {
             failure = Some(error);
         }
@@ -1654,9 +1729,10 @@ impl SessionRuntime {
                 None => match error {
                     ConnectionError::Closed => DropReason::Closed,
                     ConnectionError::Io(_) => DropReason::IoError,
-                    ConnectionError::Transport(_) | ConnectionError::Socks(_) | ConnectionError::Proxy(_) => {
-                        DropReason::Protocol
-                    }
+                    ConnectionError::Transport(_)
+                    | ConnectionError::Socks(_)
+                    | ConnectionError::Proxy(_)
+                    | ConnectionError::WebSocket(_) => DropReason::Protocol,
                 },
             };
             self.report_drop(dropped, now, callbacks);
@@ -1750,11 +1826,14 @@ impl SessionRuntime {
     /// The server answered on the TCP connection, a handshake step or a packet under the key: TCP gets
     /// through, whatever the key turns out to be.
     fn note_server_heard(&mut self, now: Now) {
+        let learns = self.learns_route_hints();
         if let Some(connection) = &mut self.connection
             && !connection.heard_from_server
         {
             connection.heard_from_server = true;
-            self.hints.note_tcp_answered(now.mono);
+            if learns && !connection.is_host_stream() {
+                self.hints.note_tcp_answered(now.unix);
+            }
         }
     }
 
@@ -1800,6 +1879,9 @@ impl SessionRuntime {
                     }
                     if fresh {
                         self.clear_suspicion(registry);
+                        if self.auto.on_websocket {
+                            self.note_websocket_answered();
+                        }
                     }
                     match result {
                         Ok(()) => {
@@ -1823,7 +1905,9 @@ impl SessionRuntime {
                                 self.key_rejections = 0;
                                 let index = self.connection.as_ref().map_or(0, |connection| connection.address_index);
                                 self.report_address(index, true, now, callbacks);
-                                self.drop_racer(registry);
+                                if !self.auto.on_websocket {
+                                    self.drop_racer(registry);
+                                }
                             }
                             self.timeout_fired = false;
                         }
@@ -2123,10 +2207,17 @@ impl SessionRuntime {
                 return;
             }
         }
-        if self.connection.as_ref().is_some_and(|connection| connection.heard_from_server) {
+        if self.auto.on_websocket {
+            if self.racer.as_ref().is_some_and(|racer| now.mono - racer.started_at > RACE_VERIFY_TIMEOUT) {
+                self.fail_racer(registry, now, callbacks);
+            }
+            self.maybe_recheck_tcp(registry, now, resolver, rng);
+            self.settle_websocket(now, callbacks);
+        }
+        if !self.auto.on_websocket && self.connection.as_ref().is_some_and(|connection| connection.heard_from_server) {
             self.cancel_http_probe(registry);
         }
-        self.expire_http_probe(registry, now);
+        self.expire_http_probe(registry, now, resolver, rng);
         self.settle_back_on_tcp(now);
         self.maybe_probe_http(registry, now, resolver, rng);
         let wants = self.wants_connection(now);
@@ -2158,7 +2249,10 @@ impl SessionRuntime {
         {
             let index = connection.address_index;
             let tcp_connected = connection.is_tcp_connected();
-            if !tcp_connected && let Some(racer) = self.racer.take() {
+            if !tcp_connected
+                && !self.auto.on_websocket
+                && let Some(racer) = self.racer.take()
+            {
                 self.report_drop(DropReason::ConnectTimeout, now, callbacks);
                 self.report_address(index, false, now, callbacks);
                 if let Some(mut loser) = self.connection.take() {
@@ -2175,7 +2269,7 @@ impl SessionRuntime {
             callbacks.on_event(self.handle, EngineEvent::AuthKeyCreationFailed { reason: "handshake timeout".into() });
             self.log(callbacks, LogLevel::Info, "handshake timeout");
             self.report_drop(DropReason::HandshakeTimeout, now, callbacks);
-            self.close_connection(registry, now, true);
+            self.close_failed_connection(registry, now, true);
         }
         if failure.is_none()
             && let (Some(rpc), Some(connection)) = (&mut self.rpc, &self.connection)

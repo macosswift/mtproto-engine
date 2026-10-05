@@ -307,7 +307,12 @@ fn tcp_through_a_refusing_proxy_backs_off_whether_given_by_ip_or_name() {
 /// Accepts connections, reads one request and closes, as DPI boxes that cut a flow once they see the
 /// request do. Counts connections.
 fn start_cutter() -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
-    use std::io::Read;
+    start_cutter_answering(b"")
+}
+
+/// As `start_cutter`, sending `reply` before it cuts.
+fn start_cutter_answering(reply: &'static [u8]) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+    use std::io::{Read, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -326,6 +331,7 @@ fn start_cutter() -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
                     }
                     seen.extend_from_slice(&buffer[..read]);
                     if seen.windows(4).any(|window| window == b"\r\n\r\n") {
+                        let _ = stream.write_all(reply);
                         let _ = stream.shutdown(std::net::Shutdown::Both);
                         return;
                     }
@@ -364,6 +370,30 @@ fn http_requests_cut_by_a_middlebox_back_off() {
     for (transport, opened) in results {
         assert!(opened <= 6, "{transport:?}: {opened} connections in 5 s");
     }
+}
+
+/// A middlebox that lets the start of each answer through and then cuts: the link answered, so its
+/// cuts back off like a flapping link's, past the cap that refused connections get.
+#[test]
+fn http_requests_cut_mid_answer_back_off_like_a_flapping_link() {
+    let (port, connections) = start_cutter_answering(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\nxx");
+    let key = random_key(6008);
+    let collector = Arc::new(Collector::default());
+    let engine = engine(&collector);
+    let mut setup =
+        SessionSetup::new(2, SessionRole::Main, vec![DcAddress { host: "127.0.0.1".into(), port, secret: None }]);
+    setup.auth_key = Some(AuthKeyMaterial { key, salts: salts(), init_hash: None });
+    setup.transport = TransportPreference::Http;
+    setup.http_port = None;
+    let session = engine.create_session(setup);
+    engine.send(session, request(1, 1));
+    std::thread::sleep(Duration::from_secs(8));
+    let counted = connections.load(std::sync::atomic::Ordering::Relaxed);
+    std::thread::sleep(Duration::from_secs(12));
+    let opened = connections.load(std::sync::atomic::Ordering::Relaxed) - counted;
+    engine.shutdown();
+    eprintln!("{counted} connections in the first 8 s, {opened} in the next 12 s");
+    assert!(opened <= 5, "{opened} connections in 12 s");
 }
 
 fn read_http_message(stream: &mut std::net::TcpStream, buffer: &mut Vec<u8>) -> Option<(String, Vec<u8>)> {
