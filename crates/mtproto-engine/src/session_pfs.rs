@@ -428,12 +428,15 @@ impl SessionRuntime {
         callbacks.on_event(self.handle, EngineEvent::TemporaryKeyDropped { key_id: key_id as i64 });
     }
 
-    /// The bind answers that mean the server will never take this temporary key.
+    /// The bind answers that mean the server will never take this temporary key: every 400, such as
+    /// CONNECTION_NOT_INITED for a key another client (MtProtoKit) bound and used without
+    /// initConnection, which no retry of the same key gets past.
     pub(super) fn refuses_temporary_key(event: &RpcEvent) -> bool {
         matches!(
             event,
-            RpcEvent::TemporaryKeyBindFailed { message, .. }
-                if matches!(message.as_str(), "ENCRYPTED_MESSAGE_INVALID" | "TEMP_AUTH_KEY_EMPTY" | "TEMP_AUTH_KEY_ALREADY_BOUND" | "EXPIRES_AT_INVALID")
+            RpcEvent::TemporaryKeyBindFailed { code, message }
+                if *code == 400
+                    || matches!(message.as_str(), "ENCRYPTED_MESSAGE_INVALID" | "TEMP_AUTH_KEY_EMPTY" | "TEMP_AUTH_KEY_ALREADY_BOUND" | "EXPIRES_AT_INVALID")
         )
     }
 
@@ -466,7 +469,7 @@ impl SessionRuntime {
                 pfs.refusals = 0;
                 true
             }
-            RpcEvent::TemporaryKeyBindFailed { message, .. } => {
+            RpcEvent::TemporaryKeyBindFailed { code, message } => {
                 pfs.binding = false;
                 pfs.bind_failures = pfs.bind_failures.saturating_add(1);
                 match message.as_str() {
@@ -475,6 +478,9 @@ impl SessionRuntime {
                         pfs.regenerate_after_refusal(now);
                     }
                     "TEMP_AUTH_KEY_EMPTY" | "TEMP_AUTH_KEY_ALREADY_BOUND" | "EXPIRES_AT_INVALID" => {
+                        pfs.regenerate_after_refusal(now);
+                    }
+                    _ if *code == 400 => {
                         pfs.regenerate_after_refusal(now);
                     }
                     _ => {

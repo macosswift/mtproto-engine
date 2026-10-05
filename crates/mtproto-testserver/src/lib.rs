@@ -121,8 +121,13 @@ pub struct ServerOptions {
     pub http_proxy_credentials: Option<String>,
     /// Every `auth.bindTempAuthKey` is refused with this error.
     pub refuse_binds: Option<&'static str>,
+    /// The code `refuse_binds` answers with: 400 when not given.
+    pub refuse_binds_code: Option<i32>,
     /// `auth.bindTempAuthKey` is never answered.
     pub ignore_binds: bool,
+    /// `auth.bindTempAuthKey` for a temporary key bound before is refused with this error, as Telegram
+    /// answers CONNECTION_NOT_INITED for a key another client bound and used without initConnection.
+    pub refuse_rebinds: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1181,16 +1186,19 @@ fn process_packet(
                     ids::RPC_DROP_ANSWER => {}
                     ids::AUTH_BIND_TEMP_AUTH_KEY if options.ignore_binds => {}
                     ids::AUTH_BIND_TEMP_AUTH_KEY => {
-                        let checked = match options.refuse_binds {
-                            Some(error) => Err(error),
-                            None => check_bind(
+                        let rebind = shared_ref.temp_keys.get(&auth_key_id).is_some_and(|temp| temp.bound_to.is_some());
+                        let checked = match (options.refuse_binds, options.refuse_rebinds) {
+                            (Some(error), _) => Err((options.refuse_binds_code.unwrap_or(400), error)),
+                            (None, Some(error)) if rebind => Err((400, error)),
+                            _ => check_bind(
                                 &shared_ref.keys,
                                 &mut shared_ref.temp_keys,
                                 auth_key_id,
                                 session_id,
                                 message.msg_id,
                                 &message.body,
-                            ),
+                            )
+                            .map_err(|error| (400, error)),
                         };
                         let reply = match checked {
                             Ok(()) => {
@@ -1199,9 +1207,9 @@ fn process_packet(
                                 writer.write_u32(0x997275b5);
                                 sp::rpc_result(message.msg_id, &writer.into_inner())
                             }
-                            Err(error) => {
+                            Err((code, error)) => {
                                 stats.bind_failures.push(error.to_string());
-                                sp::rpc_error(message.msg_id, 400, error)
+                                sp::rpc_error(message.msg_id, code, error)
                             }
                         };
                         outgoing.push((reply, true));

@@ -43,6 +43,7 @@ fn run(transport: TransportPreference, bind_error: &'static str, perm_seed: u64)
         ServerOptions {
             handshake: ServerHandshakeBehavior { live_time: true, ..Default::default() },
             refuse_binds: (!bind_error.is_empty()).then_some(bind_error),
+            refuse_binds_code: Some(500),
             ..Default::default()
         },
     );
@@ -83,8 +84,8 @@ fn run(transport: TransportPreference, bind_error: &'static str, perm_seed: u64)
     (cost, binds, temps)
 }
 
-/// A bind refused with an error that is not about the key is retried after 2^n s (up to 30 s); the
-/// worker must sleep in between, with the session's queries held by the bind gate.
+/// A bind refused with an error that is not about the key (500) is retried after 2^n s (up to 30 s);
+/// the worker must sleep in between, with the session's queries held by the bind gate.
 #[test]
 fn the_worker_sleeps_between_bind_retries() {
     let mut worst: f64 = 0.0;

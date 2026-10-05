@@ -253,6 +253,7 @@ fn a_retried_bind_of_an_unverified_key_holds_calls() {
         ServerOptions {
             handshake: ServerHandshakeBehavior { live_time: true, ..Default::default() },
             refuse_binds: Some("RPC_CALL_FAIL"),
+            refuse_binds_code: Some(500),
             ..Default::default()
         },
         "generic bind failures",
@@ -332,4 +333,45 @@ fn a_refused_unverified_key_offered_again_is_not_bound_again() {
     for tag in [2u32, 3] {
         assert_eq!(ran.iter().find(|(t, _)| *t == tag).map(|(_, perm)| *perm), Some(new_perm.id()), "call {tag}");
     }
+}
+
+/// The app's MtProtoKit made and bound a temporary key and used it without initConnection; Telegram
+/// then answers every bind of it with CONNECTION_NOT_INITED (seen live: after PHONE_MIGRATE_2 the login
+/// session retried that bind forever and auth.sendCode never went out). The session drops the key and
+/// makes its own.
+#[test]
+fn an_offered_key_whose_bind_is_refused_with_connection_not_inited_is_replaced() {
+    let perm = random_key(410);
+    let server = TestServer::start(
+        vec![perm.clone()],
+        ServerOptions {
+            handshake: ServerHandshakeBehavior { live_time: true, ..Default::default() },
+            refuse_rebinds: Some("CONNECTION_NOT_INITED"),
+            ..Default::default()
+        },
+    );
+    let collector = Arc::new(Collector::default());
+    let engine = engine(&collector);
+    let donor = engine.create_session(setup(&server, Some(material(perm.clone())), pfs(86_400)));
+    engine.send(donor, request(1));
+    assert!(collector.wait_completed(donor, 1));
+    let mut used = collector.bound_key(donor);
+    used.bound_to = None;
+    let session = engine.create_session(setup(
+        &server,
+        Some(material(perm.clone())),
+        PfsSetup { temporary_key: Some(used.clone()), ..pfs(86_400) },
+    ));
+    engine.send(session, request(2));
+    let done = collector.wait_completed(session, 2);
+    let (failures, ran) = server.with_stats(|stats| (stats.bind_failures.clone(), stats.executed_under.clone()));
+    let in_use = collector.in_use(session);
+    let dropped = collector.dropped(session);
+    engine.shutdown();
+    eprintln!("failures {failures:?}; in use {in_use:x?}; dropped {dropped:x?}");
+    assert!(done, "the call went out under a key of the session's own");
+    assert_eq!(failures, vec!["CONNECTION_NOT_INITED".to_string()], "the refused key was bound once, not again");
+    assert_eq!(dropped, vec![used.material.key.id() as i64], "the host heard the key is dead");
+    assert!(!in_use.iter().any(|(id, _)| *id == used.material.key.id() as i64));
+    assert_eq!(ran.iter().find(|(tag, _)| *tag == 2).map(|(_, key)| *key), Some(perm.id()));
 }
