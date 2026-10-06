@@ -1789,8 +1789,22 @@ fn detailed_info_without_answer_resends_the_query() {
     assert!(packet.find(ids::MSG_RESEND_REQ).is_none());
 }
 
+fn lost_answer_failures(events: &[SessionEvent]) -> Vec<QueryId> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            SessionEvent::Error { id, code: 500, message, .. } if message == ANSWER_LOST => Some(*id),
+            _ => None,
+        })
+        .collect()
+}
+
+/// An announced answer means the server ran the call: it is never sent again under a new msg_id, which
+/// would run it twice. Over TCP the server answers every re-send request on the connection (re-sending
+/// the answer or saying it has none), so an unanswered one is not repeated: the call waits, and only the
+/// server saying it no longer has the answer fails it.
 #[test]
-fn answer_resend_requests_resolve_or_fall_back_to_resending_the_query() {
+fn answer_resend_requests_resolve_or_fail_the_call_without_running_it_again() {
     let mut h = Harness::new();
     let query = h.sent_one(1);
     let answer = h.server.next_msg_id(true);
@@ -1808,8 +1822,12 @@ fn answer_resend_requests_resolve_or_fall_back_to_resending_the_query() {
     let packet = h.flush().unwrap();
     let request = packet.find(ids::MSG_RESEND_REQ).unwrap().msg_id;
     h.deliver(vec![Outgoing::Service(msgs_state_info(request, &[1]))]).unwrap();
-    let packet = h.flush().unwrap();
-    assert!(h.sent_query(&packet, 2) > query, "an answer the server cannot resend means the query is resent");
+    assert_eq!(
+        lost_answer_failures(&h.events()),
+        vec![QueryId(2)],
+        "an answer the server cannot resend fails the call"
+    );
+    assert!(h.flush_all().iter().all(|packet| packet.queries().is_empty()), "the call is not sent again");
 
     let query = h.sent_one(3);
     let answer = h.server.next_msg_id(true);
@@ -1829,9 +1847,44 @@ fn answer_resend_requests_resolve_or_fall_back_to_resending_the_query() {
             }
         }
     }
-    assert_eq!(requests, MAX_ANSWER_REQUESTS as usize);
-    assert!(resent.is_some_and(|id| id > query), "unanswered resend requests fall back to resending the query");
-    assert!(!h.session.is_performing_service_tasks() || h.session.has_unanswered_queries());
+    assert_eq!(requests, 1, "the answer is asked for once on this connection: {requests} requests in 80 s");
+    assert_eq!(resent, None, "unanswered resend requests never send the call again");
+    assert!(lost_answer_failures(&h.events()).is_empty(), "the call waits for its answer");
+    assert!(h.session.has_unanswered_queries());
+    h.deliver_sealed(answer, 1, &rpc_result(query, &[5, 5, 5, 5])).unwrap();
+    assert!(h.results().contains(&(QueryId(3), vec![5, 5, 5, 5])), "a late answer still completes it");
+}
+
+/// The server announcing an answer again shows it still holds it: over TCP a re-send request stays out
+/// until the server replies to it (production always does) or `TCP_ASK_BACKSTOP` passes, so announcements
+/// add no requests meanwhile, and the call is never given up or run again.
+#[test]
+fn an_answer_the_server_keeps_announcing_is_asked_for_without_running_the_call_again() {
+    let mut h = Harness::new();
+    let query = h.sent_one(1);
+    let answer = h.server.next_msg_id(true);
+    h.deliver(vec![Outgoing::Service(msg_detailed_info(query, answer, 40_000))]).unwrap();
+    let mut requests = 0;
+    let mut events = Vec::new();
+    for second in 0..300 {
+        h.advance(1.0);
+        if second % 5 == 0 {
+            h.deliver(vec![Outgoing::Service(msg_detailed_info(query, answer, 40_000))]).unwrap();
+        }
+        h.session.handle_timeout(h.now).unwrap();
+        while let Some(packet) = h.flush() {
+            h.answer_pings(&packet);
+            if packet.find(ids::MSG_RESEND_REQ).is_some() {
+                requests += 1;
+            }
+            assert!(packet.queries().is_empty(), "the call ran on the server; it never goes again");
+        }
+        events.extend(h.events());
+    }
+    assert!(lost_answer_failures(&events).is_empty());
+    assert!((1..=3).contains(&requests), "{requests} requests");
+    h.deliver_sealed(answer, 1, &rpc_result(query, &[4, 4, 4, 4])).unwrap();
+    assert_eq!(h.results(), vec![(QueryId(1), vec![4, 4, 4, 4])]);
 }
 
 #[test]
@@ -2562,7 +2615,7 @@ fn outgoing_containers_never_exceed_1024_messages() {
 }
 
 #[test]
-fn a_failed_batched_answer_request_is_retried_one_by_one_before_any_query_is_resent() {
+fn a_failed_batched_answer_request_is_retried_one_by_one_before_any_call_fails() {
     let mut h = Harness::new();
     h.sync();
     h.session.send(QueryId(1), query_body(1), QueryOptions::default(), h.now);
@@ -2580,7 +2633,8 @@ fn a_failed_batched_answer_request_is_retried_one_by_one_before_any_query_is_res
     assert_eq!(read_vector_after_constructor(&batch.body).len(), 2);
     h.deliver(vec![Outgoing::Service(msgs_state_info(batch.msg_id, &[4, 1]))]).unwrap();
     let packet = h.flush().unwrap();
-    assert!(packet.queries().is_empty(), "no query is resent while one of the answers may still exist");
+    assert!(packet.queries().is_empty(), "no query is resent");
+    assert!(lost_answer_failures(&h.events()).is_empty(), "nothing fails while one of the answers may still exist");
     let singles: Vec<(i64, Vec<i64>)> = packet
         .messages
         .iter()
@@ -2592,10 +2646,10 @@ fn a_failed_batched_answer_request_is_retried_one_by_one_before_any_query_is_res
     h.deliver_sealed(answer_one, 1, &rpc_result(first, &[1, 1, 1, 1])).unwrap();
     let missing = singles.iter().find(|(_, ids)| ids[0] == answer_two).unwrap().0;
     h.deliver(vec![Outgoing::Service(msgs_state_info(missing, &[1]))]).unwrap();
-    let packet = h.flush().unwrap();
-    let resent: Vec<u32> = packet.queries().iter().filter_map(|message| query_tag(&message.body)).collect();
-    assert_eq!(resent, vec![2], "only the query whose answer is gone is resent");
-    assert_eq!(h.results(), vec![(QueryId(1), vec![1, 1, 1, 1])]);
+    let events = h.events();
+    assert_eq!(lost_answer_failures(&events), vec![QueryId(2)], "only the call whose answer is gone fails");
+    assert!(events.iter().any(|event| matches!(event, SessionEvent::Result { id: QueryId(1), .. })));
+    assert!(h.flush_all().iter().all(|packet| packet.queries().is_empty()), "no call is sent again");
 }
 
 fn large_query_body(tag: u32, size: usize) -> Vec<u8> {
@@ -3843,6 +3897,69 @@ mod http {
         assert!(packet.find(ids::MSG_RESEND_REQ).is_some());
     }
 
+    /// A response is lost whole: large announced answers are asked for in requests of their own, so
+    /// one that a flaky link cuts takes no other answer with it.
+    #[test]
+    fn large_announced_answers_are_asked_for_in_requests_of_their_own() {
+        let mut h = http_harness();
+        for tag in 1..=4 {
+            h.session.send(QueryId(tag), query_body(tag as u32), QueryOptions::default(), h.now);
+        }
+        let (_, packet) = request(&mut h, HttpWait::long_poll(25_000), false).unwrap();
+        let mut sizes = HashMap::new();
+        let mut announcements = Vec::new();
+        for (tag, size) in [(1, 40_000), (2, 2_000), (3, 40_000), (4, 2_000)] {
+            let query = h.sent_query(&packet, tag);
+            let answer = h.server.next_msg_id(true);
+            sizes.insert(answer, size as usize);
+            announcements.push(Outgoing::Service(msg_detailed_info(query, answer, size)));
+        }
+        h.deliver(announcements).unwrap();
+        h.advance(HTTP_ANSWER_HOLD_MAX);
+        let mut asked = Vec::new();
+        while let Some((_, packet)) = request(&mut h, HttpWait::IMMEDIATE, false) {
+            let ids: Vec<i64> = packet
+                .messages
+                .iter()
+                .filter(|message| message.constructor() == ids::MSG_RESEND_REQ)
+                .flat_map(|message| read_vector_after_constructor(&message.body))
+                .collect();
+            if ids.is_empty() {
+                break;
+            }
+            let bytes: usize = ids.iter().map(|id| sizes[id]).sum();
+            assert!(ids.len() == 1 || bytes <= HTTP_ANSWER_REQUEST_BYTES, "{ids:?} {bytes}");
+            asked.extend(ids);
+        }
+        asked.sort_unstable();
+        let mut expected: Vec<i64> = sizes.keys().copied().collect();
+        expected.sort_unstable();
+        assert_eq!(asked, expected, "every answer asked for once");
+    }
+
+    /// While the request asking for an announced answer is out, the server announcing it again brings
+    /// no second request, which would put a second copy of a large answer on the link; once that
+    /// request's response came back without it, the next announcement asks again.
+    #[test]
+    fn an_announced_answer_is_asked_for_again_only_once_the_last_request_for_it_came_back() {
+        let mut h = http_harness();
+        h.session.send(QueryId(1), query_body(1), QueryOptions::default(), h.now);
+        let (_, packet) = request(&mut h, HttpWait::long_poll(25_000), false).unwrap();
+        let query = h.sent_query(&packet, 1);
+        let answer = h.server.next_msg_id(true);
+        h.deliver(vec![Outgoing::Service(msg_detailed_info(query, answer, 40_000))]).unwrap();
+        h.advance(HTTP_ANSWER_HOLD_MAX);
+        let (asking, packet) = request(&mut h, HttpWait::IMMEDIATE, false).unwrap();
+        assert!(packet.find(ids::MSG_RESEND_REQ).is_some());
+        h.deliver(vec![Outgoing::Service(msg_detailed_info(query, answer, 40_000))]).unwrap();
+        let again = request(&mut h, HttpWait::IMMEDIATE, false);
+        assert!(again.is_none_or(|(_, packet)| packet.find(ids::MSG_RESEND_REQ).is_none()), "the request is out");
+        h.session.http_packet_delivered(asking.packet_seq, h.now);
+        h.deliver(vec![Outgoing::Service(msg_detailed_info(query, answer, 40_000))]).unwrap();
+        let (_, packet) = request(&mut h, HttpWait::IMMEDIATE, false).expect("asked again");
+        assert!(packet.find(ids::MSG_RESEND_REQ).is_some());
+    }
+
     #[test]
     fn receiving_never_holds_an_answer_past_the_cap() {
         let mut h = http_harness();
@@ -4126,3 +4243,519 @@ fn an_old_answer_resent_in_a_fresh_container_does_not_bring_the_old_clock_with_i
         h.session.time_difference()
     );
 }
+
+mod announced_answers {
+    use super::*;
+
+    fn http_harness() -> Harness {
+        let mut h = Harness::new();
+        h.session.set_http(true);
+        h
+    }
+
+    fn request(h: &mut Harness, wait: HttpWait) -> Option<(Transmit, DecodedPacket)> {
+        h.advance(0.002);
+        let transmit = h.session.poll_http_transmit(h.now, &mut h.rng, wait, false, true)?;
+        let packet = h.server.decode(&transmit.data);
+        Some((transmit, packet))
+    }
+
+    fn asked(packet: &DecodedPacket) -> Vec<i64> {
+        packet
+            .messages
+            .iter()
+            .filter(|message| message.constructor() == ids::MSG_RESEND_REQ)
+            .flat_map(|message| read_vector_after_constructor(&message.body))
+            .collect()
+    }
+
+    /// A batched ask for two answers, one of which arrives before the server's msgs_state_info about the
+    /// batch: the reply is about the whole batch, so the answer still awaited is asked for alone before
+    /// anything is given up.
+    #[test]
+    fn a_trimmed_batched_ask_is_asked_for_again_one_answer_at_a_time() {
+        let mut h = Harness::new();
+        h.sync();
+        h.session.send(QueryId(1), query_body(1), QueryOptions::default(), h.now);
+        h.session.send(QueryId(2), query_body(2), QueryOptions::default(), h.now);
+        let packet = h.flush().unwrap();
+        let (first, second) = (h.sent_query(&packet, 1), h.sent_query(&packet, 2));
+        let (answer_one, answer_two) = (h.server.next_msg_id(true), h.server.next_msg_id(true));
+        h.deliver(vec![
+            Outgoing::Service(msg_detailed_info(first, answer_one, 100)),
+            Outgoing::Service(msg_detailed_info(second, answer_two, 100)),
+        ])
+        .unwrap();
+        let packet = h.flush().unwrap();
+        let batch = packet.find(ids::MSG_RESEND_REQ).unwrap();
+        assert_eq!(read_vector_after_constructor(&batch.body).len(), 2);
+        h.deliver_sealed(answer_one, 1, &rpc_result(first, &[1, 1, 1, 1])).unwrap();
+        h.deliver(vec![Outgoing::Service(msgs_state_info(batch.msg_id, &[1, 4]))]).unwrap();
+        assert!(lost_answer_failures(&h.events()).is_empty());
+        let reasked: Vec<i64> = h.flush_all().iter().flat_map(asked).collect();
+        assert_eq!(reasked, vec![answer_two]);
+    }
+
+    /// HTTP: the server announces the answer again in responses while asks are out. Overlapping asks do
+    /// not pile up, and an answer that does not come never gives the call up.
+    #[test]
+    fn overlapping_http_asks_do_not_pile_up_or_give_the_call_up() {
+        let mut h = http_harness();
+        h.session.send(QueryId(1), query_body(1), QueryOptions::default(), h.now);
+        let (_, packet) = request(&mut h, HttpWait::long_poll(25_000)).unwrap();
+        let query = h.sent_query(&packet, 1);
+        let answer = h.server.next_msg_id(true);
+        h.deliver(vec![Outgoing::Service(msg_detailed_info(query, answer, 40_000))]).unwrap();
+        h.advance(HTTP_ANSWER_HOLD_MAX);
+        let mut asks = 0;
+        for _ in 0..3 {
+            let (transmit, packet) = request(&mut h, HttpWait::IMMEDIATE).expect("ask");
+            assert!(!asked(&packet).is_empty());
+            asks += 1;
+            h.session.http_packet_delivered(transmit.packet_seq, h.now);
+            h.advance(1.0);
+            h.deliver(vec![Outgoing::Service(msg_detailed_info(query, answer, 40_000))]).unwrap();
+        }
+        for _ in 0..240 {
+            h.advance(0.5);
+            h.session.handle_timeout(h.now).unwrap();
+            while let Some((transmit, packet)) = request(&mut h, HttpWait::IMMEDIATE) {
+                if !asked(&packet).is_empty() {
+                    asks += 1;
+                }
+                h.session.http_packet_delivered(transmit.packet_seq, h.now);
+            }
+        }
+        assert!(lost_answer_failures(&h.events()).is_empty(), "the call waits for its answer");
+        assert!(asks <= 4 + MAX_EXPIRED_ANSWER_ASKS as usize, "{asks} asks in two minutes");
+        assert!(h.session.has_unanswered_queries());
+        assert!(!h.session.is_performing_service_tasks(), "no longer 'updating' once the asks ran out");
+    }
+
+    /// HTTP: the response to the request that asked for a large answer is still arriving on a slow link:
+    /// it may carry the answer, so no other request asks for it meanwhile (each would bring another copy).
+    #[test]
+    fn an_ask_whose_response_is_still_arriving_is_not_repeated() {
+        let mut h = http_harness();
+        h.session.send(QueryId(1), query_body(1), QueryOptions::default(), h.now);
+        let (_, packet) = request(&mut h, HttpWait::long_poll(25_000)).unwrap();
+        let query = h.sent_query(&packet, 1);
+        let answer = h.server.next_msg_id(true);
+        h.deliver(vec![Outgoing::Service(msg_detailed_info(query, answer, 512 * 1024))]).unwrap();
+        h.advance(HTTP_ANSWER_HOLD_MAX);
+        let (_first, packet) = request(&mut h, HttpWait::IMMEDIATE).expect("ask");
+        assert_eq!(asked(&packet), vec![answer]);
+        let mut asks_while_arriving = 0;
+        for _ in 0..240 {
+            h.advance(0.5);
+            h.session.note_http_receiving(h.now);
+            h.session.handle_timeout(h.now).unwrap();
+            while let Some((_, packet)) = request(&mut h, HttpWait::IMMEDIATE) {
+                if !asked(&packet).is_empty() {
+                    asks_while_arriving += 1;
+                }
+            }
+        }
+        assert_eq!(asks_while_arriving, 0);
+        assert!(h.session.poll_timeout(h.now).is_none_or(|at| at > h.now.mono), "no deadline in the past");
+    }
+
+    /// Over TCP the server's reply to a re-send request may come long after it (behind a large answer on a
+    /// slow link): saying it no longer has the answer still fails the call then.
+    #[test]
+    fn a_late_reply_to_a_tcp_ask_still_counts() {
+        let mut h = Harness::new();
+        let query = h.sent_one(1);
+        let answer = h.server.next_msg_id(true);
+        h.deliver(vec![Outgoing::Service(msg_detailed_info(query, answer, 100))]).unwrap();
+        let ask = h.flush().unwrap().find(ids::MSG_RESEND_REQ).unwrap().msg_id;
+        for _ in 0..60 {
+            h.advance(1.0);
+            h.session.handle_timeout(h.now).unwrap();
+            while let Some(packet) = h.flush() {
+                h.answer_pings(&packet);
+            }
+        }
+        assert!(h.session.is_performing_service_tasks(), "the ask waits for the server's reply");
+        h.deliver(vec![Outgoing::Service(msgs_state_info(ask, &[2]))]).unwrap();
+        assert_eq!(lost_answer_failures(&h.events()), vec![QueryId(1)]);
+        assert!(!h.session.is_performing_service_tasks());
+    }
+
+    /// A cancelled call's announced answer is not asked for any more, not even on a new connection.
+    #[test]
+    fn a_cancelled_calls_answer_is_not_asked_for_again() {
+        let mut h = Harness::new();
+        let query = h.sent_one(1);
+        let answer = h.server.next_msg_id(true);
+        h.deliver(vec![Outgoing::Service(msg_detailed_info(query, answer, 100))]).unwrap();
+        assert!(h.flush().unwrap().find(ids::MSG_RESEND_REQ).is_some());
+        h.session.cancel(QueryId(1));
+        h.session.connection_closed();
+        h.advance(1.0);
+        h.session.connection_opened(h.now);
+        let packets = h.flush_all();
+        assert!(packets.iter().all(|packet| asked(packet).is_empty()), "the cancelled call's answer was asked for");
+    }
+
+    /// HTTP: two asks for one answer are out when the first expires; only the last one to expire asks
+    /// again, so the answer is not requested twice at once.
+    #[test]
+    fn only_the_last_of_two_expiring_asks_asks_again() {
+        let mut h = http_harness();
+        h.session.send(QueryId(1), query_body(1), QueryOptions::default(), h.now);
+        let (_, packet) = request(&mut h, HttpWait::long_poll(25_000)).unwrap();
+        let query = h.sent_query(&packet, 1);
+        let answer = h.server.next_msg_id(true);
+        h.deliver(vec![Outgoing::Service(msg_detailed_info(query, answer, 40_000))]).unwrap();
+        h.advance(HTTP_ANSWER_HOLD_MAX);
+        for _ in 0..2 {
+            let (transmit, packet) = request(&mut h, HttpWait::IMMEDIATE).expect("ask");
+            assert_eq!(asked(&packet), vec![answer]);
+            h.session.http_packet_delivered(transmit.packet_seq, h.now);
+            h.advance(2.0);
+            h.deliver(vec![Outgoing::Service(msg_detailed_info(query, answer, 40_000))]).unwrap();
+        }
+        while let Some((transmit, _)) = request(&mut h, HttpWait::IMMEDIATE) {
+            h.session.http_packet_delivered(transmit.packet_seq, h.now);
+        }
+        let mut asks = 0;
+        for _ in 0..50 {
+            h.advance(0.5);
+            h.session.handle_timeout(h.now).unwrap();
+            while let Some((transmit, packet)) = request(&mut h, HttpWait::IMMEDIATE) {
+                asks += asked(&packet).len();
+                h.session.http_packet_delivered(transmit.packet_seq, h.now);
+            }
+        }
+        assert_eq!(asks, 1, "{asks} asks once the two expired");
+    }
+
+    fn run_idle(h: &mut Harness, seconds: usize) -> (usize, usize) {
+        let (mut asks, mut pings) = (0, 0);
+        for _ in 0..seconds {
+            h.advance(1.0);
+            h.session.handle_timeout(h.now).unwrap();
+            while let Some(packet) = h.flush() {
+                pings += packet
+                    .messages
+                    .iter()
+                    .filter(|m| m.constructor() == ids::PING_DELAY_DISCONNECT || m.constructor() == ids::PING)
+                    .count();
+                h.answer_pings(&packet);
+                if packet.find(ids::MSG_RESEND_REQ).is_some() {
+                    asks += 1;
+                }
+            }
+        }
+        (asks, pings)
+    }
+
+    /// TCP: the call is cancelled while its announced answer is asked for, and the server then re-sends
+    /// the answer (alone or in a container), as production does: the ask does not stay out on the live
+    /// connection, so the session neither shows "updating" nor stays on its busy ping cadence.
+    #[test]
+    fn a_cancelled_calls_ask_does_not_stay_out_once_its_answer_comes() {
+        for in_container in [false, true] {
+            let mut h = Harness::new();
+            h.session.set_online(false, h.now);
+            h.sync();
+            let query = h.sent_one(1);
+            let answer = h.server.next_msg_id(true);
+            h.deliver(vec![Outgoing::Service(msg_detailed_info(query, answer, 100))]).unwrap();
+            assert!(h.flush().unwrap().find(ids::MSG_RESEND_REQ).is_some());
+            h.session.cancel(QueryId(1));
+            if in_container {
+                h.deliver(vec![Outgoing::Content(rpc_result(query, &[7, 0, 0, 0]))]).unwrap();
+            } else {
+                h.deliver_sealed(answer, 1, &rpc_result(query, &[7, 0, 0, 0])).unwrap();
+            }
+            h.events();
+            assert!(!h.session.is_performing_service_tasks(), "in_container={in_container}");
+            assert!(!h.session.is_awaiting_responses(), "in_container={in_container}");
+            run_idle(&mut h, 60);
+            let (_, pings) = run_idle(&mut h, 600);
+            assert!(pings <= 20, "{pings} pings in 10 idle minutes (in_container={in_container})");
+        }
+    }
+
+    /// TCP: an answer announced with no query is asked for, and the server re-sends it after an outage
+    /// longer than the time window, answering no call that still waits: the packet is dropped, and the ask
+    /// still ends once `TCP_ASK_BACKSTOP` passes.
+    #[test]
+    fn an_ask_whose_reply_is_dropped_ends_after_the_backstop() {
+        let mut h = Harness::new();
+        h.sync();
+        let answer = h.server.next_msg_id(true);
+        run_idle(&mut h, 400);
+        h.deliver(vec![Outgoing::Service(msg_new_detailed_info(answer, 100))]).unwrap();
+        let mut asked = false;
+        while let Some(packet) = h.flush() {
+            asked |= packet.find(ids::MSG_RESEND_REQ).is_some();
+        }
+        assert!(asked);
+        h.deliver_sealed(answer, 1, &rpc_result(12345, &[7, 0, 0, 0])).unwrap();
+        let (asks, _) = run_idle(&mut h, TCP_ASK_BACKSTOP as usize + 5);
+        assert_eq!(asks, 0, "the ask is not repeated");
+        assert!(!h.session.is_performing_service_tasks());
+    }
+
+    /// An answer re-sent on request after an outage longer than the time window (its msg_id from before,
+    /// still within the duplicate window) completes its call and counts as fresh.
+    #[test]
+    fn a_requested_answer_past_the_time_window_counts_as_fresh() {
+        let mut h = Harness::new();
+        h.sync();
+        let query = h.sent_one(1);
+        let answer = h.server.next_msg_id(true);
+        h.deliver(vec![Outgoing::Service(msg_detailed_info(query, answer, 40_000))]).unwrap();
+        h.advance(MSG_ID_MAX_PAST_SECONDS + 100.0);
+        h.deliver(vec![Outgoing::Content(update(0x0101_0101, &[0; 4]))]).unwrap();
+        h.events();
+        let fresh_before = h.session.fresh_packets();
+        h.deliver_sealed(answer, 1, &rpc_result(query, &[7, 0, 0, 0])).unwrap();
+        assert!(h.results().iter().any(|(id, _)| *id == QueryId(1)));
+        assert_eq!(h.session.fresh_packets(), fresh_before + 1);
+    }
+
+    /// A middlebox replays the packet that carried a requested answer (past the duplicate window, or past
+    /// the time window): only its first copy completes the call and counts as fresh.
+    #[test]
+    fn a_replayed_requested_answer_counts_as_fresh_once() {
+        for past_time_window in [false, true] {
+            let mut h = Harness::new();
+            h.sync();
+            let query = h.sent_one(1);
+            let answer = h.server.next_msg_id(true);
+            h.deliver(vec![Outgoing::Service(msg_detailed_info(query, answer, 40_000))]).unwrap();
+            if past_time_window {
+                h.advance(MSG_ID_MAX_PAST_SECONDS + 100.0);
+                h.deliver(vec![Outgoing::Content(update(0x0101_0101, &[0; 4]))]).unwrap();
+            } else {
+                for _ in 0..2100 {
+                    h.deliver(vec![Outgoing::Content(update(0x0101_0101, &[0; 4]))]).unwrap();
+                }
+            }
+            h.events();
+            let packet = h.server.seal(answer, 1, &rpc_result(query, &[7, 0, 0, 0]));
+            let fresh_before = h.session.fresh_packets();
+            for _ in 0..5 {
+                let _ = h.session.handle_packet(&packet, h.now, &mut h.rng);
+            }
+            assert_eq!(h.results().len(), 1, "past_time_window={past_time_window}");
+            assert_eq!(h.session.fresh_packets(), fresh_before + 1, "past_time_window={past_time_window}");
+        }
+    }
+
+    /// TCP: a large announced answer takes long to come down a slow link; it is asked for once, not again
+    /// every `STATE_REQUEST_RETRY` while it is on its way.
+    #[test]
+    fn a_large_answer_in_transit_over_tcp_is_asked_for_once() {
+        let mut h = Harness::new();
+        let query = h.sent_one(1);
+        let answer = h.server.next_msg_id(true);
+        h.deliver(vec![Outgoing::Service(msg_detailed_info(query, answer, 1024 * 1024))]).unwrap();
+        let mut requests = 0;
+        for _ in 0..200 {
+            h.advance(1.0);
+            h.session.handle_timeout(h.now).unwrap();
+            while let Some(packet) = h.flush() {
+                h.answer_pings(&packet);
+                if packet.find(ids::MSG_RESEND_REQ).is_some() {
+                    requests += 1;
+                }
+            }
+        }
+        assert_eq!(requests, 1);
+    }
+
+    /// The server lost its session after announcing an answer: the call goes again in the new session
+    /// (as in tdlib), and a late msgs_state_info about the old session's answer does not fail it.
+    #[test]
+    fn a_late_reply_about_the_old_sessions_answer_does_not_fail_the_call_sent_again() {
+        let mut h = Harness::new();
+        h.sync();
+        let query = h.sent_one(1);
+        let answer = h.server.next_msg_id(true);
+        h.deliver(vec![Outgoing::Service(msg_detailed_info(query, answer, 100))]).unwrap();
+        let packet = h.flush().unwrap();
+        let ask = packet.find(ids::MSG_RESEND_REQ).unwrap().msg_id;
+        h.deliver(vec![Outgoing::Content(new_session_created(ask, 77, 101))]).unwrap();
+        let resent: Vec<i64> = h
+            .flush_all()
+            .iter()
+            .flat_map(|packet| packet.messages.iter().filter(|m| query_tag(&m.body) == Some(1)).map(|m| m.msg_id))
+            .collect();
+        assert_eq!(resent.len(), 1, "the call goes again in the new session");
+        h.events();
+        h.deliver(vec![Outgoing::Service(msgs_state_info(ask, &[1]))]).unwrap();
+        assert!(lost_answer_failures(&h.events()).is_empty());
+        h.deliver(vec![Outgoing::Content(rpc_result(resent[0], &[9, 9, 9, 9]))]).unwrap();
+        assert_eq!(h.results(), vec![(QueryId(1), vec![9, 9, 9, 9])]);
+    }
+}
+
+/// An answer the server re-sends on request after more than the duplicate window of other messages
+/// (an outage) completes its call and counts as news from the server, so a link carrying it is not
+/// taken for one replaying old packets.
+#[test]
+fn a_requested_answer_past_the_duplicate_window_counts_as_fresh() {
+    let mut h = Harness::new();
+    h.sync();
+    let query = h.sent_one(1);
+    let answer = h.server.next_msg_id(true);
+    h.deliver(vec![Outgoing::Service(msg_detailed_info(query, answer, 40_000))]).unwrap();
+    for _ in 0..2100 {
+        h.deliver(vec![Outgoing::Content(update(0x0101_0101, &[0; 4]))]).unwrap();
+    }
+    h.events();
+    let fresh_before = h.session.fresh_packets();
+    h.deliver_sealed(answer, 1, &rpc_result(query, &[7, 0, 0, 0])).unwrap();
+    assert!(h.results().iter().any(|(id, _)| *id == QueryId(1)));
+    assert_eq!(h.session.fresh_packets(), fresh_before + 1);
+}
+
+/// The only salt has expired and the request for future salts is out: until its reply the session has
+/// nothing to send, so it does not ask to be woken at once (a busy loop for a round trip, or for a minute
+/// when the reply is lost).
+#[test]
+fn an_expired_salt_with_future_salts_asked_for_does_not_spin() {
+    let mut h =
+        Harness::with_salts(vec![ServerSalt { salt: 101, valid_since: START - 100.0, valid_until: START + 120.0 }]);
+    h.sync();
+    for _ in 0..200 {
+        h.advance(0.05);
+        let _ = h.session.handle_timeout(h.now);
+        while let Some(packet) = h.flush() {
+            h.answer_pings(&packet);
+        }
+    }
+    h.advance(60.0);
+    let _ = h.session.handle_timeout(h.now);
+    let mut asked = false;
+    while let Some(packet) = h.flush() {
+        asked |= packet.find(ids::GET_FUTURE_SALTS).is_some();
+    }
+    assert!(asked, "future salts are asked for");
+    assert!(!h.session.salts.has_valid_salt(h.session.server_time(h.now)), "the salt expired");
+    let mut immediate = 0;
+    for _ in 0..100 {
+        h.advance(0.01);
+        let _ = h.session.handle_timeout(h.now);
+        let sent = h.flush().is_some();
+        if !sent && h.session.poll_timeout(h.now).is_some_and(|at| at <= h.now.mono) {
+            immediate += 1;
+        }
+    }
+    assert_eq!(immediate, 0, "{immediate} of 100 idle checks asked to be woken at once");
+}
+
+/// The next salt overlaps the current one by less than the safety margin: between the current salt's
+/// margin and the next salt's start nothing can be sent, and a query queued meanwhile goes out once the
+/// next salt starts, not a future-salts retry later.
+#[test]
+fn a_query_waiting_for_the_next_salt_goes_out_when_it_starts() {
+    let mut h = Harness::with_salts(vec![
+        ServerSalt { salt: 101, valid_since: START - 100.0, valid_until: START + 300.0 },
+        ServerSalt { salt: 102, valid_since: START + 280.0, valid_until: START + 100_000.0 },
+    ]);
+    h.sync();
+    for _ in 0..250 {
+        h.advance(1.0);
+        let _ = h.session.handle_timeout(h.now);
+        while let Some(packet) = h.flush() {
+            h.answer_pings(&packet);
+        }
+    }
+    h.session.send(QueryId(7), query_body(7), QueryOptions::default(), h.now);
+    let mut sent_at = None;
+    for _ in 0..200 {
+        let wake = h.session.poll_timeout(h.now).unwrap_or(h.now.mono + 1000.0);
+        h.advance((wake - h.now.mono).max(0.001));
+        let _ = h.session.handle_timeout(h.now);
+        while let Some(packet) = h.flush() {
+            h.answer_pings(&packet);
+            if packet.messages.iter().any(|m| query_tag(&m.body) == Some(7)) {
+                sent_at = Some(h.session.server_time(h.now) - START);
+            }
+        }
+        if sent_at.is_some() {
+            break;
+        }
+    }
+    let sent_at = sent_at.expect("the query went out");
+    assert!(sent_at <= 281.0, "the query went out at +{sent_at:.1} s, the next salt starts at +280 s");
+}
+
+fn wait_for_query_7(h: &mut Harness, exact: bool) -> Option<f64> {
+    for _ in 0..400 {
+        let wake = h.session.poll_timeout(h.now).unwrap_or(h.now.mono + 1000.0);
+        let step = wake - h.now.mono;
+        if exact {
+            h.now.mono += step.max(0.0);
+            h.now.unix += step.max(0.0);
+            h.server.server_time += step.max(0.0);
+        } else {
+            h.advance(step.max(0.001));
+        }
+        let _ = h.session.handle_timeout(h.now);
+        loop {
+            let packet = if exact {
+                h.session.poll_transmit(h.now, &mut h.rng).map(|t| h.server.decode(&t.data))
+            } else {
+                h.flush()
+            };
+            let Some(packet) = packet else { break };
+            h.answer_pings(&packet);
+            if packet.messages.iter().any(|m| query_tag(&m.body) == Some(7)) {
+                return Some(h.session.server_time(h.now) - START);
+            }
+        }
+    }
+    None
+}
+
+fn salt_gap_harness(salts: Vec<ServerSalt>) -> Harness {
+    let mut h = Harness::with_salts(salts);
+    h.sync();
+    for _ in 0..250 {
+        h.advance(1.0);
+        let _ = h.session.handle_timeout(h.now);
+        while let Some(packet) = h.flush() {
+            h.answer_pings(&packet);
+        }
+    }
+    h.session.send(QueryId(7), query_body(7), QueryOptions::default(), h.now);
+    h
+}
+
+/// Several future salts held, the earliest starting after the current one's margin: a query queued in
+/// the gap goes out when the earliest starts.
+#[test]
+fn a_query_waits_for_the_earliest_of_several_future_salts() {
+    let mut h = salt_gap_harness(vec![
+        ServerSalt { salt: 101, valid_since: START - 100.0, valid_until: START + 300.0 },
+        ServerSalt { salt: 102, valid_since: START + 280.0, valid_until: START + 3_000.0 },
+        ServerSalt { salt: 103, valid_since: START + 2_900.0, valid_until: START + 6_000.0 },
+        ServerSalt { salt: 104, valid_since: START + 5_900.0, valid_until: START + 9_000.0 },
+    ]);
+    let sent = wait_for_query_7(&mut h, false).expect("sent");
+    assert!(sent <= 281.0, "sent at +{sent:.1} s");
+}
+
+/// A wake landing exactly on the next salt's start rotates to it.
+#[test]
+fn a_wake_exactly_at_the_next_salts_start_uses_it() {
+    let mut h = salt_gap_harness(vec![
+        ServerSalt { salt: 101, valid_since: START - 100.0, valid_until: START + 300.0 },
+        ServerSalt { salt: 102, valid_since: START + 280.0, valid_until: START + 100_000.0 },
+    ]);
+    let sent = wait_for_query_7(&mut h, true);
+    assert!(sent.is_some_and(|at| at <= 281.0), "sent at {sent:?}");
+}
+
+#[path = "answer_model_tests.rs"]
+mod answer_model;
+
+#[path = "announced_answer_cases_tests.rs"]
+mod announced_answer_cases;

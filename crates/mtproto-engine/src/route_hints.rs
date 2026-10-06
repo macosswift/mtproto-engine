@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// How long a session's finding that TCP does not get through, and HTTP does, is trusted by the others
 /// on a network the host does not name.
@@ -19,6 +19,9 @@ const REFRESH_AFTER: f64 = 3600.0;
 const MAX_KEY_LENGTH: usize = 64;
 const MEMORY_FORMAT: u8 = 1;
 const ENTRY_LENGTH_AFTER_KEY: usize = 24;
+/// Datacenters a finding keeps apart: those whose TCP did not get through, and those whose TCP answered
+/// since. One blocked datacenter does not make the network block TCP, nor does another answering clear it.
+const DATACENTERS_TRACKED: usize = 8;
 
 /// What the engine's sessions learned about the network, in Unix seconds: once one of them proved that
 /// only HTTP gets through, the others try HTTP at once instead of waiting out their own TCP silence.
@@ -32,6 +35,9 @@ pub struct RouteHints {
     reporting: Mutex<()>,
     /// A change waits to be reported: workers check it without taking the locks.
     pending: AtomicBool,
+    /// Moves whenever the host names another network: what a session found before then was about the
+    /// old one.
+    generation: AtomicU64,
 }
 
 #[derive(Debug, Default)]
@@ -47,12 +53,46 @@ struct Record {
     http_needed_at: Option<f64>,
     tcp_answered_at: Option<f64>,
     seen_at: f64,
+    /// Kept for this run only: a record from memory knows no datacenters, and the first TCP answer
+    /// clears it.
+    blocked: Datacenters,
+    answered: Datacenters,
 }
 
 impl Record {
     fn http_likely(&self, now: f64, lifetime: f64) -> bool {
         self.http_needed_at.is_some_and(|at| now - at < lifetime && at - now <= FUTURE_TOLERANCE)
             && self.tcp_answered_at.is_none_or(|tcp| tcp < self.http_needed_at.unwrap_or(0.0))
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+struct Datacenters([i32; DATACENTERS_TRACKED]);
+
+impl Datacenters {
+    fn contains(&self, datacenter: i32) -> bool {
+        datacenter != 0 && self.0.contains(&datacenter)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.iter().all(|slot| *slot == 0)
+    }
+
+    fn insert(&mut self, datacenter: i32) {
+        if datacenter == 0 || self.contains(datacenter) {
+            return;
+        }
+        if let Some(slot) = self.0.iter_mut().find(|slot| **slot == 0) {
+            *slot = datacenter;
+        }
+    }
+
+    fn remove(&mut self, datacenter: i32) {
+        for slot in &mut self.0 {
+            if *slot == datacenter {
+                *slot = 0;
+            }
+        }
     }
 }
 
@@ -94,17 +134,32 @@ impl State {
 }
 
 impl RouteHints {
-    pub fn note_http_needed(&self, now: f64) {
+    /// The network the findings are about now; a finding made under another is dropped.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// TCP to `datacenter` did not get through on the network of `generation`, and HTTP did.
+    pub fn note_http_needed_for(&self, datacenter: i32, generation: u64, now: f64) {
         if let Ok(mut state) = self.inner.lock() {
+            if generation != self.generation() {
+                return;
+            }
             let named = state.network.is_some();
             let lifetime = state.lifetime();
             let record = state.current();
-            let news =
-                !record.http_likely(now, lifetime) || record.http_needed_at.is_some_and(|at| now - at >= REFRESH_AFTER);
+            let likely = record.http_likely(now, lifetime);
+            let news = !likely || record.http_needed_at.is_some_and(|at| now - at >= REFRESH_AFTER);
+            if !likely {
+                record.blocked = Datacenters::default();
+                record.answered = Datacenters::default();
+            }
             if news || !named {
                 record.http_needed_at = Some(now);
                 record.tcp_answered_at = None;
             }
+            record.blocked.insert(datacenter);
+            record.answered.remove(datacenter);
             record.seen_at = now;
             if named && news {
                 state.changed = true;
@@ -113,16 +168,27 @@ impl RouteHints {
         }
     }
 
-    /// A TCP connection answered: whatever was found about TCP on this network no longer holds, however
-    /// the clock moved since.
-    pub fn note_tcp_answered(&self, now: f64) {
+    /// A TCP connection to `datacenter` answered on the network of `generation`: whatever was found about
+    /// TCP there no longer holds, however the clock moved since, unless other datacenters were found
+    /// blocked and have not answered.
+    pub fn note_tcp_answered_for(&self, datacenter: i32, generation: u64, now: f64) {
         if let Ok(mut state) = self.inner.lock() {
+            if generation != self.generation() {
+                return;
+            }
             let named = state.network.is_some();
             let record = state.current();
+            record.seen_at = now;
+            record.blocked.remove(datacenter);
+            if record.http_needed_at.is_some() && !record.blocked.is_empty() {
+                record.answered.insert(datacenter);
+                return;
+            }
             let flips = record.http_needed_at.is_some();
             record.http_needed_at = None;
             record.tcp_answered_at = Some(now);
-            record.seen_at = now;
+            record.blocked = Datacenters::default();
+            record.answered = Datacenters::default();
             if named && flips {
                 state.changed = true;
                 self.pending.store(true, Ordering::Release);
@@ -130,11 +196,29 @@ impl RouteHints {
         }
     }
 
-    /// TCP did not get through lately on this network, and no TCP connection answered since.
-    pub fn http_likely(&self, now: f64) -> bool {
-        self.inner
-            .lock()
-            .is_ok_and(|state| state.peek().is_some_and(|record| record.http_likely(now, state.lifetime())))
+    /// TCP did not get through lately on this network, and no TCP connection to `datacenter` answered
+    /// since.
+    pub fn http_likely_for(&self, datacenter: i32, now: f64) -> bool {
+        self.inner.lock().is_ok_and(|state| {
+            state.peek().is_some_and(|record| {
+                record.http_likely(now, state.lifetime()) && !record.answered.contains(datacenter)
+            })
+        })
+    }
+
+    #[cfg(test)]
+    fn note_http_needed(&self, now: f64) {
+        self.note_http_needed_for(0, self.generation(), now);
+    }
+
+    #[cfg(test)]
+    fn note_tcp_answered(&self, now: f64) {
+        self.note_tcp_answered_for(0, self.generation(), now);
+    }
+
+    #[cfg(test)]
+    fn http_likely(&self, now: f64) -> bool {
+        self.http_likely_for(0, now)
     }
 
     /// A new network the host does not name: nothing learned on the old one holds. Named networks keep
@@ -159,6 +243,7 @@ impl RouteHints {
         }
         state.network = key;
         state.unnamed = Record::default();
+        self.generation.fetch_add(1, Ordering::AcqRel);
         if state.network.is_some() {
             state.current().seen_at = now;
             state.prune(now);
@@ -274,6 +359,7 @@ fn parse(memory: &[u8]) -> Option<Vec<(Vec<u8>, Record)>> {
                 http_needed_at: time_from(&times[0..8]),
                 tcp_answered_at: time_from(&times[8..16]),
                 seen_at: time_from(&times[16..24]).unwrap_or(0.0),
+                ..Record::default()
             },
         ));
         rest = &after[length + ENTRY_LENGTH_AFTER_KEY..];
@@ -385,5 +471,43 @@ mod tests {
             loaded.load(garbage, now);
         }
         assert!(loaded.export(now).len() == 2, "nothing was taken from malformed memory");
+    }
+
+    #[test]
+    fn one_blocked_datacenter_does_not_flip_the_network() {
+        let now = 1_800_000_000.0;
+        let hints = RouteHints::default();
+        hints.set_network(b"office", now);
+        let generation = hints.generation();
+        hints.note_http_needed_for(4, generation, now);
+        assert!(hints.take_change(now).is_some());
+        for second in 1..20 {
+            hints.note_tcp_answered_for(2, generation, now + f64::from(second));
+            hints.note_http_needed_for(4, generation, now + f64::from(second));
+        }
+        assert!(hints.take_change(now + 20.0).is_none(), "the memory is not stored again and again");
+        assert!(hints.http_likely_for(4, now + 20.0), "datacenter 4 still gets HTTP early");
+        assert!(hints.http_likely_for(5, now + 20.0), "so does one not heard from yet");
+        assert!(!hints.http_likely_for(2, now + 20.0), "one whose TCP answers does not");
+        hints.note_tcp_answered_for(4, generation, now + 21.0);
+        assert!(!hints.http_likely_for(5, now + 21.0), "once the blocked one answers, nothing is blocked");
+        assert!(hints.take_change(now + 21.0).is_some());
+    }
+
+    #[test]
+    fn a_finding_made_before_the_network_changed_is_dropped() {
+        let now = 1_800_000_000.0;
+        let hints = RouteHints::default();
+        hints.set_network(b"censored-office", now);
+        let before = hints.generation();
+        hints.set_network(b"home", now + 1.0);
+        hints.note_http_needed_for(2, before, now + 1.0);
+        assert!(!hints.http_likely_for(2, now + 1.0), "home does not block TCP for what the office showed");
+        hints.set_network(b"censored-office", now + 2.0);
+        assert!(!hints.http_likely_for(2, now + 2.0));
+        assert!(hints.generation() > before);
+        hints.note_http_needed_for(2, hints.generation(), now + 3.0);
+        hints.note_tcp_answered_for(2, before, now + 4.0);
+        assert!(hints.http_likely_for(2, now + 4.0), "nor does an old TCP answer clear what holds now");
     }
 }

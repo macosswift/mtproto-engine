@@ -526,6 +526,7 @@ pub(super) fn serve_http(
             &packet,
             None,
             true,
+            seed,
         );
         if reaction.kill_now {
             let _ = stream.shutdown(Shutdown::Both);

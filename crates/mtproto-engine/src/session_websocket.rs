@@ -89,6 +89,11 @@ impl SessionRuntime {
             return;
         };
         let mut failed = connection.handle_writable(registry, now.mono).is_err();
+        let connected = connection.is_tcp_connected();
+        probe.note_connected(connected, now.mono);
+        let ProbeLink::Stream(connection) = &mut probe.link else {
+            return;
+        };
         let mut verified = false;
         while readable && !failed && !verified {
             match connection.read_chunk(registry, scratch, now.mono) {
@@ -122,6 +127,10 @@ impl SessionRuntime {
         let Some(at) = self.auto.probes.iter().position(|probe| probe.token() == token) else {
             return;
         };
+        if !self.may_adopt_probe(now) {
+            self.cancel_http_probe(registry);
+            return;
+        }
         let probe = self.auto.probes.remove(at);
         self.end_round_for_websocket(registry);
         let ProbeLink::Stream(mut connection) = probe.link else {
@@ -150,9 +159,7 @@ impl SessionRuntime {
         connection.heard_from_server = true;
         self.connection = Some(*connection);
         self.auto.on_websocket = true;
-        if self.learns_route_hints() {
-            self.hints.note_http_needed(now.unix);
-        }
+        self.note_route_http_needed(now);
         self.note_websocket_adopted(now);
         self.reset_failures();
         self.flaps = 0;
@@ -174,13 +181,15 @@ impl SessionRuntime {
     }
 
     /// The WebSocket endpoint failed `WEBSOCKET_MAX_FAILURES` times in a row: TCP gets its turn again,
-    /// and the probes after it if it stays silent.
+    /// and the probes after it if it stays silent, HTTPS first: a front can answer a probe and still cut
+    /// every session.
     pub(super) fn settle_websocket(&mut self, now: Now, callbacks: &Arc<dyn EngineCallbacks>) {
         if self.auto.on_websocket && self.failures >= WEBSOCKET_MAX_FAILURES {
             self.auto.on_websocket = false;
             self.apply_keepalive();
             self.next_attempt_at = self.next_attempt_at.min(now.mono + 0.05);
             self.note_probes_failed(now);
+            self.demote_websocket(now);
             self.log(callbacks, LogLevel::Info, "Telegram Web's WebSocket endpoint keeps failing; trying TCP again");
         }
     }
@@ -188,9 +197,7 @@ impl SessionRuntime {
     /// The TCP recheck answered: the stream transport goes back to TCP on the verified connection.
     pub(super) fn leave_websocket_for_tcp(&mut self, now: Now, callbacks: &Arc<dyn EngineCallbacks>) {
         self.log(callbacks, LogLevel::Info, "a TCP route answers again; leaving the WebSocket endpoint");
-        if self.learns_route_hints() {
-            self.hints.note_tcp_answered(now.unix);
-        }
+        self.note_route_tcp_answered(now);
         self.auto.on_websocket = false;
         self.note_left_websocket(now);
         self.reset_failures();

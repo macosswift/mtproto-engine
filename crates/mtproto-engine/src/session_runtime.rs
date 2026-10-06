@@ -14,8 +14,8 @@ use mtproto_core::session::{Now, SEND_QUEUE_STUCK_AFTER, ServerSalt, Session, Se
 use mtproto_core::tl::mtproto::ReqPqMulti;
 use mtproto_core::tl::{TlWrite, Writer, ids};
 use mtproto_core::transport::{
-    Incoming, STABLE_CONNECTION_AFTER, Socks5Auth, Socks5Target, TransportConfig, TransportErrorKind, flap_delay,
-    reconnect_delay, transport_flood_delay, urgent_reconnect_delay,
+    Incoming, RECONNECT_JITTER, STABLE_CONNECTION_AFTER, Socks5Auth, Socks5Target, TransportConfig, TransportErrorKind,
+    flap_delay, reconnect_delay, transport_flood_delay, urgent_reconnect_delay,
 };
 
 use crate::connection::{ChunkStatus, Connection, ConnectionError};
@@ -45,6 +45,8 @@ pub const FRAME_MIN_RATE: f64 = 512.0;
 pub const KEY_REJECTION_RETRY_DELAY: f64 = 0.5;
 const PROGRESS_HEAD: usize = 128;
 pub(crate) const HANDSHAKE_TIMEOUT: f64 = 10.0;
+/// The longest a failed key handshake makes the next one wait.
+pub const HANDSHAKE_RETRY_MAX: f64 = 60.0;
 pub const READ_BUDGET_PER_TURN: usize = 512 * 1024;
 pub const RACE_AFTER: f64 = 1.0;
 pub const RACE_SILENT_AFTER: f64 = 1.5;
@@ -206,6 +208,8 @@ pub struct SessionRuntime {
     transport_floods: u32,
     rejections: u32,
     key_rejections: u32,
+    /// Key handshakes that failed since one completed: the next waits 1 s, doubling up to a minute.
+    handshake_failures: u32,
     handshake_started_at: Option<f64>,
     jitter_state: u64,
     /// Set while the session runs over HTTP instead of a stream connection.
@@ -216,6 +220,8 @@ pub struct SessionRuntime {
     /// Counts the sessions (keys) the runtime installed, so that answers for an earlier one are told apart.
     rpc_generation: u64,
     hints: Arc<crate::route_hints::RouteHints>,
+    /// The network `hints` was about when this session last looked; findings are made for it.
+    network_generation: u64,
     /// Streams the host opens (Telegram Web's HTTPS endpoint), and how their news reaches the worker.
     host_streams: Option<(Arc<crate::host_stream::HostStreams>, Arc<crate::host_stream::WorkerSignal>)>,
 }
@@ -275,6 +281,7 @@ impl SessionRuntime {
             transport_floods: 0,
             rejections: 0,
             key_rejections: 0,
+            handshake_failures: 0,
             handshake_started_at: None,
             jitter_state: rng.next_u64() | 1,
             http: (setup.transport == crate::types::TransportPreference::Http).then(HttpState::default),
@@ -282,6 +289,7 @@ impl SessionRuntime {
             pfs: None,
             rpc_generation: 0,
             hints: Arc::default(),
+            network_generation: 0,
             host_streams: None,
             setup,
         };
@@ -497,11 +505,16 @@ impl SessionRuntime {
         }
         self.setup.paused = paused;
         if paused {
+            self.cancel_http_probe(registry);
             self.close_connection(registry, now, false);
         } else {
             self.next_attempt_at = now.mono;
             self.reset_failures();
             self.flaps = 0;
+            self.handshake_failures = 0;
+            if let Some(http) = &mut self.http {
+                http.forget_backoff();
+            }
         }
     }
 
@@ -775,6 +788,7 @@ impl SessionRuntime {
     }
 
     pub fn share_route_hints(&mut self, hints: Arc<crate::route_hints::RouteHints>) {
+        self.network_generation = hints.generation();
         self.hints = hints;
     }
 
@@ -839,6 +853,7 @@ impl SessionRuntime {
             self.network_available = available;
             self.forget_routes();
             if !available {
+                self.cancel_http_probe(registry);
                 self.close_connection(registry, now, false);
                 self.unavailable_probe_at = now.mono + UNAVAILABLE_PROBE_INTERVAL;
             } else {
@@ -923,6 +938,7 @@ impl SessionRuntime {
     }
 
     fn forget_routes(&mut self) {
+        self.handshake_failures = 0;
         self.resolved = None;
         self.answered_address = None;
         self.dns.clear();
@@ -977,6 +993,19 @@ impl SessionRuntime {
 
     fn has_waiting_work(&self) -> bool {
         !self.queued.is_empty() || self.rpc.as_ref().is_some_and(|rpc| rpc.session().is_awaiting_responses())
+    }
+
+    /// A key handshake failed: the next one waits longer each time, so a server or middlebox that
+    /// always fails it (an unknown RSA key, a hostile proxy) is not asked every second for good.
+    pub(super) fn note_handshake_failure(&mut self, now: Now) {
+        self.handshake_failures = self.handshake_failures.saturating_add(1);
+        let base = f64::from(1u32 << (self.handshake_failures - 1).min(6)).min(HANDSHAKE_RETRY_MAX);
+        let unit = f64::from(self.next_jitter()) / f64::from(u32::MAX);
+        let delay = base * (1.0 + RECONNECT_JITTER * (2.0 * unit - 1.0));
+        self.next_attempt_at = self.next_attempt_at.max(now.mono + delay);
+        if let Some(http) = &mut self.http {
+            http.hold_until_at_least(now.mono + delay);
+        }
     }
 
     fn reconnect_delay(&mut self) -> f64 {
@@ -1832,7 +1861,7 @@ impl SessionRuntime {
         {
             connection.heard_from_server = true;
             if learns && !connection.is_host_stream() {
-                self.hints.note_tcp_answered(now.unix);
+                self.hints.note_tcp_answered_for(self.setup.datacenter_id, self.network_generation, now.unix);
             }
         }
     }
@@ -1885,8 +1914,10 @@ impl SessionRuntime {
                     }
                     match result {
                         Ok(()) => {
-                            self.transport_floods = 0;
-                            self.rejections = 0;
+                            if fresh {
+                                self.transport_floods = 0;
+                                self.rejections = 0;
+                            }
                             if !self.network_available {
                                 self.network_available = true;
                                 self.log(
@@ -1963,6 +1994,7 @@ impl SessionRuntime {
             Ok(HandshakeStep::Done(result)) => {
                 self.handshake = None;
                 self.handshake_started_at = None;
+                self.handshake_failures = 0;
                 if let Some(target) = self.connection.as_ref().map(|connection| connection.target) {
                     self.note_resolved_address_answered(target);
                 } else {
@@ -1994,6 +2026,7 @@ impl SessionRuntime {
             Err(error) => {
                 callbacks.on_event(self.handle, EngineEvent::AuthKeyCreationFailed { reason: error.to_string() });
                 self.close_reason = Some(CloseReason::HandshakeFailed);
+                self.note_handshake_failure(now);
                 Err(ConnectionError::Closed)
             }
         }
@@ -2018,6 +2051,7 @@ impl SessionRuntime {
                     self.next_attempt_at.max(now.mono + transport_flood_delay(self.transport_floods));
             }
             self.close_reason = Some(CloseReason::HandshakeFailed);
+            self.note_handshake_failure(now);
             return;
         }
         match kind {
@@ -2030,7 +2064,7 @@ impl SessionRuntime {
                 }
                 self.key_rejections = 0;
                 let key_id = self.rpc.as_ref().map(|rpc| rpc.session().auth_key_id());
-                if !self.forget_temporary_key() {
+                if !self.forget_temporary_key(now) {
                     callbacks.on_event(self.handle, EngineEvent::AuthKeyInvalid { code });
                 } else if let Some(key_id) = key_id {
                     self.drop_temporary_key(key_id, callbacks);
@@ -2091,6 +2125,9 @@ impl SessionRuntime {
         for event in events {
             let current_key = self.rpc.as_ref().map(|rpc| rpc.session().auth_key_id());
             let refused = Self::refuses_temporary_key(&event);
+            if matches!(event, RpcEvent::Completed { .. }) {
+                self.note_pfs_progress();
+            }
             if !self.observe_pfs_event(&event, now) {
                 continue;
             }
@@ -2191,6 +2228,13 @@ impl SessionRuntime {
             callbacks.on_event(self.handle, EngineEvent::AuthKeyRequired);
         }
 
+        let generation = self.hints.generation();
+        if generation != self.network_generation {
+            self.network_generation = generation;
+            if self.setup.transport == crate::types::TransportPreference::Auto {
+                self.note_network_changed(registry, now);
+            }
+        }
         self.refresh_uploads(now);
         self.drive_pfs(registry, now, callbacks, rng);
         if self.http.is_some() {
@@ -2270,6 +2314,7 @@ impl SessionRuntime {
             self.log(callbacks, LogLevel::Info, "handshake timeout");
             self.report_drop(DropReason::HandshakeTimeout, now, callbacks);
             self.close_failed_connection(registry, now, true);
+            self.note_handshake_failure(now);
         }
         if failure.is_none()
             && let (Some(rpc), Some(connection)) = (&mut self.rpc, &self.connection)
@@ -2402,15 +2447,17 @@ impl SessionRuntime {
         let connected = self.connection.as_ref().is_some_and(Connection::is_established)
             || self.http.as_ref().is_some_and(HttpState::is_connected);
         let received = self.connection_received_packet() || self.http.as_ref().is_some_and(HttpState::answered);
+        let key_unbound = self.rpc.is_some() && self.pfs.as_ref().is_some_and(|pfs| pfs.perm.is_some() && !pfs.bound);
         let state = ConnectionState {
             network_available: self.network_available && !self.setup.paused,
             connected,
-            updating_connection_context: connected && !received,
+            updating_connection_context: connected && (!received || key_unbound),
             performing_service_tasks: connected
                 && self.rpc.as_ref().is_some_and(|rpc| rpc.session().is_performing_service_tasks()),
             proxy_has_connection_issues: self.setup.proxy.is_some()
                 && ((!connected && self.failures >= 3)
                     || (self.http.is_some() && !received && (self.rejections >= 3 || self.open_failures() >= 3))),
+            awaiting_key_binding: connected && received && key_unbound,
         };
         (state, self.setup.proxy.as_ref().map(ProxyConfig::display_address))
     }

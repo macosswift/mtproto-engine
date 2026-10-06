@@ -290,6 +290,9 @@ pub struct ConnectionState {
     pub updating_connection_context: bool,
     pub performing_service_tasks: bool,
     pub proxy_has_connection_issues: bool,
+    /// The link answers, and the session waits for its temporary key to be bound: it is updating, yet
+    /// says nothing against the route.
+    pub awaiting_key_binding: bool,
 }
 
 /// Why the engine gave up on a connection: which of its checks decided, for the host's diagnostics.

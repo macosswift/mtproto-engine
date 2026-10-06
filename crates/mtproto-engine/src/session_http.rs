@@ -49,6 +49,10 @@ pub const HTTP_PIPELINE_DEPTH: usize = 2;
 /// elsewhere: on a slow link the late answer usually comes, and a new connection costs round trips.
 pub const HTTP_HEDGE_HOLD_MIN: f64 = 8.0;
 pub const HTTP_MAX_HEDGED: usize = 2;
+/// 2xx answers with nothing new in them that may come in a row before the link is held. Telegram sends
+/// an answer again on every poll that ends before its acknowledgement arrives, so a healthy link can
+/// give a few: two parked polls and a lost acknowledgement.
+pub const HTTP_STALE_ANSWERS_TOLERATED: u32 = 4;
 /// The longest a cut waits while the latest connection cut got no response bytes: a link that refuses
 /// every connection, as through an outage, gets its first one through soon after it comes back.
 pub const HTTP_UNHEARD_CUT_MAX_DELAY: f64 = 4.0;
@@ -79,6 +83,8 @@ pub(super) struct HttpState {
     cut_in_a_row: u32,
     /// The latest of those got response bytes before it was cut.
     cut_after_bytes: bool,
+    /// 2xx answers in a row with nothing new in them.
+    stale_in_a_row: u32,
     health: HashMap<(String, u16), AddressHealth>,
     cursor: usize,
     more_readable: Vec<Token>,
@@ -124,6 +130,12 @@ impl HttpState {
         if self.open_failures == 0 {
             self.next_open_at = self.next_open_at.min(now);
         }
+    }
+
+    /// Holds the link and the next connection until `at` at least.
+    pub(super) fn hold_until_at_least(&mut self, at: f64) {
+        self.hold_until = self.hold_until.max(at);
+        self.next_open_at = self.next_open_at.max(at);
     }
 
     pub(super) fn forget_backoff(&mut self) {
@@ -1362,13 +1374,46 @@ impl SessionRuntime {
         DropReason::Protocol
     }
 
+    /// A 2xx answer with nothing new in it: a cache or a middlebox replaying an earlier answer, or one
+    /// of another session. One can be a resend; from the second in a row the link is held and its route
+    /// checked, as for an answer that is not the server's, so that long polls do not spin on replays.
+    fn note_stale_http_answer(&mut self, now: Now, callbacks: &Arc<dyn EngineCallbacks>) {
+        let Some(http) = &mut self.http else {
+            return;
+        };
+        http.stale_in_a_row = http.stale_in_a_row.saturating_add(1);
+        if http.stale_in_a_row < HTTP_STALE_ANSWERS_TOLERATED {
+            return;
+        }
+        let first = http.stale_in_a_row == HTTP_STALE_ANSWERS_TOLERATED;
+        self.rejections = self.rejections.saturating_add(1);
+        let delay = mtproto_core::transport::transport_flood_delay(self.rejections).min(super::REJECTION_MAX_DELAY);
+        if let Some(http) = &mut self.http {
+            http.route_checked = false;
+            http.route_check_needed = true;
+            http.hold_until_at_least(now.mono + delay);
+        }
+        if first {
+            self.log(
+                callbacks,
+                LogLevel::Info,
+                "HTTP answers with nothing new in them; holding and checking the route",
+            );
+        }
+    }
+
     /// A key creation failed: the next starts after the reconnect delay, as over TCP.
     fn note_http_handshake_failure(&mut self, now: Now) {
+        self.hold_http_after_handshake_failure(now);
+        self.note_handshake_failure(now);
+    }
+
+    /// The HTTP side of a failed key creation whose handshake backoff is already counted.
+    fn hold_http_after_handshake_failure(&mut self, now: Now) {
         self.failures = self.failures.saturating_add(1);
         let delay = self.reconnect_delay();
         if let Some(http) = &mut self.http {
-            http.hold_until = http.hold_until.max(now.mono + delay);
-            http.next_open_at = http.next_open_at.max(now.mono + delay);
+            http.hold_until_at_least(now.mono + delay);
         }
     }
 
@@ -1606,7 +1651,7 @@ impl SessionRuntime {
                 Err(_) => {
                     self.close_reason = None;
                     self.abandon_http_handshake();
-                    self.note_http_handshake_failure(now);
+                    self.hold_http_after_handshake_failure(now);
                     Err(Some(DropReason::HandshakeFailed))
                 }
             };
@@ -1620,11 +1665,23 @@ impl SessionRuntime {
         let fresh_before = rpc.session().fresh_packets();
         let result = rpc.handle_packet(&body, now, rng);
         let fresh = rpc.session().fresh_packets() != fresh_before;
+        let stale = match &result {
+            Ok(()) => !fresh,
+            Err(SessionError::ForeignSession) | Err(SessionError::TooOld) | Err(SessionError::EvenServerMsgId(_)) => {
+                true
+            }
+            Err(_) => false,
+        };
+        if stale {
+            self.note_stale_http_answer(now, callbacks);
+        }
         match result {
             Ok(()) => {
-                self.transport_floods = 0;
-                self.rejections = 0;
-                self.timeout_fired = false;
+                if fresh {
+                    self.transport_floods = 0;
+                    self.rejections = 0;
+                    self.timeout_fired = false;
+                }
                 if !self.network_available {
                     self.network_available = true;
                     self.log(
@@ -1634,6 +1691,7 @@ impl SessionRuntime {
                     );
                 }
                 if fresh && let Some(http) = &mut self.http {
+                    http.stale_in_a_row = 0;
                     http.route_check_needed = false;
                     http.open_failures = 0;
                     http.cut_in_a_row = 0;
@@ -1728,6 +1786,18 @@ pub const AUTO_HTTP_AFTER_SILENCE: f64 = 2.5;
 pub const AUTO_HTTP_AFTER_HINT: f64 = 0.3;
 pub const AUTO_HTTP_AFTER_FAILURES: u32 = 2;
 pub const AUTO_PROBE_TIMEOUT: f64 = 6.0;
+/// Rounds whose probes went unanswered for their whole time double the next round's, at most this many
+/// times: on a link with RTTs past a second the web routes need longer than that to answer at all.
+pub const AUTO_PROBE_TIMEOUT_DOUBLINGS: u32 = 3;
+/// Once a probe's connection is up, the answer gets twice what connecting took, at least
+/// `AUTO_PROBE_TIMEOUT` and at most this long.
+pub const AUTO_PROBE_ANSWER_MAX: f64 = 30.0;
+/// A WebSocket endpoint that answered probes and then kept failing the session waits this long before it
+/// is probed again, doubling up to `WEBSOCKET_DEMOTION_MAX`; HTTPS on the same front goes first meanwhile.
+pub const WEBSOCKET_DEMOTION_BASE: f64 = 300.0;
+pub const WEBSOCKET_DEMOTION_MAX: f64 = 3600.0;
+/// A WebSocket that carried the session this long before it failed starts its demotions over.
+pub const WEBSOCKET_PROVEN_AFTER: f64 = 600.0;
 pub const AUTO_PROBE_RETRY_BASE: f64 = 5.0;
 pub const AUTO_PROBE_RETRY_MAX: f64 = 60.0;
 /// Auto on HTTP: TCP is tried again at most this rarely (`SessionSetup::tcp_recheck_after` doubles
@@ -1759,11 +1829,29 @@ pub(super) struct Probe {
     named: Option<NamedAddress>,
     pub(super) nonce: [u8; 16],
     started_at: f64,
+    /// When its connection came up (TCP, or the host's TLS for the web routes).
+    connected_at: Option<f64>,
 }
 
 impl Probe {
     pub(super) fn new(kind: ProbeKind, link: ProbeLink, nonce: [u8; 16], now: f64) -> Self {
-        Self { kind, link, named: None, nonce, started_at: now }
+        Self { kind, link, named: None, nonce, started_at: now, connected_at: None }
+    }
+
+    pub(super) fn note_connected(&mut self, connected: bool, now: f64) {
+        if connected && self.connected_at.is_none() {
+            self.connected_at = Some(now);
+        }
+    }
+
+    /// When the probe stops waiting: `timeout` after it started, or, once its connection is up, twice
+    /// what connecting took, since a link that slow takes as long again for the answer.
+    fn deadline(&self, timeout: f64) -> f64 {
+        let start = self.started_at + timeout;
+        match self.connected_at {
+            Some(at) => start.max(at + (2.0 * (at - self.started_at)).clamp(AUTO_PROBE_TIMEOUT, AUTO_PROBE_ANSWER_MAX)),
+            None => start,
+        }
     }
 
     pub(super) fn token(&self) -> Token {
@@ -1804,6 +1892,15 @@ pub(super) struct AutoState {
     /// A round of probes is under way; HTTPS has been tried in it.
     round_open: bool,
     https_tried: bool,
+    /// A probe of the round under way ran out of time.
+    round_timed_out: bool,
+    /// Rounds in a row that ended with a probe out of time, doubling the next round's.
+    probe_timeouts: u32,
+    /// The WebSocket endpoint answered probes and then failed the session this many times; it is not
+    /// probed before `websocket_retry_at`.
+    websocket_give_ups: u32,
+    websocket_retry_at: f64,
+    websocket_adopted_at: f64,
     probe_failures: u32,
     probe_retry_at: f64,
     probe_cursor: usize,
@@ -1958,7 +2055,25 @@ impl SessionRuntime {
     }
 
     fn http_hinted(&self, now: Now) -> bool {
-        self.learns_route_hints() && self.hints.http_likely(now.unix)
+        self.learns_route_hints() && self.hints.http_likely_for(self.setup.datacenter_id, now.unix)
+    }
+
+    pub(super) fn note_route_http_needed(&self, now: Now) {
+        if self.learns_route_hints() {
+            self.hints.note_http_needed_for(self.setup.datacenter_id, self.network_generation, now.unix);
+        }
+    }
+
+    pub(super) fn note_route_tcp_answered(&self, now: Now) {
+        if self.learns_route_hints() {
+            self.hints.note_tcp_answered_for(self.setup.datacenter_id, self.network_generation, now.unix);
+        }
+    }
+
+    /// A probe that answered moves the session only while it wants a connection and its TCP connection
+    /// has not answered meanwhile (probe answers are read before the drive that would see it did).
+    pub(super) fn may_adopt_probe(&self, now: Now) -> bool {
+        self.wants_connection(now) && !self.connection.as_ref().is_some_and(|connection| connection.heard_from_server)
     }
 
     /// Auto on TCP: tries an HTTP route alongside once TCP gets nowhere.
@@ -1994,13 +2109,15 @@ impl SessionRuntime {
         let plain: Vec<usize> = (0..candidates.len()).filter(|index| !candidates[*index].web).collect();
         self.auto.round_open = true;
         self.auto.https_tried = false;
+        self.auto.round_timed_out = false;
         let mut pending = false;
         if !plain.is_empty() {
             let choice = plain[self.auto.probe_cursor % plain.len()];
             self.auto.probe_cursor = self.auto.probe_cursor.wrapping_add(1);
             pending |= self.start_http_probe(ProbeKind::Plain, choice, registry, now, resolver, rng);
         }
-        if !(self.websocket_possible() && self.start_websocket_probe(registry, now, rng)) {
+        let websocket_demoted = now.mono < self.auto.websocket_retry_at;
+        if !(self.websocket_possible() && !websocket_demoted && self.start_websocket_probe(registry, now, rng)) {
             self.maybe_start_https_probe(registry, now, resolver, rng);
         }
         if self.auto.probes.is_empty() {
@@ -2047,13 +2164,9 @@ impl SessionRuntime {
             }
             return false;
         }
-        self.auto.probes.push(Probe {
-            kind,
-            link: ProbeLink::Http(Box::new(conn)),
-            named,
-            nonce,
-            started_at: now.mono,
-        });
+        let mut probe = Probe::new(kind, ProbeLink::Http(Box::new(conn)), nonce, now.mono);
+        probe.named = named;
+        self.auto.probes.push(probe);
         false
     }
 
@@ -2130,6 +2243,7 @@ impl SessionRuntime {
     }
 
     pub(super) fn note_websocket_adopted(&mut self, now: Now) {
+        self.auto.websocket_adopted_at = now.mono;
         self.auto.back_on_tcp_at = None;
         self.auto.tcp_recheck_at =
             now.mono + recheck_interval(self.setup.tcp_recheck_after, self.auto.tcp_recheck_failures);
@@ -2144,9 +2258,42 @@ impl SessionRuntime {
     }
 
     pub(super) fn note_probes_failed(&mut self, now: Now) {
+        if std::mem::take(&mut self.auto.round_timed_out) {
+            self.auto.probe_timeouts = (self.auto.probe_timeouts + 1).min(AUTO_PROBE_TIMEOUT_DOUBLINGS);
+        }
         self.auto.probe_failures = self.auto.probe_failures.saturating_add(1);
         let backoff = AUTO_PROBE_RETRY_BASE * f64::from(1u32 << self.auto.probe_failures.saturating_sub(1).min(8));
         self.auto.probe_retry_at = now.mono + backoff.min(AUTO_PROBE_RETRY_MAX);
+    }
+
+    /// The WebSocket endpoint answered probes and then kept failing the session: HTTPS on the same front
+    /// goes first for a while.
+    pub(super) fn demote_websocket(&mut self, now: Now) {
+        if now.mono - self.auto.websocket_adopted_at >= WEBSOCKET_PROVEN_AFTER {
+            self.auto.websocket_give_ups = 0;
+        }
+        self.auto.websocket_give_ups = self.auto.websocket_give_ups.saturating_add(1);
+        let wait = WEBSOCKET_DEMOTION_BASE * f64::from(1u32 << self.auto.websocket_give_ups.saturating_sub(1).min(8));
+        self.auto.websocket_retry_at = now.mono + wait.min(WEBSOCKET_DEMOTION_MAX);
+    }
+
+    fn probe_timeout(&self) -> f64 {
+        AUTO_PROBE_TIMEOUT * f64::from(1u32 << self.auto.probe_timeouts.min(AUTO_PROBE_TIMEOUT_DOUBLINGS))
+    }
+
+    /// The host named another network: probes and rechecks under way were about the old one. A session
+    /// on HTTP or the WebSocket checks TCP at once instead of at its next recheck.
+    pub(super) fn note_network_changed(&mut self, registry: &Registry, now: Now) {
+        self.cancel_http_probe(registry);
+        self.auto.probe_timeouts = 0;
+        self.auto.websocket_give_ups = 0;
+        self.auto.websocket_retry_at = 0.0;
+        if self.auto.on_http || self.auto.on_websocket {
+            self.drop_racer(registry);
+            self.auto.back_on_tcp_at = None;
+            self.auto.tcp_recheck_failures = 0;
+            self.auto.tcp_recheck_at = now.mono;
+        }
     }
 
     pub(super) fn cancel_http_probe(&mut self, registry: &Registry) {
@@ -2157,6 +2304,7 @@ impl SessionRuntime {
             probe.close(registry);
         }
         self.auto.round_open = false;
+        self.auto.round_timed_out = false;
         self.auto.probe_failures = 0;
         self.auto.probe_retry_at = 0.0;
     }
@@ -2168,13 +2316,12 @@ impl SessionRuntime {
         resolver: &mut dyn Resolve,
         rng: &mut OsRandom,
     ) {
-        let expired: Vec<Token> = self
-            .auto
-            .probes
-            .iter()
-            .filter(|probe| now.mono - probe.started_at > AUTO_PROBE_TIMEOUT)
-            .map(Probe::token)
-            .collect();
+        let timeout = self.probe_timeout();
+        let expired: Vec<Token> =
+            self.auto.probes.iter().filter(|probe| now.mono > probe.deadline(timeout)).map(Probe::token).collect();
+        if !expired.is_empty() {
+            self.auto.round_timed_out = true;
+        }
         for token in expired {
             self.fail_http_probe(token, registry, now);
         }
@@ -2185,7 +2332,8 @@ impl SessionRuntime {
         if self.auto.probes.is_empty() && self.https_turn_pending() {
             return Some(now.mono);
         }
-        if let Some(started_at) = self.auto.probes.iter().map(|probe| probe.started_at).reduce(f64::min) {
+        let timeout = self.probe_timeout();
+        if let Some(expires_at) = self.auto.probes.iter().map(|probe| probe.deadline(timeout)).reduce(f64::min) {
             let https_turn = self
                 .auto
                 .probes
@@ -2194,7 +2342,7 @@ impl SessionRuntime {
                 .map(|probe| probe.started_at + WEBSOCKET_HEAD_START)
                 .reduce(f64::min)
                 .unwrap_or(f64::INFINITY);
-            return Some((started_at + AUTO_PROBE_TIMEOUT).min(https_turn) + 0.01);
+            return Some(expires_at.min(https_turn) + 0.01);
         }
         if self.setup.transport != crate::types::TransportPreference::Auto {
             return None;
@@ -2239,6 +2387,11 @@ impl SessionRuntime {
         if writable && conn.handle_writable(registry, now.mono).is_err() {
             failed = true;
         }
+        let connected = conn.established_at.is_some();
+        probe.note_connected(connected, now.mono);
+        let ProbeLink::Http(conn) = &mut probe.link else {
+            return;
+        };
         if readable && !failed && conn.read(registry, scratch, HTTP_READ_BUDGET, now.mono, &mut events).is_err() {
             failed = true;
         }
@@ -2261,6 +2414,10 @@ impl SessionRuntime {
         let Some(at) = self.auto.probes.iter().position(|probe| probe.token() == token) else {
             return;
         };
+        if !self.may_adopt_probe(now) {
+            self.cancel_http_probe(registry);
+            return;
+        }
         let probe = self.auto.probes.remove(at);
         self.cancel_http_probe(registry);
         let ProbeLink::Http(conn) = probe.link else {
@@ -2291,9 +2448,7 @@ impl SessionRuntime {
         }
         self.note_http_address(candidate, true, now);
         self.auto.on_http = true;
-        if self.learns_route_hints() {
-            self.hints.note_http_needed(now.unix);
-        }
+        self.note_route_http_needed(now);
         self.auto.probe_failures = 0;
         self.auto.back_on_tcp_at = None;
         self.auto.tcp_recheck_at =
@@ -2361,9 +2516,7 @@ impl SessionRuntime {
     /// The TCP recheck answered: the session leaves HTTP, and the verified connection takes over.
     pub(super) fn switch_back_to_tcp(&mut self, registry: &Registry, now: Now, callbacks: &Arc<dyn EngineCallbacks>) {
         self.log(callbacks, LogLevel::Info, "a TCP route answers again; leaving HTTP");
-        if self.learns_route_hints() {
-            self.hints.note_tcp_answered(now.unix);
-        }
+        self.note_route_tcp_answered(now);
         self.leave_http(registry, now);
         self.auto.on_http = false;
         self.auto.back_on_tcp_at = Some(now.mono);
@@ -2395,6 +2548,9 @@ impl SessionRuntime {
             self.hints.forget();
         }
         self.cancel_http_probe(registry);
+        self.auto.probe_timeouts = 0;
+        self.auto.websocket_give_ups = 0;
+        self.auto.websocket_retry_at = 0.0;
         self.auto.tcp_recheck_failures = 0;
         self.auto.back_on_tcp_at = None;
         if self.auto.on_http {

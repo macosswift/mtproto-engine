@@ -31,7 +31,6 @@ pub const MAX_PENDING_PINGS: usize = 16;
 pub const MAX_TRACKED_SERVICE_CONTAINERS: usize = 64;
 pub const RECENT_SENT_CAPACITY: usize = 1024;
 pub const MAX_PROTOCOL_STRIKES: u32 = 3;
-pub const MAX_ANSWER_REQUESTS: u32 = 3;
 pub const MAX_NESTING_DEPTH: usize = 8;
 pub const MAX_AWAITED_ANSWERS: usize = 1024;
 pub const MAX_MESSAGES_PER_PACKET: usize = 4 * 1024;
@@ -58,6 +57,21 @@ pub const DROPPED_ANSWER_WINDOW: f64 = 10.0;
 pub const RESPONSE_UNPACK_FAILED: &str = "RESPONSE_UNPACK_FAILED";
 pub const PROTOCOL_ERROR_PREFIX: &str = "PROTOCOL_ERROR_BAD_MSG_";
 pub const PROTOCOL_REJECTED: &str = "PROTOCOL_ERROR_REJECTED";
+/// A call whose answer the server announced (so it executed the call) and then said it no longer has.
+/// The call fails with this rather than going again under a new msg_id, which would execute it a second
+/// time; the host decides what the caller hears (as with tdlib and MtProtoKit, the call may just wait).
+/// An announced answer that does not come is asked for again on every new connection, on an announcement
+/// while no request for it is out and, over HTTP, up to `MAX_EXPIRED_ANSWER_ASKS` times when a request
+/// goes unanswered.
+pub const ANSWER_LOST: &str = "PROTOCOL_ERROR_ANSWER_LOST";
+/// HTTP: an announced answer whose re-send request expired with no sign of it is asked for again at most
+/// this many times until the server announces it again (it does in every response while it holds it).
+/// Over TCP a re-send request is not repeated: the server answers every one on the connection it came on
+/// (re-sending the answer or saying it has none), and a new connection asks again.
+pub const MAX_EXPIRED_ANSWER_ASKS: u32 = 3;
+/// TCP: how long a re-send request waits for the server's reply before it is dropped (not repeated), in
+/// case the reply was lost to us (an answer dropped as too old, a call cancelled meanwhile).
+pub const TCP_ASK_BACKSTOP: f64 = 120.0;
 pub const MAX_QUERY_REJECTIONS: u32 = 12;
 pub const MAX_SERVER_RESENDS: u32 = 8;
 pub const TRANSMIT_GRACE_MIN_SIZE: usize = 4 * 1024;
@@ -89,6 +103,10 @@ pub const SEND_QUEUE_STUCK_AFTER: f64 = 10.0;
 pub const HTTP_ANSWER_HOLD_MIN: f64 = 1.0;
 /// HTTP: the longest an announced answer is waited for while responses keep arriving.
 pub const HTTP_ANSWER_HOLD_MAX: f64 = 30.0;
+/// HTTP: the answers asked for in one request add up to at most this many announced bytes, one
+/// always going: a response is lost whole, and on a link that drops connections every few seconds a
+/// response carrying several large answers may never arrive.
+pub const HTTP_ANSWER_REQUEST_BYTES: usize = 16 * 1024;
 /// HTTP: packets tracked for loss; beyond it the oldest are forgotten (their queries then wait for
 /// the usual state requests).
 pub const MAX_TRACKED_HTTP_PACKETS: usize = 256;
@@ -321,7 +339,12 @@ impl ServiceRequest {
 #[derive(Debug, Clone, Copy)]
 struct AwaitedAnswer {
     query: Option<QueryId>,
-    requests: u32,
+    /// The msg_id of the latest message announcing it.
+    announced_by: i64,
+    /// HTTP: re-send requests repeated since the last announcement because the previous one expired.
+    expired_asks: u32,
+    /// The size the server announced.
+    bytes: usize,
     /// HTTP: no re-send request before then; the answer may be in a response still arriving.
     hold_until: f64,
     announced_at: f64,
@@ -402,6 +425,10 @@ pub struct Session {
     resend_individually: HashSet<i64>,
     recent_sent: VecDeque<(i64, f64)>,
     recent_unique_ids: VecDeque<i64>,
+    /// The msg_id of the last `new_session_created`: an answer announced before it is the old server
+    /// session's, and the server saying it has none of it does not fail the call (the new session runs
+    /// it, or it was sent again).
+    server_session_since: i64,
     force_send_at: Option<f64>,
 
     received: DuplicateChecker,
@@ -533,6 +560,7 @@ impl Session {
             resend_individually: HashSet::new(),
             recent_sent: VecDeque::new(),
             recent_unique_ids: VecDeque::new(),
+            server_session_since: 0,
             force_send_at: None,
             received: DuplicateChecker::new(1000),
             updates: DuplicateChecker::new(1000),
@@ -1357,6 +1385,7 @@ impl Session {
                 self.by_msg_id.remove(&query.msg_id);
                 self.detach_from_container(query.container_id, query.msg_id);
                 self.refresh_unknown_tracking();
+                self.forget_awaited_answers_of(&[(query.msg_id, id)]);
                 CancelOutcome::RemovedInFlight { msg_id: query.msg_id }
             }
         }
@@ -1507,6 +1536,7 @@ impl Session {
         self.resend_individually.clear();
         self.recent_sent.clear();
         self.recent_unique_ids.clear();
+        self.server_session_since = 0;
         self.pending_pings.clear();
         self.received.clear();
         self.updates.clear();
@@ -1869,14 +1899,18 @@ impl Session {
             DuplicateCheck::TooOld => Mode::Replay,
         };
         let budget = self.config.max_unpacked_bytes;
+        let mut answers_awaited = false;
         match mode {
             Mode::Process => {
                 self.observe_server_time(header.msg_id, now);
                 if !self.is_within_time_window(header.msg_id, now) {
                     if self.has_freshness_proof(body, 0, &mut { budget }, &mut 0, now) {
                         self.reset_server_time(header.msg_id, now);
-                    } else if self.answers_an_awaited_query(body, 0, &mut { budget }, &mut 0) {
+                    } else if self.awaited_answers.contains_key(&header.msg_id)
+                        || self.answers_an_awaited_query(body, 0, &mut { budget }, &mut 0)
+                    {
                         mode = Mode::Replay;
+                        answers_awaited = true;
                     } else {
                         return Ok(());
                     }
@@ -1884,16 +1918,16 @@ impl Session {
                 self.received.check(header.msg_id);
             }
             Mode::Replay => {
-                if !self.is_within_time_window(header.msg_id, now)
-                    && !self.answers_an_awaited_query(body, 0, &mut { budget }, &mut 0)
-                {
+                answers_awaited = self.awaited_answers.contains_key(&header.msg_id)
+                    || self.answers_an_awaited_query(body, 0, &mut { budget }, &mut 0);
+                if !self.is_within_time_window(header.msg_id, now) && !answers_awaited {
                     return Ok(());
                 }
                 self.received.check(header.msg_id);
             }
             Mode::AckOnly => {}
         }
-        if mode == Mode::Process {
+        if mode == Mode::Process || answers_awaited {
             if !self.received_on_connection {
                 let took = (now.mono - self.connected_at).max(0.0);
                 self.first_answer_peak = took.max(self.first_answer_peak * 0.9);
@@ -2048,10 +2082,14 @@ impl Session {
             return;
         }
         self.to_resend_answer.retain(|id| *id != msg_id);
+        self.withdraw_asks_for(msg_id);
+    }
+
+    fn withdraw_asks_for(&mut self, answer: i64) {
         let mut finished = Vec::new();
         for (request_id, request) in self.service_requests.iter_mut() {
             if let ServiceRequest::ResendRequest { msg_ids, .. } = request {
-                msg_ids.retain(|id| *id != msg_id);
+                msg_ids.retain(|id| *id != answer);
                 if msg_ids.is_empty() {
                     finished.push(*request_id);
                 }
@@ -2159,22 +2197,25 @@ impl Session {
                 self.on_bad_msg_notification(msg_id, bad_msg_id, error_code, now)
             }
             ServiceMessage::NewSessionCreated { first_msg_id, unique_id, server_salt } => {
-                self.on_new_session_created(context, unique_id, first_msg_id, server_salt, now)
+                self.on_new_session_created(context, msg_id, unique_id, first_msg_id, server_salt, now)
             }
             ServiceMessage::MsgsAck(msg_ids) => {
                 for acked in msg_ids {
                     self.acknowledge(acked);
                 }
             }
-            ServiceMessage::MsgDetailedInfo { msg_id: query_msg_id, answer_msg_id, status, .. } => {
-                self.on_message_info(Some(query_msg_id), status, Some(answer_msg_id).filter(|id| *id != 0), now);
+            ServiceMessage::MsgDetailedInfo { msg_id: query_msg_id, answer_msg_id, bytes, status } => {
+                let answer = Some(answer_msg_id).filter(|id| *id != 0);
+                self.on_message_info(msg_id, Some(query_msg_id), status, answer, bytes, now);
             }
-            ServiceMessage::MsgNewDetailedInfo { answer_msg_id, .. } => {
-                self.on_message_info(None, 0, Some(answer_msg_id).filter(|id| *id != 0), now);
+            ServiceMessage::MsgNewDetailedInfo { answer_msg_id, bytes, .. } => {
+                self.on_message_info(msg_id, None, 0, Some(answer_msg_id).filter(|id| *id != 0), bytes, now);
             }
             ServiceMessage::MsgsStateInfo { req_msg_id, info } => match self.service_requests.remove(&req_msg_id) {
                 Some(ServiceRequest::StateRequest { msg_ids, .. }) => self.on_state_info(&msg_ids, info, now),
-                Some(ServiceRequest::ResendRequest { msg_ids, .. }) => self.on_answers_unavailable(&msg_ids, now),
+                Some(ServiceRequest::ResendRequest { msg_ids, .. }) => {
+                    self.on_answers_unavailable(&msg_ids, info.len(), now)
+                }
                 None => {}
             },
             ServiceMessage::MsgsAllInfo { msg_ids, info } => {
@@ -2439,7 +2480,18 @@ impl Session {
                 self.to_retransmit.retain(|other| *other != id);
             }
             if !self.awaited_answers.is_empty() {
-                self.awaited_answers.retain(|_, awaited| awaited.query != Some(id));
+                let gone: Vec<i64> = self
+                    .awaited_answers
+                    .iter()
+                    .filter(|(_, awaited)| awaited.query == Some(id))
+                    .map(|(answer, _)| *answer)
+                    .collect();
+                for answer in gone {
+                    self.awaited_answers.remove(&answer);
+                    self.to_resend_answer.retain(|id| *id != answer);
+                    self.resend_individually.remove(&answer);
+                    self.withdraw_asks_for(answer);
+                }
             }
         }
         self.refresh_unknown_tracking();
@@ -2448,6 +2500,7 @@ impl Session {
     fn on_new_session_created(
         &mut self,
         context: &mut PacketContext,
+        notice_msg_id: i64,
         unique_id: i64,
         first_msg_id: i64,
         server_salt: i64,
@@ -2457,6 +2510,7 @@ impl Session {
             return;
         }
         self.recent_unique_ids.push_back(unique_id);
+        self.server_session_since = self.server_session_since.max(notice_msg_id);
         while self.recent_unique_ids.len() > 16 {
             self.recent_unique_ids.pop_front();
         }
@@ -2483,11 +2537,27 @@ impl Session {
             .map(|(id, query)| (query.msg_id, *id))
             .collect();
         resend.sort_unstable();
+        self.forget_awaited_answers_of(&resend);
+        let old: Vec<i64> = self.awaited_answers.keys().copied().filter(|answer| *answer < notice_msg_id).collect();
+        for answer in old {
+            self.awaited_answers.remove(&answer);
+            self.to_resend_answer.retain(|id| *id != answer);
+            self.resend_individually.remove(&answer);
+            self.withdraw_asks_for(answer);
+        }
         context.deferred_resends.extend(resend.into_iter().map(|(msg_id, id)| (id, msg_id)));
         self.events.push_back(SessionEvent::ServerSessionReset { unique_id, first_msg_id });
     }
 
-    fn on_message_info(&mut self, query_msg_id: Option<i64>, status: i32, answer_msg_id: Option<i64>, now: Now) {
+    fn on_message_info(
+        &mut self,
+        announcement: i64,
+        query_msg_id: Option<i64>,
+        status: i32,
+        answer_msg_id: Option<i64>,
+        bytes: i32,
+        now: Now,
+    ) {
         let mut answered_query = None;
         if let Some(query_msg_id) = query_msg_id {
             let Some(id) = self.by_msg_id.get(&query_msg_id).copied() else {
@@ -2515,26 +2585,35 @@ impl Session {
             if self.received.contains(answer) {
                 self.schedule_ack(answer, now);
             } else {
-                self.request_answer(answer, answered_query, now);
+                self.request_answer(answer, answered_query, announcement, usize::try_from(bytes).unwrap_or(0), now);
             }
         }
     }
 
-    fn request_answer(&mut self, answer: i64, query: Option<QueryId>, now: Now) {
+    fn request_answer(&mut self, answer: i64, query: Option<QueryId>, announcement: i64, bytes: usize, now: Now) {
         if !self.awaited_answers.contains_key(&answer) && self.awaited_answers.len() >= MAX_AWAITED_ANSWERS {
             return;
         }
         let hold = if self.http { now.mono + HTTP_ANSWER_HOLD_MIN.max(self.rtt_estimate() * 1.5) } else { 0.0 };
+        let announced_again = self.awaited_answers.contains_key(&answer);
         let entry = self.awaited_answers.entry(answer).or_insert(AwaitedAnswer {
             query,
-            requests: 0,
+            announced_by: announcement,
+            expired_asks: 0,
+            bytes,
             hold_until: hold,
             announced_at: now.mono,
         });
         if entry.query.is_none() {
             entry.query = query;
         }
+        entry.bytes = bytes;
+        entry.expired_asks = 0;
+        entry.announced_by = entry.announced_by.max(announcement);
         let entry = *entry;
+        if announced_again && self.is_answer_requested(answer) {
+            return;
+        }
         let due = if self.http { self.answer_hold_until(&entry) } else { now.mono + QUERY_DELAY };
         if self.to_resend_answer.is_empty() {
             self.send_before(due.max(now.mono + QUERY_DELAY));
@@ -2548,8 +2627,85 @@ impl Session {
         }
     }
 
-    fn on_answers_unavailable(&mut self, answers: &[i64], now: Now) {
-        if answers.len() > 1 {
+    /// HTTP: the answers at the tail of the queue whose announced sizes fit `HTTP_ANSWER_REQUEST_BYTES`,
+    /// at least one.
+    fn take_answers_for_http_request(&mut self) -> Vec<i64> {
+        let mut bytes = 0usize;
+        let mut count = 0;
+        for id in self.to_resend_answer.iter().rev() {
+            let size = self.awaited_answers.get(id).map_or(0, |awaited| awaited.bytes);
+            if count > 0
+                && (bytes.saturating_add(size) > HTTP_ANSWER_REQUEST_BYTES || count >= MAX_IDS_PER_SERVICE_MESSAGE)
+            {
+                break;
+            }
+            bytes = bytes.saturating_add(size);
+            count += 1;
+        }
+        take_tail(&mut self.to_resend_answer, count)
+    }
+
+    /// A re-send request naming `answer` is out and has not expired yet; over HTTP, until the response
+    /// to the request that carried it arrives, since the server re-sends the answer in some response.
+    fn is_answer_requested(&self, answer: i64) -> bool {
+        self.service_requests.iter().any(|(request_id, request)| match request {
+            ServiceRequest::ResendRequest { msg_ids, .. } => {
+                msg_ids.contains(&answer)
+                    && (!self.http || self.http_packets.iter().any(|packet| packet.services.contains(request_id)))
+            }
+            ServiceRequest::StateRequest { .. } => false,
+        })
+    }
+
+    /// The server executed the call whose answer `answer` is, and the answer cannot be had.
+    fn give_up_answer(&mut self, answer: i64) {
+        self.to_resend_answer.retain(|id| *id != answer);
+        self.resend_individually.remove(&answer);
+        self.withdraw_asks_for(answer);
+        let Some(awaited) = self.awaited_answers.remove(&answer) else {
+            return;
+        };
+        let Some(id) = awaited.query.filter(|_| awaited.announced_by >= self.server_session_since) else {
+            return;
+        };
+        if self.awaited_answers.values().any(|awaited| awaited.query == Some(id)) {
+            return;
+        }
+        let Some(msg_id) =
+            self.queries.get(&id).filter(|query| query.state != QueryState::Pending).map(|query| query.msg_id)
+        else {
+            return;
+        };
+        self.complete_query(id, msg_id);
+        self.events.push_back(SessionEvent::Error {
+            id,
+            code: 500,
+            message: ANSWER_LOST.to_string(),
+            response_msg_id: 0,
+        });
+    }
+
+    /// The answers the old server session announced for queries that go again in the new one: they are
+    /// gone with it, and a late reply about them must not touch the query sent again.
+    fn forget_awaited_answers_of(&mut self, resent: &[(i64, QueryId)]) {
+        let forgotten: Vec<i64> = self
+            .awaited_answers
+            .iter()
+            .filter(|(_, awaited)| awaited.query.is_some_and(|id| resent.iter().any(|(_, other)| *other == id)))
+            .map(|(answer, _)| *answer)
+            .collect();
+        for answer in forgotten {
+            self.awaited_answers.remove(&answer);
+            self.to_resend_answer.retain(|id| *id != answer);
+            self.resend_individually.remove(&answer);
+            self.withdraw_asks_for(answer);
+        }
+    }
+
+    /// The server says it has none of `answers`, which a re-send request of `asked` answers named (some
+    /// of them may have arrived since): a batch is asked for again one answer at a time first.
+    fn on_answers_unavailable(&mut self, answers: &[i64], asked: usize, now: Now) {
+        if answers.len() > 1 || asked > answers.len() {
             for answer in answers {
                 if self.awaited_answers.contains_key(answer) {
                     self.resend_individually.insert(*answer);
@@ -2562,10 +2718,7 @@ impl Session {
             return;
         }
         for answer in answers {
-            self.resend_individually.remove(answer);
-            if let Some(id) = self.awaited_answers.remove(answer).and_then(|awaited| awaited.query) {
-                self.resend_query(id, now);
-            }
+            self.give_up_answer(*answer);
         }
     }
 
@@ -2715,8 +2868,8 @@ impl Session {
                 None => transmit = transmit.min(now.mono),
             }
         }
-        if let Some(change) = self.salts.next_change_time() {
-            transmit = transmit.min(now.mono + (change - server_time).max(0.0));
+        if let Some(change) = self.salts.next_change_time(server_time) {
+            transmit = transmit.min(now.mono + (change - server_time));
         }
         let mut deadline = match self.drain_reset_at {
             Some(at) => transmit.max(at),
@@ -2742,7 +2895,13 @@ impl Session {
                 .min((at + 0.002).max(self.probe_held_until(now)))
                 .min(self.backlog_sampled_at + BACKLOG_SAMPLE_INTERVAL);
         }
-        for request in self.service_requests.values() {
+        for (request_id, request) in &self.service_requests {
+            if self.ask_in_flight(*request_id) {
+                if !self.http {
+                    deadline = deadline.min(request.sent_at() + TCP_ASK_BACKSTOP + 0.002);
+                }
+                continue;
+            }
             deadline = deadline.min(request.sent_at() + STATE_REQUEST_RETRY + 0.002);
         }
         deadline.is_finite().then_some(deadline)
@@ -2836,12 +2995,23 @@ impl Session {
         }
     }
 
+    /// A re-send request still waiting for the server's reply does not expire after
+    /// `STATE_REQUEST_RETRY`: over TCP until the reply, the connection's end or `TCP_ASK_BACKSTOP`, over
+    /// HTTP while the response to the request that carried it is arriving.
+    fn ask_in_flight(&self, request_id: i64) -> bool {
+        matches!(self.service_requests.get(&request_id), Some(ServiceRequest::ResendRequest { .. }))
+            && (!self.http || self.http_packets.iter().any(|packet| packet.services.contains(&request_id)))
+    }
+
     fn expire_answer_requests(&mut self, now: Now) {
         let expired: Vec<i64> = self
             .service_requests
             .iter()
             .filter_map(|(request_id, request)| match request {
-                ServiceRequest::ResendRequest { sent_at, .. } if sent_at + STATE_REQUEST_RETRY < now.mono => {
+                ServiceRequest::ResendRequest { sent_at, .. }
+                    if (sent_at + STATE_REQUEST_RETRY < now.mono && !self.ask_in_flight(*request_id))
+                        || (!self.http && sent_at + TCP_ASK_BACKSTOP < now.mono) =>
+                {
                     Some(*request_id)
                 }
                 _ => None,
@@ -2852,17 +3022,20 @@ impl Session {
                 continue;
             };
             for answer in msg_ids {
+                let newer_ask_out = self.service_requests.values().any(|request| {
+                    matches!(request, ServiceRequest::ResendRequest { msg_ids, .. } if msg_ids.contains(&answer))
+                });
+                if newer_ask_out || !self.http {
+                    continue;
+                }
                 let Some(awaited) = self.awaited_answers.get_mut(&answer) else {
                     continue;
                 };
-                awaited.requests += 1;
-                if awaited.requests >= MAX_ANSWER_REQUESTS {
-                    let query = awaited.query;
-                    self.awaited_answers.remove(&answer);
-                    if let Some(id) = query {
-                        self.resend_query(id, now);
-                    }
-                } else if !self.to_resend_answer.contains(&answer) {
+                if awaited.expired_asks >= MAX_EXPIRED_ANSWER_ASKS {
+                    continue;
+                }
+                awaited.expired_asks += 1;
+                if !self.to_resend_answer.contains(&answer) {
                     self.to_resend_answer.push(answer);
                     self.send_before(now.mono);
                 }
@@ -3237,7 +3410,11 @@ impl Session {
         if has_salt && !self.to_resend_answer.is_empty() {
             let awaited = &self.awaited_answers;
             self.resend_individually.retain(|id| awaited.contains_key(id));
-            let ids = take_tail(&mut self.to_resend_answer, MAX_IDS_PER_SERVICE_MESSAGE);
+            let ids = if self.http {
+                self.take_answers_for_http_request()
+            } else {
+                take_tail(&mut self.to_resend_answer, MAX_IDS_PER_SERVICE_MESSAGE)
+            };
             let (single, batch): (Vec<i64>, Vec<i64>) =
                 ids.into_iter().partition(|id| self.resend_individually.contains(id));
             if !batch.is_empty() {

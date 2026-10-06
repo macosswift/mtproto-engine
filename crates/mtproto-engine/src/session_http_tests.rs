@@ -745,3 +745,40 @@ fn the_hosts_permanent_key_given_mid_handshake_is_not_overwritten_by_the_one_mad
         "the call ran under the permanent key the session made, not the host's"
     );
 }
+
+#[test]
+fn a_new_route_starts_the_handshake_backoff_over() {
+    let poll = mio::Poll::new().unwrap();
+    let registry = poll.registry();
+    let mut rng = OsRandom::new();
+    let now = Now { mono: 1000.0, unix: 1_727_000_000.0 };
+    let mut runtime = runtime("127.0.0.1", 1, TransportPreference::Tcp, now, &mut rng);
+    for _ in 0..8 {
+        runtime.note_handshake_failure(now);
+    }
+    assert!(runtime.next_attempt_at - now.mono > 40.0, "the backoff built up");
+    runtime.reset_connection(now, registry);
+    runtime.set_network_available(false, now, registry);
+    runtime.set_network_available(true, now, registry);
+    runtime.note_handshake_failure(now);
+    let wait = runtime.next_attempt_at - now.mono;
+    assert!(wait <= 1.0 + mtproto_core::transport::RECONNECT_JITTER, "one failure on the new route waits {wait:.2} s");
+}
+
+#[test]
+fn an_unpaused_http_session_does_not_keep_its_handshake_hold() {
+    let poll = mio::Poll::new().unwrap();
+    let registry = poll.registry();
+    let mut rng = OsRandom::new();
+    let now = Now { mono: 1000.0, unix: 1_727_000_000.0 };
+    let mut runtime = runtime("127.0.0.1", 1, TransportPreference::Http, now, &mut rng);
+    runtime.set_paused(false, now, registry);
+    for _ in 0..8 {
+        runtime.note_handshake_failure(now);
+    }
+    runtime.set_paused(true, now, registry);
+    let later = Now { mono: now.mono + 5.0, unix: now.unix + 5.0 };
+    runtime.set_paused(false, later, registry);
+    let deadline = runtime.next_deadline(later, &EngineConfig::default()).expect("the session wants to connect");
+    assert!(deadline - later.mono <= 1.0, "the unpaused session waits {:.2} s", deadline - later.mono);
+}

@@ -15,6 +15,8 @@ const OPCODE_PONG: u8 = 0xa;
 pub const WS_MAX_FRAME_PAYLOAD: usize = 64 * 1024;
 /// The most one incoming frame may announce.
 pub const WS_MAX_INBOUND_FRAME: u64 = 16 * 1024 * 1024;
+/// The most a control frame may carry (RFC 6455 5.5); a longer one is not buffered.
+pub const WS_MAX_CONTROL_PAYLOAD: u64 = 125;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum WsError {
@@ -184,6 +186,9 @@ impl WsDeframer {
                     input.consume(header);
                     self.remaining = length;
                 }
+                OPCODE_PING | OPCODE_PONG if length > WS_MAX_CONTROL_PAYLOAD => {
+                    return Err(WsError::FrameTooLong(length));
+                }
                 OPCODE_PING | OPCODE_PONG => {
                     let total = header + length as usize;
                     if data.len() < total {
@@ -322,6 +327,15 @@ mod tests {
                     frame
                 },
                 WsError::FrameTooLong(WS_MAX_INBOUND_FRAME + 1),
+            ),
+            (server_frame(OPCODE_PING, &[0; 126]), WsError::FrameTooLong(126)),
+            (
+                {
+                    let mut frame = vec![0x89, 127];
+                    frame.extend_from_slice(&(2u64 << 20).to_be_bytes());
+                    frame
+                },
+                WsError::FrameTooLong(2 << 20),
             ),
         ] {
             let mut input = InputBuffer::new();

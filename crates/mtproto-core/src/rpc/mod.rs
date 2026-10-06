@@ -1073,7 +1073,10 @@ fn server_error_delay(server_errors: u32) -> f64 {
 }
 
 fn is_local_terminal_error(message: &str) -> bool {
-    message.starts_with(RESPONSE_UNPACK_FAILED) || message.starts_with(PROTOCOL_ERROR_PREFIX)
+    message.starts_with(RESPONSE_UNPACK_FAILED)
+        || message.starts_with(PROTOCOL_ERROR_PREFIX)
+        || message == crate::session::PROTOCOL_REJECTED
+        || message == crate::session::ANSWER_LOST
 }
 
 fn is_updates_too_long(body: &[u8]) -> bool {

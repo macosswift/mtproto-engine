@@ -299,7 +299,9 @@ is created with `pfs_lifetime = tempKeyExpiration` (24 h) and `pfs_make_permanen
   `ephemeralMedia` for media addresses) goes in as `pfs_temporary_key` when it is bound to that
   permanent key (attribute `rustEngineBoundTo`; MtProtoKit's keys carry none) and has more than 5 minutes
   left; the session then talks under it without a handshake (a key without the attribute is bound once
-  more first, so one bound to another permanent key is refused and replaced). A key with no expiry is never
+  more first: Telegram moves the binding of a key that carried initConnection to this permanent key, and
+  answers CONNECTION_NOT_INITED for one that never did, which the engine replaces with a key of its own;
+  once bound, the bridge marks the context's copy with `rustEngineBoundTo`). A key with no expiry is never
   taken as a temporary key. `MTTemporaryKey.bound_to` carries the binding: the engine refuses an offer
   bound to another permanent key, and drops what it kept when the permanent key changes.
 - Whenever the context gets another key for that selector (another session, MtProtoKit's refresh), it is

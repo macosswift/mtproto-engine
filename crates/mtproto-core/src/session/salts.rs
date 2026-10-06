@@ -67,7 +67,7 @@ impl SaltState {
 
     fn rotate(&mut self, server_time: f64) {
         while let Some(next) = self.future.last() {
-            if next.valid_since < server_time {
+            if next.valid_since <= server_time {
                 self.current = *next;
                 self.future.pop();
             } else {
@@ -98,9 +98,11 @@ impl SaltState {
         salts
     }
 
-    pub fn next_change_time(&self) -> Option<f64> {
-        let rotation = self.future.last().map(|salt| salt.valid_since);
-        let expiry = Some(self.current.valid_until - SALT_SAFETY_MARGIN).filter(|value| value.is_finite());
+    /// The next server time after `server_time` at which the salt in use changes or nears its end.
+    pub fn next_change_time(&self, server_time: f64) -> Option<f64> {
+        let rotation = self.future.last().map(|salt| salt.valid_since).filter(|at| *at > server_time);
+        let expiry = Some(self.current.valid_until - SALT_SAFETY_MARGIN)
+            .filter(|value| value.is_finite() && *value > server_time);
         match (rotation, expiry) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
@@ -153,6 +155,7 @@ mod tests {
         let mut state = SaltState::from_salts(&salts, 150.0);
         assert_eq!(state.current_salt(150.0), 2);
         assert_eq!(state.current_salt(2001.0), 3);
-        assert_eq!(state.next_change_time(), Some(3940.0));
+        assert_eq!(state.next_change_time(2001.0), Some(3940.0));
+        assert_eq!(state.next_change_time(3950.0), None, "a change already past wakes nobody");
     }
 }

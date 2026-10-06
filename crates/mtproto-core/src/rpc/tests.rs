@@ -1205,3 +1205,110 @@ mod pfs {
         assert!(requests < 5, "{requests} requests");
     }
 }
+
+fn rejected_every_time(flags: RequestFlags, rounds: usize) -> (usize, Vec<String>) {
+    let mut h = Harness::new(SessionRole::Main, Some("h1"));
+    h.send(1, flags);
+    let mut sends = 0;
+    let mut surfaced = Vec::new();
+    for _ in 0..rounds {
+        let calls = h.flush_calls();
+        for (msg_id, _, _) in &calls {
+            sends += 1;
+            h.reply(vec![Outgoing::Service(bad_msg_notification(*msg_id, 1, 16))]);
+        }
+        for event in h.events() {
+            match event {
+                RpcEvent::Failed { message, .. } => surfaced.push(message),
+                RpcEvent::RetryDecisionRequired { id, message, .. } => {
+                    surfaced.push(format!("decision:{message}"));
+                    h.client.decide_retry(id, true, h.now);
+                }
+                _ => {}
+            }
+        }
+        if calls.is_empty() {
+            h.advance(1.0);
+        }
+    }
+    (sends, surfaced)
+}
+
+/// The session gives up on a query the server keeps rejecting (a salt or time loop) with
+/// `PROTOCOL_ERROR_REJECTED`; the call fails to the host once instead of going again as a new query
+/// with the rejection count back at zero, for good.
+#[test]
+fn a_query_rejected_too_often_fails_instead_of_starting_over() {
+    for flags in [RequestFlags::default(), RequestFlags { delegate_retry_decisions: true, ..RequestFlags::default() }] {
+        let (sends, surfaced) = rejected_every_time(flags, 600);
+        assert_eq!(surfaced, vec![crate::session::PROTOCOL_REJECTED.to_string()], "{sends} sends");
+        assert!(sends <= 20, "{sends} sends");
+    }
+}
+
+/// The server ran a call whose answer it announced. While the answer does not come the call waits; once
+/// the server says it no longer has it, the call fails to the host
+/// once with `PROTOCOL_ERROR_ANSWER_LOST`, never as a retry decision, and it is never sent again as a new
+/// message, which would run it a second time.
+#[test]
+fn a_call_whose_announced_answer_never_comes_fails_instead_of_running_again() {
+    for flags in [RequestFlags::default(), RequestFlags { delegate_retry_decisions: true, ..RequestFlags::default() }] {
+        let mut h = Harness::new(SessionRole::Main, Some("h1"));
+        h.send(1, flags);
+        let calls = h.flush_calls();
+        assert_eq!(calls.len(), 1);
+        let answer = h.server.next_msg_id(true);
+        h.reply(vec![Outgoing::Service(msg_detailed_info(calls[0].0, answer, 40_000))]);
+        let mut sends = calls.len();
+        let mut surfaced = Vec::new();
+        let mut last_request = None;
+        let mut requests = 0;
+        for second in 0..200 {
+            if second == 150 {
+                h.reply(vec![Outgoing::Service(msg_detailed_info(calls[0].0, answer, 40_000))]);
+            }
+            if second == 152 {
+                let request = last_request.expect("the answer was asked for");
+                h.reply(vec![Outgoing::Service(msgs_state_info(request, &[1]))]);
+            }
+            h.advance(1.0);
+            let _ = h.client.handle_timeout(h.now);
+            while let Some(transmit) = h.client.poll_transmit(h.now, &mut h.rng) {
+                let packet = h.server.decode(&transmit.data);
+                let mut pongs = Vec::new();
+                for message in &packet.messages {
+                    if unwrap_call(&message.body).1.is_some() {
+                        sends += 1;
+                    }
+                    if message.constructor() == ids::MSG_RESEND_REQ {
+                        requests += 1;
+                        last_request = Some(message.msg_id);
+                    }
+                    if message.constructor() == ids::PING_DELAY_DISCONNECT || message.constructor() == ids::PING {
+                        let ping_id = i64::from_le_bytes(message.body[4..12].try_into().unwrap());
+                        pongs.push(Outgoing::Service(pong(message.msg_id, ping_id)));
+                    }
+                }
+                if !pongs.is_empty() {
+                    h.reply(pongs);
+                }
+            }
+            for event in h.events() {
+                match event {
+                    RpcEvent::Failed { message, .. } => surfaced.push(message),
+                    RpcEvent::RetryDecisionRequired { id, message, .. } => {
+                        surfaced.push(format!("decision:{message}"));
+                        h.client.decide_retry(id, true, h.now);
+                    }
+                    _ => {}
+                }
+            }
+            if second == 149 {
+                assert!(surfaced.is_empty(), "the call waits while its answer may still come: {surfaced:?}");
+                assert!(requests >= 1, "the answer is asked for: {requests}");
+            }
+        }
+        assert_eq!(sends, 1);
+        assert_eq!(surfaced, vec![crate::session::ANSWER_LOST.to_string()]);
+    }
+}

@@ -293,8 +293,11 @@ fn an_unverified_key_bound_to_the_sessions_permanent_key_is_bound_again_and_used
     assert_eq!(ran.iter().find(|(tag, _)| *tag == 2).map(|(_, key)| *key), Some(key.material.key.id()));
 }
 
+/// A key bound to another permanent key and offered without its binding is bound to this session's
+/// permanent key first: Telegram moves the binding of a key that carried calls (it never answers
+/// TEMP_AUTH_KEY_ALREADY_BOUND), so the calls run under this session's authorization.
 #[test]
-fn a_refused_unverified_key_offered_again_is_not_bound_again() {
+fn an_unverified_key_bound_to_another_permanent_key_is_moved_to_this_one() {
     let old_perm = random_key(400);
     let new_perm = random_key(401);
     let server = TestServer::start(
@@ -318,21 +321,13 @@ fn a_refused_unverified_key_offered_again_is_not_bound_again() {
     ));
     engine.send(session, request(2));
     assert!(collector.wait_completed(session, 2), "events {:?}", collector.of(session));
-    assert_eq!(collector.dropped(session), vec![stale.material.key.id() as i64]);
-    let failures_before = server.with_stats(|stats| stats.bind_failures.clone());
-    engine.offer_temporary_key(session, stale.clone());
-    server.drop_temporary_keys();
-    engine.send(session, request(3));
-    assert!(collector.wait_completed(session, 3), "events {:?}", collector.of(session));
     let (failures, ran) = server.with_stats(|stats| (stats.bind_failures.clone(), stats.executed_under.clone()));
     let in_use = collector.in_use(session);
     engine.shutdown();
-    eprintln!("failures {failures_before:?} -> {failures:?}; in use {in_use:x?}; ran {ran:x?}");
-    assert_eq!(failures, failures_before, "the refused key was bound again");
-    assert!(!in_use.iter().any(|(id, _)| *id == stale.material.key.id() as i64));
-    for tag in [2u32, 3] {
-        assert_eq!(ran.iter().find(|(t, _)| *t == tag).map(|(_, perm)| *perm), Some(new_perm.id()), "call {tag}");
-    }
+    eprintln!("failures {failures:?}; in use {in_use:x?}; ran {ran:x?}");
+    assert!(failures.is_empty(), "{failures:?}");
+    assert_eq!(in_use, vec![(stale.material.key.id() as i64, false)]);
+    assert_eq!(ran.iter().find(|(tag, _)| *tag == 2).map(|(_, perm)| *perm), Some(new_perm.id()));
 }
 
 /// The app's MtProtoKit made and bound a temporary key and used it without initConnection; Telegram

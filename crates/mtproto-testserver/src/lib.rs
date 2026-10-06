@@ -197,6 +197,12 @@ pub struct Stats {
 struct TempKey {
     expires_at: f64,
     bound_to: Option<u64>,
+    /// Calls ran under the key. Telegram counts a key as initialized once a call wrapped in
+    /// initConnection came under it; clients without API parameters (tests) never send one, so any call
+    /// counts here.
+    inited: bool,
+    /// The connection, session and expiry of the last bind.
+    bound_on: Option<(u64, i64, i32)>,
 }
 
 struct SessionState {
@@ -779,6 +785,7 @@ fn serve_frames_inner(
     let mut handshake_stalled = false;
     let mut resent_for = Delivered::default();
     let mut chaos_rng = XorShiftRandom::new(options.chaos.as_ref().map_or(1, |chaos| chaos.seed) ^ wire.rng.next_u64());
+    let connection = wire.rng.next_u64();
     let mut encrypted_packets = 0usize;
     let ambush = options.chaos.as_ref().is_some_and(|chaos| {
         chaos::ChaosConfig::chance(&mut chaos_rng, chaos.rate(chaos::Fault::AdaptiveReconnectAmbush))
@@ -900,6 +907,7 @@ fn serve_frames_inner(
             &packet,
             ambush_step,
             false,
+            connection,
         );
         if kill_now {
             let _ = wire.stream.shutdown(Shutdown::Both);
@@ -1022,6 +1030,7 @@ fn process_packet(
     packet: &[u8],
     ambush_step: Option<usize>,
     http: bool,
+    connection: u64,
 ) -> Reaction {
     let decoded = ServerPeer::new(key.clone(), unix_now()).decode(packet);
     let session_id = decoded.header.session_id;
@@ -1197,6 +1206,7 @@ fn process_packet(
                                 session_id,
                                 message.msg_id,
                                 &message.body,
+                                connection,
                             )
                             .map_err(|error| (400, error)),
                         };
@@ -1232,6 +1242,9 @@ fn process_packet(
                     _ => {
                         let (call, flags) = unwrap_wrappers(&message.body);
                         stats.init_connections += usize::from(flags.init_connection);
+                        if let Some(temp) = shared_ref.temp_keys.get_mut(&auth_key_id) {
+                            temp.inited = true;
+                        }
                         stats.without_updates += usize::from(flags.without_updates);
                         stats.invoke_after += usize::from(flags.invoke_after);
                         let (tag, payload) = match call {
@@ -1738,7 +1751,12 @@ fn register_key(shared: &mut Shared, outcome: &mtproto_core::test_support::Serve
         shared.stats.temporary_keys += 1;
         shared.temp_keys.insert(
             outcome.auth_key.id(),
-            TempKey { expires_at: server_now(clock_offset) + f64::from(expires_in), bound_to: None },
+            TempKey {
+                expires_at: server_now(clock_offset) + f64::from(expires_in),
+                bound_to: None,
+                inited: false,
+                bound_on: None,
+            },
         );
     }
 }
@@ -1764,6 +1782,7 @@ fn check_bind(
     session_id: i64,
     msg_id: i64,
     body: &[u8],
+    connection: u64,
 ) -> Result<(), &'static str> {
     let mut reader = Reader::new(&body[4..]);
     let perm_id = reader.read_i64().map_err(|_| "INPUT_REQUEST_INVALID")? as u64;
@@ -1796,11 +1815,22 @@ fn check_bind(
     if f64::from(expires_at) > temp.expires_at + 5.0 {
         return Err("EXPIRES_AT_INVALID");
     }
-    if temp.bound_to.is_some_and(|bound| bound != perm_id) {
-        return Err("TEMP_AUTH_KEY_ALREADY_BOUND");
+    // As Telegram does: a key bound before is bound again (to any permanent key) once it carried
+    // initConnection; before that, only to the same permanent key, on the connection or the session of
+    // its last bind and with the same expiry, and CONNECTION_NOT_INITED otherwise.
+    // TEMP_AUTH_KEY_ALREADY_BOUND never comes.
+    if temp.bound_to.is_some()
+        && !temp.inited
+        && !(temp.bound_to == Some(perm_id)
+            && temp.bound_on.is_some_and(|(bound_connection, bound_session, bound_expiry)| {
+                (bound_connection == connection || bound_session == session_id) && bound_expiry == expires_at
+            }))
+    {
+        return Err("CONNECTION_NOT_INITED");
     }
     if let Some(entry) = temp_keys.get_mut(&temp_key_id) {
         entry.bound_to = Some(perm_id);
+        entry.bound_on = Some((connection, session_id, expires_at));
     }
     Ok(())
 }

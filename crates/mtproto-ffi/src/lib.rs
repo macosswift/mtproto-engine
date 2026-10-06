@@ -308,6 +308,9 @@ impl EngineCallbacks for Bridge {
                 if state.proxy_has_connection_issues {
                     flags |= 16;
                 }
+                if state.awaiting_key_binding {
+                    flags |= 32;
+                }
                 event.flags = flags;
                 let address = proxy_address.unwrap_or_default();
                 event.text = string_ref(&address);

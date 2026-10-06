@@ -3,7 +3,7 @@ use std::sync::Arc;
 use mio::Registry;
 use mtproto_core::crypto::{OsRandom, RsaPublicKey};
 use mtproto_core::handshake::HandshakeConfig;
-use mtproto_core::rpc::RpcEvent;
+use mtproto_core::rpc::{RpcEvent, flood_wait_seconds};
 use mtproto_core::session::Now;
 
 use super::SessionRuntime;
@@ -24,6 +24,9 @@ pub const PFS_MIN_AGE_SHARE: f64 = 0.5;
 pub const PFS_SWITCH_WAIT: f64 = 60.0;
 pub const PFS_ROTATED_ERROR: &str = "TEMP_KEY_ROTATED";
 pub const PFS_BIND_RETRY_MAX: f64 = 30.0;
+/// Binds of one temporary key that may fail (500s, boolFalse and the like) before the key is replaced,
+/// as in MtProtoKit.
+pub const PFS_SAME_KEY_BINDS: u32 = 3;
 /// A temporary key the server refused is replaced at once the first time, then after 1 s, doubling up
 /// to a minute, until one is bound.
 pub const PFS_REGENERATE_BACKOFF_BASE: f64 = 1.0;
@@ -32,6 +35,9 @@ pub const PFS_REGENERATE_BACKOFF_MAX: f64 = 60.0;
 /// permanent key is not the server's.
 pub const PFS_INVALID_PERMANENT_AFTER: u32 = 2;
 pub const PFS_INVALID_PERMANENT_RETRY: f64 = 60.0;
+/// A permanent key younger than this is not reported unknown to the server, as in tdlib: binds under
+/// it are tried again after `PFS_INVALID_PERMANENT_RETRY` instead.
+pub const PFS_PERMANENT_KEY_IMMUNITY: f64 = 60.0;
 /// Temporary keys the server stopped taking that a host offer cannot bring back.
 const PFS_DROPPED_KEYS_KEPT: usize = 8;
 
@@ -41,6 +47,8 @@ pub(super) struct PfsState {
     pub(super) public_keys: Vec<RsaPublicKey>,
     /// The permanent key; the session never talks under it.
     pub(super) perm: Option<AuthKeyMaterial>,
+    /// When the session got the permanent key, unless it came with the session.
+    perm_since: Option<f64>,
     /// When the current temporary key expires, in server time.
     pub(super) temp_expires_at: Option<f64>,
     pub(super) bound: bool,
@@ -54,6 +62,10 @@ pub(super) struct PfsState {
     /// Temporary keys the server refused since one was last bound, and when the next may be made.
     refusals: u32,
     regenerate_at: f64,
+    /// Temporary keys the server lost (-404) with no fresh packet since: the next one waits longer.
+    lost_in_a_row: u32,
+    /// Rebinds after AUTH_KEY_PERM_EMPTY with no fresh packet since: a second one replaces the key.
+    perm_empty_rebinds: u32,
     /// The key went while the session was idle: the next one is made when there is work for it.
     pub(super) lazy: bool,
     /// `destroy_auth_key` goes under the permanent key, with every request held; once it is answered
@@ -209,6 +221,7 @@ impl PfsState {
     pub(super) fn replace_permanent_key(&mut self, perm: AuthKeyMaterial, running: bool, now: Now) {
         let replaced = self.perm.is_some();
         self.perm = Some(perm);
+        self.perm_since = Some(now.mono);
         if replaced || self.offered.as_ref().is_some_and(|offer| !self.binding_fits(offer)) {
             self.offered = None;
         }
@@ -292,6 +305,7 @@ impl SessionRuntime {
                     );
                 } else {
                     pfs.perm = Some(material);
+                    pfs.perm_since = Some(now.mono);
                     pfs.offered = None;
                     self.log(callbacks, LogLevel::Info, "permanent key made; making a temporary key");
                 }
@@ -313,6 +327,7 @@ impl SessionRuntime {
                 pfs.switch_by = None;
                 pfs.bound = false;
                 pfs.binding = false;
+                pfs.bind_failures = 0;
                 pfs.need_regenerate = false;
                 pfs.need_rebind = false;
                 self.install_key(material, now, rng);
@@ -347,8 +362,10 @@ impl SessionRuntime {
 
     /// Starts talking under the key the host offered instead of making one; a handshake under way is
     /// dropped with its connection. A key whose binding the host does not know (MtProtoKit's) is bound
-    /// again before any call goes out under it: one bound to another permanent key is then refused and
-    /// replaced. True when the key was taken.
+    /// again before any call goes out under it, which leaves it bound to this session's permanent key:
+    /// Telegram moves the binding of a key that carried initConnection (it does not refuse it), and
+    /// refuses the rebind of one that never did with CONNECTION_NOT_INITED, which replaces the key. True
+    /// when the key was taken.
     pub(super) fn take_offered_key(
         &mut self,
         registry: &Registry,
@@ -378,6 +395,7 @@ impl SessionRuntime {
         pfs.temp_created_at = now.mono - (f64::from(pfs.lifetime) - remaining).max(0.0);
         pfs.bound = !unverified;
         pfs.binding = false;
+        pfs.bind_failures = 0;
         pfs.need_regenerate = false;
         pfs.need_rebind = false;
         pfs.lazy = false;
@@ -430,12 +448,12 @@ impl SessionRuntime {
 
     /// The bind answers that mean the server will never take this temporary key: every 400, such as
     /// CONNECTION_NOT_INITED for a key another client (MtProtoKit) bound and used without
-    /// initConnection, which no retry of the same key gets past.
+    /// initConnection, which no retry of the same key gets past, and the 401, 403 and 406 refusals.
     pub(super) fn refuses_temporary_key(event: &RpcEvent) -> bool {
         matches!(
             event,
             RpcEvent::TemporaryKeyBindFailed { code, message }
-                if *code == 400
+                if matches!(*code, 400 | 401 | 403 | 406)
                     || matches!(message.as_str(), "ENCRYPTED_MESSAGE_INVALID" | "TEMP_AUTH_KEY_EMPTY" | "TEMP_AUTH_KEY_ALREADY_BOUND" | "EXPIRES_AT_INVALID")
         )
     }
@@ -480,7 +498,14 @@ impl SessionRuntime {
                     "TEMP_AUTH_KEY_EMPTY" | "TEMP_AUTH_KEY_ALREADY_BOUND" | "EXPIRES_AT_INVALID" => {
                         pfs.regenerate_after_refusal(now);
                     }
-                    _ if *code == 400 => {
+                    _ if matches!(*code, 400 | 401 | 403 | 406) => {
+                        pfs.regenerate_after_refusal(now);
+                    }
+                    _ if let Some(seconds) = flood_wait_seconds(message).filter(|_| *code == 420) => {
+                        pfs.bind_retry_at = now.mono + seconds.clamp(1, 86_400) as f64;
+                        pfs.need_rebind = true;
+                    }
+                    _ if pfs.bind_failures >= PFS_SAME_KEY_BINDS => {
                         pfs.regenerate_after_refusal(now);
                     }
                     _ => {
@@ -498,8 +523,12 @@ impl SessionRuntime {
                 true
             }
             RpcEvent::TemporaryKeyRejected => {
-                if pfs.bound {
+                if pfs.bound && pfs.perm_empty_rebinds >= 1 {
                     pfs.bound = false;
+                    pfs.regenerate_after_refusal(now);
+                } else if pfs.bound {
+                    pfs.bound = false;
+                    pfs.perm_empty_rebinds += 1;
                     pfs.need_rebind = true;
                 } else if !pfs.binding {
                     pfs.regenerate_after_refusal(now);
@@ -511,7 +540,7 @@ impl SessionRuntime {
     }
 
     /// The server lost the temporary key (`-404`): the next one is made without asking the host.
-    pub(super) fn forget_temporary_key(&mut self) -> bool {
+    pub(super) fn forget_temporary_key(&mut self, now: Now) -> bool {
         let Some(pfs) = &mut self.pfs else {
             return false;
         };
@@ -522,7 +551,22 @@ impl SessionRuntime {
         pfs.temp_expires_at = None;
         pfs.bound = false;
         pfs.binding = false;
+        pfs.lost_in_a_row = pfs.lost_in_a_row.saturating_add(1);
+        if pfs.lost_in_a_row > 1 {
+            let delay = (PFS_REGENERATE_BACKOFF_BASE * f64::from(1u32 << (pfs.lost_in_a_row - 2).min(10)))
+                .min(PFS_REGENERATE_BACKOFF_MAX);
+            self.next_attempt_at = self.next_attempt_at.max(now.mono + delay);
+        }
         true
+    }
+
+    /// A call completed under the temporary key: it works end to end. Bind answers and errors do not
+    /// count, so a server that keeps losing the binding or the key still gets a new key, with backoff.
+    pub(super) fn note_pfs_progress(&mut self) {
+        if let Some(pfs) = &mut self.pfs {
+            pfs.lost_in_a_row = 0;
+            pfs.perm_empty_rebinds = 0;
+        }
     }
 
     /// Drops the session's temporary key so that the next handshake makes another; the requests wait
@@ -552,6 +596,8 @@ impl SessionRuntime {
             pfs.binding = false;
             pfs.need_regenerate = false;
             pfs.need_rebind = false;
+            pfs.bind_failures = 0;
+            pfs.perm_empty_rebinds = 0;
             pfs.switch_by = None;
             pfs.lazy = idle;
         }
@@ -709,10 +755,19 @@ impl SessionRuntime {
             return;
         }
         if pfs.invalid_in_a_row >= PFS_INVALID_PERMANENT_AFTER {
+            let young = pfs.perm_since.is_some_and(|since| now.mono - since < PFS_PERMANENT_KEY_IMMUNITY);
             if let Some(pfs) = &mut self.pfs {
                 pfs.invalid_in_a_row = 0;
                 pfs.held_until = now.mono + PFS_INVALID_PERMANENT_RETRY;
                 pfs.need_regenerate = true;
+            }
+            if young {
+                self.log(
+                    callbacks,
+                    LogLevel::Info,
+                    "binds under the permanent key made just now fail; trying again before reporting it",
+                );
+                return;
             }
             self.log(callbacks, LogLevel::Warning, "the server does not know the permanent key");
             callbacks.on_event(self.handle, EngineEvent::PermanentKeyInvalid);

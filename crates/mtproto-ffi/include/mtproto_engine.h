@@ -204,6 +204,9 @@ enum {
     MTConnectionStateUpdatingConnectionContext = 1 << 2,
     MTConnectionStatePerformingServiceTasks = 1 << 3,
     MTConnectionStateProxyHasConnectionIssues = 1 << 4,
+    /* With UpdatingConnectionContext: the link answers and the session waits for its temporary key to
+       be bound, which says nothing against the route. */
+    MTConnectionStateAwaitingKeyBinding = 1 << 5,
 };
 
 enum {
