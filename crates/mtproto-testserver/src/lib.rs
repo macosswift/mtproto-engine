@@ -921,7 +921,7 @@ fn serve_frames_inner(
                 }
             }
             drop(guard);
-            return trickle_forever(&mut wire, mode, &stop, &mut chaos_rng);
+            return trickle_forever(&mut wire, mode, &key, &stop, &mut chaos_rng);
         }
         if let Some(code) = transport_error {
             let mut guard = shared.lock().unwrap();
@@ -1835,8 +1835,17 @@ fn check_bind(
     Ok(())
 }
 
-fn trickle_forever(wire: &mut Wire, mode: i32, stop: &AtomicBool, rng: &mut XorShiftRandom) -> std::io::Result<()> {
+fn trickle_forever(
+    wire: &mut Wire,
+    mode: i32,
+    key: &AuthKey,
+    stop: &AtomicBool,
+    rng: &mut XorShiftRandom,
+) -> std::io::Result<()> {
     let started = Instant::now();
+    if mode == 4 || mode == 5 {
+        return chain_short_frames(wire, mode, key, stop, started);
+    }
     if mode == 0 || mode == 3 {
         let declared = if mode == 0 { 2u32 << 20 } else { 8u32 << 20 };
         let header = match wire.framing {
@@ -1858,6 +1867,49 @@ fn trickle_forever(wire: &mut Wire, mode: i32, stop: &AtomicBool, rng: &mut XorS
             _ => wire.send_quick_ack(rng.next_u64() as u32 & 0x7fff_ffff),
         };
         if sent.is_err() {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Frames that never answer anything but each end inside the grace a partial frame gets, the next one
+/// already started: mode 4 chains empty transport frames, mode 5 chains packets sealed under the key
+/// for another session (what an on-path attacker replays from an earlier session under the same key).
+fn chain_short_frames(
+    wire: &mut Wire,
+    mode: i32,
+    key: &AuthKey,
+    stop: &AtomicBool,
+    started: Instant,
+) -> std::io::Result<()> {
+    let mut peer = ServerPeer::new(key.clone(), server_now(0.0));
+    peer.session_id = 0x0bad_5e55_1011;
+    let next_frame = |wire: &mut Wire, peer: &mut ServerPeer| -> Vec<u8> {
+        let payload = if mode == 4 {
+            0u32.to_le_bytes().to_vec()
+        } else {
+            peer.server_time = server_now(0.0);
+            let msg_id = peer.next_msg_id(false);
+            peer.seal(msg_id, 0, &sp::msgs_ack(&[msg_id - 1]))
+        };
+        let mut frame = Vec::new();
+        encode_frame(wire.framing, &payload, false, &mut wire.rng, &mut frame);
+        frame
+    };
+    let mut frame = next_frame(wire, &mut peer);
+    let head = frame.len().min(4);
+    if wire.send_raw_frame(frame[..head].to_vec()).is_err() {
+        return Ok(());
+    }
+    let mut rest = frame.split_off(head);
+    while !stop.load(Ordering::Relaxed) && started.elapsed() < Duration::from_secs(90) {
+        std::thread::sleep(Duration::from_millis(300));
+        let mut next = next_frame(wire, &mut peer);
+        let head = next.len().min(4);
+        let tail = next.split_off(head);
+        rest.extend_from_slice(&next);
+        if wire.send_raw_frame(std::mem::replace(&mut rest, tail)).is_err() {
             break;
         }
     }

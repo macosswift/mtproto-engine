@@ -93,6 +93,18 @@ Telegram-Mac repo builds `MTProtoEngineFFI.xcframework` (arm64 + x86_64, macOS 1
   end-to-end tests that drive `MTContext` → `RustNetworkSession` → the engine → the
   `mtproto-testserver` binary (build it first with `cargo build --release -p mtproto-testserver`).
 
+### Fuzzing and coverage
+
+- `crates/mtproto-fuzz`: seeded generators and long soaks on the stable toolchain (`cargo run --release -p
+  mtproto-fuzz -- --list`).
+- `fuzz/`: coverage-guided cargo-fuzz targets (nightly) for every parser that faces the network (service
+  messages, HTTP, WebSocket, the four framings, obfuscated2 and fake-TLS, SOCKS5, route memory, salts), the
+  session and RPC layers fed packets sealed with the session's real key, the handshake past its RSA and
+  nonce checks, and a liveness target where an honest server must settle every request left open by hostile
+  input. How to run them and what each checks: `fuzz/README.md`.
+- Coverage: `cargo install cargo-llvm-cov`, `rustup component add llvm-tools-preview`, then
+  `cargo llvm-cov --workspace --no-fail-fast --summary-only` (about 30 minutes; `-p mtproto-core` alone takes one).
+
 ### Security bench
 
 `security/requirements.tsv` maps every documented MTProto security requirement and every tdlib check to

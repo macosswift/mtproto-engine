@@ -83,12 +83,18 @@ impl SaltState {
 
     pub fn has_valid_salt(&mut self, server_time: f64) -> bool {
         self.rotate(server_time);
-        self.current.valid_until > server_time + SALT_SAFETY_MARGIN
+        self.current_is_valid(server_time)
     }
 
+    /// Whenever the salt in use is not valid, future salts are needed: a bound that compares false
+    /// both ways (a NaN from the host's stored salts) must not leave the session with neither.
     pub fn needs_future_salts(&mut self, server_time: f64) -> bool {
         self.rotate(server_time);
-        self.future.is_empty() || self.current.valid_until <= server_time + SALT_SAFETY_MARGIN
+        self.future.is_empty() || !self.current_is_valid(server_time)
+    }
+
+    fn current_is_valid(&self, server_time: f64) -> bool {
+        self.current.valid_until > server_time + SALT_SAFETY_MARGIN
     }
 
     pub fn all(&self) -> Vec<ServerSalt> {
@@ -147,6 +153,14 @@ mod tests {
         assert_eq!(state.current_salt(7300.0), 4);
         assert!(state.needs_future_salts(7300.0));
         assert_eq!(state.all().len(), 1);
+    }
+
+    #[test]
+    fn a_stored_salt_without_a_comparable_end_asks_for_future_salts() {
+        let salts = vec![salt(1, 0.0, f64::NAN), salt(2, 1000.0, 2000.0)];
+        let mut state = SaltState::from_salts(&salts, 10.0);
+        assert!(!state.has_valid_salt(10.0));
+        assert!(state.needs_future_salts(10.0), "neither valid nor asking would leave the session stuck");
     }
 
     #[test]

@@ -73,6 +73,11 @@ pub const TARGETS: &[Target] = &[
         run: rpc_case,
     },
     Target {
+        name: "host",
+        about: "RPC client fed by a broken host: strings TL cannot carry, huge init params, NaN clocks",
+        run: crate::host::host_case,
+    },
+    Target {
         name: "soak",
         about: "30-90 simulated days: sleep, clock changes, salt rotation, drops; exactly-once, no growth",
         run: crate::soak::soak_case,

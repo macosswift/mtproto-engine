@@ -367,6 +367,40 @@ fn http_404_for_encrypted_posts_only_is_taken_for_a_lost_key() {
     );
 }
 
+/// The same middlebox, against a session that holds the RSA keys: a 404 is no proof, so the session
+/// checks its key with a temporary key bound to it instead of reporting it. The middlebox 404s the
+/// bind as well, so nothing completes, but the key is never reported.
+#[test]
+fn http_404_for_encrypted_posts_never_reports_a_key_the_session_can_check() {
+    use mtproto_engine::KeyGeneration;
+    use mtproto_engine::mtproto_core::test_support::{ServerHandshake, ServerHandshakeBehavior};
+    let key = random_key(9105);
+    let server = TestServer::start(
+        vec![key.clone()],
+        ServerOptions {
+            handshake: ServerHandshakeBehavior { live_time: true, ..Default::default() },
+            ..Default::default()
+        },
+    );
+    let middlebox = Middlebox::start(Some(server.address), Mode::StatusForEncrypted(404));
+    let collector = Arc::new(Collector::default());
+    let engine = engine(&collector);
+    let mut setup = setup_to(middlebox.port, &key, TransportPreference::Http);
+    setup.key_generation = Some(KeyGeneration {
+        public_keys: vec![ServerHandshake::new(ServerHandshakeBehavior::default()).public_key()],
+        temporary_expires_in: None,
+    });
+    let session = engine.create_session(setup);
+    engine.send(session, request(1, 1));
+    std::thread::sleep(Duration::from_secs(15));
+    let reported =
+        collector.count(|event| matches!(event, EngineEvent::AuthKeyInvalid { .. } | EngineEvent::PermanentKeyInvalid));
+    let (requests, encrypted, connections) = middlebox.snapshot();
+    engine.shutdown();
+    eprintln!("{requests} requests ({encrypted} encrypted), {connections} connections in 15 s");
+    assert_eq!(reported, 0, "a 404 from the path reported the key");
+}
+
 fn steady_rate(mode: Mode, seconds: u64) -> (usize, usize, usize) {
     let key = random_key(9103);
     let server = TestServer::start(vec![key.clone()], ServerOptions::default());

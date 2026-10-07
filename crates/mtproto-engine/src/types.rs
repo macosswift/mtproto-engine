@@ -98,6 +98,42 @@ impl ProxyConfig {
     }
 }
 
+/// Key bytes handed to the host: never printed by `Debug`, zeroized when dropped.
+#[derive(Clone, PartialEq, Eq, Default)]
+pub struct SecretBytes(Vec<u8>);
+
+impl SecretBytes {
+    pub fn into_vec(mut self) -> Vec<u8> {
+        std::mem::take(&mut self.0)
+    }
+}
+
+impl From<Vec<u8>> for SecretBytes {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+}
+
+impl core::ops::Deref for SecretBytes {
+    type Target = Vec<u8>;
+
+    fn deref(&self) -> &Vec<u8> {
+        &self.0
+    }
+}
+
+impl Drop for SecretBytes {
+    fn drop(&mut self) {
+        mtproto_core::Zeroize::zeroize(&mut self.0);
+    }
+}
+
+impl core::fmt::Debug for SecretBytes {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "<{} secret bytes>", self.0.len())
+    }
+}
+
 #[derive(Clone)]
 pub struct AuthKeyMaterial {
     pub key: AuthKey,
@@ -381,7 +417,7 @@ pub enum EngineEvent {
         code: i32,
     },
     AuthKeyCreated {
-        key: Vec<u8>,
+        key: SecretBytes,
         salt: i64,
         time_difference: f64,
         expires_at: Option<i32>,

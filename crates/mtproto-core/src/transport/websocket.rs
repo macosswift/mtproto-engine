@@ -60,6 +60,9 @@ impl WsHandshake {
         let Some(end) = data.windows(4).position(|window| window == b"\r\n\r\n") else {
             return if data.len() > MAX_HEAD_LEN { Err(WsError::Malformed) } else { Ok(false) };
         };
+        if end > MAX_HEAD_LEN {
+            return Err(WsError::Malformed);
+        }
         let head = std::str::from_utf8(&data[..end]).map_err(|_| WsError::Malformed)?;
         let mut lines = head.split("\r\n");
         let status_line = lines.next().unwrap_or_default();
@@ -259,6 +262,18 @@ mod tests {
             b"HTTP/1.1 101 Switching Protocols\r\nSec-WebSocket-Accept: AAAA\r\nSec-WebSocket-Protocol: binary\r\n\r\n",
         );
         assert_eq!(forged.feed(&mut input), Err(WsError::BadAccept), "a middlebox answering 101 to anything");
+    }
+
+    #[test]
+    fn an_oversized_upgrade_head_is_refused_even_when_it_arrives_whole() {
+        let (mut handshake, _) = WsHandshake::new("h", "/apiws", [2u8; 16]);
+        let mut input = InputBuffer::new();
+        input.extend(b"HTTP/1.1 101 Switching Protocols\r\n");
+        for index in 0..4096 {
+            input.extend(format!("X-{index}: v\r\n").as_bytes());
+        }
+        input.extend(b"\r\n");
+        assert_eq!(handshake.feed(&mut input), Err(WsError::Malformed));
     }
 
     #[test]

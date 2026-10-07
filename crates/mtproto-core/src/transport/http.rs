@@ -165,6 +165,7 @@ pub struct HttpResponseReader {
     discarded: usize,
     max_body: usize,
     expected: Option<usize>,
+    trailer_bytes: usize,
 }
 
 impl Default for HttpResponseReader {
@@ -188,6 +189,7 @@ impl HttpResponseReader {
             discarded: 0,
             max_body,
             expected: None,
+            trailer_bytes: 0,
         }
     }
 
@@ -290,6 +292,9 @@ impl HttpResponseReader {
                         if self.received().saturating_add(size) > limit {
                             return Err(HttpError::BodyTooLarge((self.received() + size) as u64));
                         }
+                        if size == 0 {
+                            self.trailer_bytes = 0;
+                        }
                         let next = if size == 0 { ChunkState::Trailers } else { ChunkState::Data(size) };
                         self.state = State::Body { framing: BodyFraming::Chunked, chunk: next };
                     }
@@ -322,6 +327,10 @@ impl HttpResponseReader {
                         };
                         if line.is_empty() {
                             return Ok(Some(self.finish_response()));
+                        }
+                        self.trailer_bytes += line.len() + 2;
+                        if self.trailer_bytes > MAX_HEAD_LEN {
+                            return Err(HttpError::HeadTooLarge);
                         }
                     }
                 },
@@ -516,6 +525,9 @@ impl HttpConnectHandshake {
                 }
                 return Ok(false);
             };
+            if end > MAX_HEAD_LEN {
+                return Err(HttpConnectError::Malformed(HttpError::HeadTooLarge));
+            }
             let head = parse_head(&data[..end]).map_err(HttpConnectError::Malformed)?;
             input.consume(end + 4);
             match head.status {
@@ -704,6 +716,27 @@ mod tests {
             read_all(&mut HttpResponseReader::new(), &chunked, 1 << 20).unwrap_err(),
             HttpError::BodyTooLarge(_)
         ));
+    }
+
+    #[test]
+    fn trailers_and_proxy_heads_are_bounded() {
+        let mut wire = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nabcd\r\n0\r\n".to_vec();
+        for index in 0..64 {
+            wire.extend_from_slice(format!("X-Trailer-{index}: {}\r\n", "t".repeat(400)).as_bytes());
+        }
+        assert_eq!(read_all(&mut HttpResponseReader::new(), &wire, 97).unwrap_err(), HttpError::HeadTooLarge);
+        let wire = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nz\r\n0\r\nA: b\r\nC: d\r\n\r\n";
+        let responses = read_all(&mut HttpResponseReader::new(), wire, 5).unwrap();
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0].body, b"z");
+
+        let mut head = b"HTTP/1.1 200 Connection established\r\nX-Pad: ".to_vec();
+        head.extend(vec![b'p'; MAX_HEAD_LEN]);
+        head.extend_from_slice(b"\r\n\r\n");
+        let (mut handshake, _) = HttpConnectHandshake::new("h:1", None);
+        let mut input = InputBuffer::new();
+        input.extend(&head);
+        assert_eq!(handshake.feed(&mut input), Err(HttpConnectError::Malformed(HttpError::HeadTooLarge)));
     }
 
     #[test]

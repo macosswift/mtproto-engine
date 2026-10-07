@@ -114,6 +114,57 @@ pub fn wrap_request(
     writer.into_inner()
 }
 
+/// The most the wrappers around a request (verification, initConnection) may add. The host's strings
+/// go into them: one TL cannot carry (16 MiB or more) or a wrapper this large fails the request
+/// locally instead of aborting the process in the TL writer or the transport framer.
+pub const MAX_WRAPPER_BYTES: usize = 1 << 20;
+
+/// The bytes `wrap_request` puts around the payload, or None when a host string is too long for TL or
+/// the init params (a serialized TL object) are not whole 4-byte words.
+pub fn wrapper_len(
+    initialize: Option<&ApiEnvironment>,
+    without_updates: bool,
+    verification: Option<&Verification>,
+) -> Option<usize> {
+    fn bytes_len(length: usize) -> Option<usize> {
+        (length < 1 << 24).then(|| crate::tl::serialized_bytes_len(length))
+    }
+    let mut total = 0usize;
+    match verification {
+        Some(Verification::Recaptcha { token }) => total += 4 + bytes_len(token.len())?,
+        Some(Verification::Apns { nonce, secret }) => {
+            total += 4 + bytes_len(nonce.len())? + bytes_len(secret.len())?;
+        }
+        None => {}
+    }
+    if without_updates {
+        total += 4;
+    }
+    if let Some(environment) = initialize {
+        total += 20;
+        for text in [
+            &environment.device_model,
+            &environment.system_version,
+            &environment.app_version,
+            &environment.system_lang_code,
+            &environment.lang_pack,
+            &environment.lang_code,
+        ] {
+            total += bytes_len(text.len())?;
+        }
+        if let Some(proxy) = &environment.proxy {
+            total += 8 + bytes_len(proxy.address.len())?;
+        }
+        if let Some(params) = &environment.params {
+            if !params.len().is_multiple_of(4) {
+                return None;
+            }
+            total = total.checked_add(params.len())?;
+        }
+    }
+    Some(total)
+}
+
 pub const GZIP_MIN_REQUEST_SIZE: usize = 256;
 /// From this size on, a request is gzipped only if a sample from its middle compresses: random or
 /// encrypted bytes (upload parts of media, secret chat payloads) would be packed for nothing.

@@ -1,0 +1,136 @@
+[package]
+name = "mtproto-cargo-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "GPL-2.0-or-later"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[lib]
+name = "mtproto_cargo_fuzz"
+path = "src/lib.rs"
+
+[dependencies]
+libfuzzer-sys = "0.4"
+num-bigint = "=0.4.8"
+mtproto-core = { path = "../crates/mtproto-core", features = ["test-support"] }
+mtproto-engine = { path = "../crates/mtproto-engine", features = ["fuzzing"] }
+
+[features]
+# Builds the write-seeds tool; fuzz builds leave it out (it has no fuzz entry point).
+seeds = []
+
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+codegen-units = 16
+
+[[bin]]
+name = "session"
+path = "fuzz_targets/session.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "session_liveness"
+path = "fuzz_targets/session_liveness.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rpc"
+path = "fuzz_targets/rpc.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "service_tl"
+path = "fuzz_targets/service_tl.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http_response"
+path = "fuzz_targets/http_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "websocket"
+path = "fuzz_targets/websocket.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "codec"
+path = "fuzz_targets/codec.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "obfuscated2"
+path = "fuzz_targets/obfuscated2.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "handshake"
+path = "fuzz_targets/handshake.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "route_memory"
+path = "fuzz_targets/route_memory.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "socks5"
+path = "fuzz_targets/socks5.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "salts"
+path = "fuzz_targets/salts.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fake_tls"
+path = "fuzz_targets/fake_tls.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "message"
+path = "fuzz_targets/message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "write-seeds"
+path = "src/bin/write_seeds.rs"
+required-features = ["seeds"]
+test = false
+doc = false
+bench = false

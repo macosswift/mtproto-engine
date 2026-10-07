@@ -1312,3 +1312,6 @@ fn a_call_whose_announced_answer_never_comes_fails_instead_of_running_again() {
         assert_eq!(surfaced, vec![crate::session::ANSWER_LOST.to_string()]);
     }
 }
+
+#[path = "coverage_tests.rs"]
+mod coverage;

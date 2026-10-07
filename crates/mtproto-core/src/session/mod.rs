@@ -1,5 +1,7 @@
 mod dedupe;
 mod salts;
+#[cfg(test)]
+mod sec_audit_replay_tests;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -372,7 +374,8 @@ struct PacketContext {
     budget: usize,
     messages: usize,
     deferred_resends: Vec<(QueryId, i64)>,
-    updates_lost: bool,
+    /// The newest msg_id of an update this packet could not deliver.
+    updates_lost: Option<i64>,
     unknown_queries_stuck: bool,
     structure_error: Option<TlError>,
 }
@@ -384,7 +387,7 @@ impl PacketContext {
             budget,
             messages: 0,
             deferred_resends: Vec::new(),
-            updates_lost: false,
+            updates_lost: None,
             unknown_queries_stuck: false,
             structure_error: None,
         }
@@ -429,6 +432,9 @@ pub struct Session {
     /// session's, and the server saying it has none of it does not fail the call (the new session runs
     /// it, or it was sent again).
     server_session_since: i64,
+    /// The host was last told to fetch the difference when the newest message received had this msg_id:
+    /// an update the server sent before it is in that fetch, so losing it again asks for nothing more.
+    updates_lost_covered: i64,
     force_send_at: Option<f64>,
 
     received: DuplicateChecker,
@@ -561,6 +567,7 @@ impl Session {
             recent_sent: VecDeque::new(),
             recent_unique_ids: VecDeque::new(),
             server_session_since: 0,
+            updates_lost_covered: 0,
             force_send_at: None,
             received: DuplicateChecker::new(1000),
             updates: DuplicateChecker::new(1000),
@@ -953,6 +960,9 @@ impl Session {
     }
 
     pub fn set_time_difference(&mut self, difference: f64) {
+        if (difference - self.time_difference).abs() > CLOCK_JUMP_THRESHOLD {
+            self.last_future_salts_at = None;
+        }
         self.time_difference = difference;
         self.server_offset = difference + self.wall_offset;
     }
@@ -1537,6 +1547,7 @@ impl Session {
         self.recent_sent.clear();
         self.recent_unique_ids.clear();
         self.server_session_since = 0;
+        self.updates_lost_covered = 0;
         self.pending_pings.clear();
         self.received.clear();
         self.updates.clear();
@@ -1950,7 +1961,11 @@ impl Session {
         now: Now,
         rng: &mut impl SecureRandom,
     ) -> Result<(), SessionError> {
-        if context.updates_lost {
+        if let Some(lost) = context.updates_lost
+            && lost > self.updates_lost_covered
+        {
+            let ceiling = msg_id_for_time(self.server_time(now) + MSG_ID_MAX_FUTURE_SECONDS);
+            self.updates_lost_covered = self.received.newest().unwrap_or(lost).min(ceiling).max(lost);
             self.events.push_back(SessionEvent::UpdatesLost);
         }
         for (id, msg_id) in context.deferred_resends {
@@ -2242,13 +2257,13 @@ impl Session {
             ServiceMessage::HttpWait { .. } | ServiceMessage::Ignored { .. } => {}
             ServiceMessage::Other { body, .. } => {
                 if context.mode == Mode::Replay {
-                    context.updates_lost = true;
+                    context.updates_lost = context.updates_lost.max(Some(msg_id));
                     return;
                 }
                 match self.updates.check(msg_id) {
                     DuplicateCheck::New => self.events.push_back(SessionEvent::Update { body: body.to_vec(), msg_id }),
                     DuplicateCheck::Duplicate => {}
-                    DuplicateCheck::TooOld => context.updates_lost = true,
+                    DuplicateCheck::TooOld => context.updates_lost = context.updates_lost.max(Some(msg_id)),
                 }
             }
         }
@@ -2369,8 +2384,11 @@ impl Session {
     }
 
     fn on_pong(&mut self, context: &mut PacketContext, msg_id: i64, ping_msg_id: i64, ping_id: i64, now: Now) {
-        self.last_pong_at = now.mono;
         let ping = self.pending_pings.remove(&ping_msg_id).or_else(|| self.pending_pings.remove(&ping_id));
+        if ping.is_none() && context.mode == Mode::Replay {
+            return;
+        }
+        self.last_pong_at = now.mono;
         if let Some(ping) = ping {
             self.note_arrived(ping.packet_seq, now);
             let fresh = self.answers_with_current_time(context, msg_id, now);
@@ -2418,7 +2436,7 @@ impl Session {
         now: Now,
     ) {
         let Some(id) = self.by_msg_id.get(&req_msg_id).copied() else {
-            if size > DROPPED_ANSWER_COUNTED_SIZE {
+            if size > DROPPED_ANSWER_COUNTED_SIZE && context.mode == Mode::Process {
                 if now.mono - self.dropped_answer_window_start > DROPPED_ANSWER_WINDOW {
                     self.dropped_answer_window_start = now.mono;
                     self.dropped_answer_bytes = 0;
@@ -3565,6 +3583,9 @@ impl Session {
                 services.push(ping_msg_id);
                 self.last_ping_container_id = container_id;
             }
+            if let Some(msg_id) = future_salts_msg_id {
+                services.push(msg_id);
+            }
             if !services.is_empty() {
                 self.service_containers.push_back((container_id, services));
                 while self.service_containers.len() > MAX_TRACKED_SERVICE_CONTAINERS {
@@ -3705,6 +3726,9 @@ impl Session {
     }
 }
 
+#[cfg(test)]
+mod sec_audit_salt_request_tests;
+
 struct OutgoingMessage {
     msg_id: i64,
     seq_no: i32,
@@ -3721,3 +3745,6 @@ fn take_tail(source: &mut Vec<i64>, limit: usize) -> Vec<i64> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod sec_audit_updates_lost_tests;

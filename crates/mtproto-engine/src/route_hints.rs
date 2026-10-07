@@ -322,7 +322,9 @@ fn time_from(bytes: &[u8]) -> Option<f64> {
     (value.is_finite() && value > 0.0).then_some(value)
 }
 
-/// Only networks where TCP is known not to get through are worth storing.
+/// Only networks where TCP is known not to get through are worth storing. A network last seen after
+/// `now` (the clock stepped back since) is stored as seen now: `load` refuses records seen ahead of the
+/// clock, and the memory has to load back on the clock it was written with.
 fn serialize(named: &HashMap<Vec<u8>, Record>, now: f64) -> Vec<u8> {
     let mut entries: Vec<_> =
         named.iter().filter(|(_, record)| record.http_likely(now, HTTP_MEMORY_LIFETIME)).collect();
@@ -333,7 +335,7 @@ fn serialize(named: &HashMap<Vec<u8>, Record>, now: f64) -> Vec<u8> {
         out.extend_from_slice(key);
         out.extend_from_slice(&time_bits(record.http_needed_at));
         out.extend_from_slice(&time_bits(record.tcp_answered_at));
-        out.extend_from_slice(&time_bits(Some(record.seen_at)));
+        out.extend_from_slice(&time_bits(Some(record.seen_at.min(now))));
     }
     out
 }
@@ -471,6 +473,26 @@ mod tests {
             loaded.load(garbage, now);
         }
         assert!(loaded.export(now).len() == 2, "nothing was taken from malformed memory");
+    }
+
+    /// The clock stepped back after the network was last seen: the memory written then still loads, on
+    /// that clock, as a network known to block TCP (crashes.md, fix-03).
+    #[test]
+    fn memory_written_after_the_clock_stepped_back_loads_again() {
+        let now = 1_800_000_000.0;
+        let hints = RouteHints::default();
+        hints.set_network(b"office", now);
+        hints.note_http_needed(now);
+        hints.set_network(b"home", now + 100.0);
+        hints.set_network(b"office", now + 100.0);
+        let stepped_back = now - 30.0;
+        assert!(hints.http_likely(stepped_back));
+        let stored = hints.export(stepped_back);
+        let next_run = RouteHints::default();
+        next_run.load(&stored, stepped_back);
+        assert_eq!(next_run.export(stepped_back), stored, "export → load → export is stable");
+        next_run.set_network(b"office", stepped_back);
+        assert!(next_run.http_likely(stepped_back), "the office still blocks TCP after a restart");
     }
 
     #[test]

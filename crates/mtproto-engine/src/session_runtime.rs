@@ -136,7 +136,6 @@ struct ResolvedHost {
 }
 
 struct FrameWatch {
-    length: usize,
     started_at: f64,
 }
 
@@ -651,7 +650,13 @@ impl SessionRuntime {
         callbacks: &Arc<dyn EngineCallbacks>,
         rng: &mut OsRandom,
     ) {
-        if self.pfs.is_some() || setup.public_keys.is_empty() {
+        if setup.public_keys.is_empty() {
+            return;
+        }
+        if let Some(pfs) = &mut self.pfs {
+            if pfs.take_over_key_check(setup) {
+                pfs.replace_temporary_key_now(now);
+            }
             return;
         }
         let perm = self.rpc.as_ref().map(|rpc| AuthKeyMaterial {
@@ -782,6 +787,7 @@ impl SessionRuntime {
 
     pub fn set_time_difference(&mut self, difference: f64) {
         self.setup.time_difference = difference;
+        self.reported_time_difference = Some(difference);
         if let Some(rpc) = &mut self.rpc {
             rpc.session_mut().set_time_difference(difference);
         }
@@ -1797,20 +1803,18 @@ impl SessionRuntime {
         more_readable
     }
 
+    /// A partial frame is arriving fast enough to count as the connection being alive. The grace runs
+    /// from the first partial frame after the last packet that proved anything (a fresh packet, a
+    /// matched quick ack, a handshake step): frames that complete without one (empty frames, unknown
+    /// quick acks, packets of another session replayed) do not start it again, or a chain of them
+    /// would hold a dead connection for ever.
     fn frame_is_progressing(&mut self, now: Now) -> bool {
-        let Some((length, received)) = self
-            .connection
-            .as_ref()
-            .and_then(Connection::pending_frame_head)
-            .map(|(length, head)| (length, head.len()))
+        let Some(received) =
+            self.connection.as_ref().and_then(Connection::pending_frame_head).map(|(_, head)| head.len())
         else {
-            self.frame_watch = None;
             return false;
         };
-        let watch = self.frame_watch.get_or_insert(FrameWatch { length, started_at: now.mono });
-        if watch.length != length {
-            *watch = FrameWatch { length, started_at: now.mono };
-        }
+        let watch = self.frame_watch.get_or_insert(FrameWatch { started_at: now.mono });
         let elapsed = now.mono - watch.started_at;
         elapsed <= FRAME_PROGRESS_GRACE || received as f64 >= elapsed * FRAME_MIN_RATE
     }
@@ -1886,11 +1890,11 @@ impl SessionRuntime {
                 break;
             };
             self.progress = None;
-            self.frame_watch = None;
             match incoming {
                 Incoming::Packet(packet) => {
                     if self.handshake.is_some() {
                         let installed = self.on_handshake_packet(&packet, now, callbacks, rng)?;
+                        self.frame_watch = None;
                         self.note_server_heard(now);
                         if installed && let Some(rpc) = &mut self.rpc {
                             rpc.connection_opened(now);
@@ -1907,6 +1911,7 @@ impl SessionRuntime {
                         connection.last_progress_at = now.mono;
                     }
                     if fresh {
+                        self.frame_watch = None;
                         self.clear_suspicion(registry);
                         if self.auto.on_websocket {
                             self.note_websocket_answered();
@@ -1927,7 +1932,8 @@ impl SessionRuntime {
                                 );
                             }
                             self.note_server_heard(now);
-                            if let Some(connection) = &mut self.connection
+                            if fresh
+                                && let Some(connection) = &mut self.connection
                                 && !connection.received_packet
                             {
                                 connection.received_packet = true;
@@ -1940,7 +1946,9 @@ impl SessionRuntime {
                                     self.drop_racer(registry);
                                 }
                             }
-                            self.timeout_fired = false;
+                            if fresh {
+                                self.timeout_fired = false;
+                            }
                         }
                         Err(SessionError::ForeignSession)
                         | Err(SessionError::TooOld)
@@ -1959,6 +1967,7 @@ impl SessionRuntime {
                         if let Some(connection) = &mut self.connection {
                             connection.last_progress_at = now.mono;
                         }
+                        self.frame_watch = None;
                         self.clear_suspicion(registry);
                     }
                     self.pump_rpc_events(now, registry, callbacks);
@@ -2003,15 +2012,17 @@ impl SessionRuntime {
                 let expires_at = result.expires_at;
                 let server_time = now.unix + result.time_difference;
                 self.setup.time_difference = result.time_difference;
-                callbacks.on_event(
-                    self.handle,
-                    EngineEvent::AuthKeyCreated {
-                        key: result.auth_key.bytes().to_vec(),
-                        salt: result.server_salt,
-                        time_difference: result.time_difference,
-                        expires_at,
-                    },
-                );
+                if self.reports_created_key(expires_at.is_some()) {
+                    callbacks.on_event(
+                        self.handle,
+                        EngineEvent::AuthKeyCreated {
+                            key: result.auth_key.bytes().to_vec().into(),
+                            salt: result.server_salt,
+                            time_difference: result.time_difference,
+                            expires_at,
+                        },
+                    );
+                }
                 let material = AuthKeyMaterial {
                     key: result.auth_key,
                     salts: vec![ServerSalt {
@@ -2064,10 +2075,18 @@ impl SessionRuntime {
                 }
                 self.key_rejections = 0;
                 let key_id = self.rpc.as_ref().map(|rpc| rpc.session().auth_key_id());
-                if !self.forget_temporary_key(now) {
+                if self.forget_temporary_key(now) {
+                    if let Some(key_id) = key_id {
+                        self.drop_temporary_key(key_id, callbacks);
+                    }
+                } else if self.check_permanent_key_with_pfs() {
+                    self.log(
+                        callbacks,
+                        LogLevel::Warning,
+                        "-404 again on a fresh connection; checking the permanent key by binding a temporary key to it",
+                    );
+                } else {
                     callbacks.on_event(self.handle, EngineEvent::AuthKeyInvalid { code });
-                } else if let Some(key_id) = key_id {
-                    self.drop_temporary_key(key_id, callbacks);
                 }
                 self.retire_rpc();
                 self.close_reason = Some(CloseReason::ServerRejected);
@@ -2136,6 +2155,7 @@ impl SessionRuntime {
             }
             if let (RpcEvent::TemporaryKeyBound, Some(key_id), Some(pfs)) = (&event, current_key, self.pfs.as_ref())
                 && let Some(expires_at) = pfs.temp_expires_at
+                && self.reports_created_key(true)
             {
                 callbacks.on_event(
                     self.handle,
@@ -2156,6 +2176,9 @@ impl SessionRuntime {
                     }
                     RpcEvent::TimeDifferenceUpdated { difference } => {
                         self.setup.time_difference = *difference;
+                        if self.setup.role == SessionRole::Cdn {
+                            continue;
+                        }
                         if self
                             .reported_time_difference
                             .is_some_and(|reported| (difference - reported).abs() < TIME_DIFFERENCE_REPORT_THRESHOLD)

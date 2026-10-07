@@ -327,7 +327,7 @@ impl EngineCallbacks for Bridge {
                 event.integer1 = salt;
                 event.integer2 = expires_at.map(i64::from).unwrap_or(0);
                 event.value1 = time_difference;
-                self.emit_secret(session, event, key);
+                self.emit_secret(session, event, key.into_vec());
             }
             EngineEvent::AuthKeyCreationFailed { reason } => {
                 let mut event = blank(22);

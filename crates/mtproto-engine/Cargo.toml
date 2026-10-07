@@ -11,6 +11,10 @@ mtproto-core = { path = "../mtproto-core" }
 mio = { version = "=1.2.2", features = ["os-poll", "net"] }
 libc = "=0.2.189"
 
+[features]
+# Exposes internal parsers to the cargo-fuzz targets in fuzz/.
+fuzzing = []
+
 [dev-dependencies]
 mtproto-core = { path = "../mtproto-core", features = ["test-support"] }
 mtproto-testserver = { path = "../mtproto-testserver" }

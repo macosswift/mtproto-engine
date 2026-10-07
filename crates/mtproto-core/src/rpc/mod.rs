@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 
 pub use wrap::{
     ApiEnvironment, ClientProxy, INIT_CONNECTION, INPUT_CLIENT_PROXY, INVOKE_WITH_APNS_SECRET, INVOKE_WITH_RECAPTCHA,
-    Verification, flood_wait_seconds, wrap_request,
+    MAX_WRAPPER_BYTES, Verification, flood_wait_seconds, wrap_request, wrapper_len,
 };
 
 use crate::crypto::SecureRandom;
@@ -20,6 +20,8 @@ pub const LARGE_RESPONSE_THRESHOLD: u32 = 512 * 1024;
 pub const MAX_CONNECTION_NOT_INITED_RETRIES: u32 = 5;
 pub const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 pub const REQUEST_INVALID_SIZE: &str = "REQUEST_INVALID_SIZE";
+/// A host request id in the range the client keeps for its own `auth.bindTempAuthKey`.
+pub const REQUEST_ID_INVALID: &str = "REQUEST_ID_INVALID";
 pub const MIN_FLOOD_WAIT_SECONDS: i64 = 1;
 pub const MAX_FLOOD_WAIT_SECONDS: i64 = 14 * 24 * 60 * 60;
 pub const TEMPORARY_KEY_RETRY_DELAY: f64 = 1.0;
@@ -268,6 +270,18 @@ fn has_invalid_size(body: &[u8]) -> bool {
     body.len() > MAX_REQUEST_BYTES || !body.len().is_multiple_of(4) || body.len() < 4
 }
 
+/// Why a host request cannot go at all: an id the client uses for its own binds would be taken for the
+/// bind (the host's request lost, its answer read as the bind's), a body no server takes.
+fn refusal(id: RequestId, body: &[u8]) -> Option<&'static str> {
+    if id.0 > BIND_QUERY_ID_BASE {
+        Some(REQUEST_ID_INVALID)
+    } else if has_invalid_size(body) {
+        Some(REQUEST_INVALID_SIZE)
+    } else {
+        None
+    }
+}
+
 #[derive(Debug, Clone)]
 struct PendingDecision {
     code: i32,
@@ -387,11 +401,11 @@ impl RpcClient {
         if self.requests.contains_key(&id) {
             return;
         }
-        if has_invalid_size(&request.body) {
+        if let Some(message) = refusal(id, &request.body) {
             self.events.push_back(RpcEvent::Failed {
                 id,
                 code: 400,
-                message: REQUEST_INVALID_SIZE.to_string(),
+                message: message.to_string(),
                 response_time: now.unix,
                 duration: 0.0,
             });
@@ -412,11 +426,11 @@ impl RpcClient {
         if self.requests.contains_key(&id) {
             return;
         }
-        if has_invalid_size(&state.request.body) {
+        if let Some(message) = refusal(id, &state.request.body) {
             self.events.push_back(RpcEvent::Failed {
                 id,
                 code: 400,
-                message: REQUEST_INVALID_SIZE.to_string(),
+                message: message.to_string(),
                 response_time: now.unix,
                 duration: 0.0,
             });
@@ -577,6 +591,21 @@ impl RpcClient {
                 .and_then(|state| state.request.invoke_after)
                 .filter(|dependency| self.requests.get(dependency).is_some_and(|other| other.in_session))
                 .map(QueryId::from);
+            let environment = anonymous.as_ref().or(self.environment.as_ref());
+            let fits = self.requests.get(&id).is_some_and(|state| {
+                let without_updates = state.request.flags.without_updates
+                    || environment.is_some_and(|environment| environment.disable_updates);
+                wrap::wrapper_len(
+                    if initialize { environment } else { None },
+                    without_updates,
+                    state.verification.as_ref(),
+                )
+                .is_some_and(|length| length <= wrap::MAX_WRAPPER_BYTES)
+            });
+            if !fits {
+                self.surface(id, 400, REQUEST_INVALID_SIZE.to_string(), now.unix, now);
+                continue;
+            }
             let environment = anonymous.as_ref().or(self.environment.as_ref());
             let state = self.requests.get_mut(&id).expect("ready request exists");
             let without_updates = state.request.flags.without_updates
@@ -838,7 +867,7 @@ impl RpcClient {
                 return;
             }
         }
-        if code == 403 {
+        if code == 403 && self.role != SessionRole::Cdn {
             if let Some(nonce) = message.strip_prefix("APNS_VERIFY_CHECK_") {
                 let kind = VerificationKind::Apns { nonce: nonce.to_string() };
                 self.park_for_verification(id, kind, now);

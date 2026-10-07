@@ -14,6 +14,7 @@ fn every_target_survives_a_short_run() {
     for target in TARGETS {
         let cases = match target.name {
             "session" | "rpc" => 24,
+            "host" => 300,
             "handshake" => 150,
             _ => 1500,
         };
