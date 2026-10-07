@@ -187,11 +187,12 @@ and send them (see 9).
 | `NetworkUsage` | `MTNetworkUsageManager(info: usageCalculationInfo)`: `addIncomingBytes`/`addOutgoingBytes`, interface `Other` |
 | `AddressResult` | `reportTransportSchemeSuccess` / `reportTransportSchemeFailure` for the scheme at that index |
 | `ConnectionDropped` | every observer from `observeConnectionDrops` gets `NetworkEngineConnectionDrop(reason: text, answered: flags & 1, age: value1)`; `RecordingNetworkEngine` feeds them to `NetworkTelemetry` (drops per role and reason, and the latest on failure records). `text` is the reason (`probe_timeout`, `racer_won`, `session_error`, …), `answered` whether the session took a packet from the connection, `age` seconds since it started connecting |
-| `AuthKeyCreated` | PFS sessions: a temporary key is held until `TemporaryKeyInUse` names it (a permanent key cannot come: the session never allows the engine to make one). Other sessions: logged only |
+| `AuthKeyCreated` | `flags` says which key (ABI 4: `MTAuthKeyCreatedTemporary` or `MTAuthKeyCreatedPermanent`), `code` the `dc` its handshake carried; only keys the session keeps are reported. PFS sessions: a temporary key is held until `TemporaryKeyInUse` names it (a permanent key cannot come: the session never allows the engine to make one). The key maker of section 9b hands its permanent key to `MTContext`. Other sessions: logged only |
 | `TemporaryKeyInUse` | the key the session talks under (salts and init hash go to its auth info). One the session made (`flags & 1 == 0`), for the address class the session has now (`code` is the obfuscation id it was made for), is written to the class's ephemeral selector with `rustEngineBoundTo` = the permanent key id in `request_id`, unless the context keeps a longer-lived key bound to the same permanent key |
 | `TemporaryKeyDropped` | the context's key for the selector is removed if it is that key |
-| `PermanentKeyInvalid` | PFS sessions, unless the key replaced another less than 60 s ago: on another datacenter the permanent key and its token are dropped and made anew; on the home datacenter `context.checkIfLoggedOut(dc)`, whose probe makes and binds a fresh temporary key over MtProtoKit's TCP (never stored, never answered by a stored key) and logs out only when that bind is refused with `ENCRYPTED_MESSAGE_INVALID` |
-| `TemporaryKeyBound`, `TemporaryKeyBindFailed`, `AuthKeyCreationFailed`, `TransportFlood` | logged only |
+| `PermanentKeyInvalid` | PFS sessions, unless the key was installed into the session less than 60 s ago, since the session last had none: on another datacenter (and for the session that imports an authorization) the permanent key and its token are dropped and made anew; on the home datacenter, refused binds alone are no verdict. While the engine's actions are installed (`RustEngineActions`) and MTContext has their factories, the report is noted in the context registry and `context.checkIfLoggedOut(dc)` runs the engine's key check of section 9b, which logs out only on the full evidence and the validation call there. While MtProtoKit runs the key actions (a session draining after a switch to MtProtoKit), the report starts nothing: MtProtoKit's probe would decide on one refused bind |
+| `TemporaryKeyBound`, `TemporaryKeyBindFailed` | PFS sessions: noted in the context registry against the installed permanent key (a bind accepted; a fresh key refused with `ENCRYPTED_MESSAGE_INVALID`), the evidence the logout check weighs (section 9b); logged |
+| `AuthKeyCreationFailed`, `TransportFlood` | logged only |
 | `AuthKeyDestroyed` (28) | not mapped (`RustEngineEventKind` has no case, so the event is dropped): TelegramCore never calls `mt_session_destroy_auth_key` yet |
 
 ## 6. MTContext reads and writes
@@ -241,6 +242,8 @@ reset (pause + resume), as MtProtoKit resets its transport.
 | `.worker`, `dc == master` | `Worker` | by the address class | idle disconnect 60 s |
 | `.worker`, `dc != master`, not CDN | `WorkerRequiringAuthToken` | by the address class | token `NSNumber(dc)` from `master` |
 | `.worker`, CDN | `Cdn` | `persistent` | |
+| authorization import (section 9b) | `Worker` | by the address class | no token gate |
+| key maker / logout check (section 9b) | `Worker` | none (makes the permanent key / checks the given one) | no requests; Auto + Telegram Web |
 
 All sessions: created paused, `framing = Abridged` (the engine switches to padded intermediate for
 `dd`/`ee` secrets), `online = 0`, `request_timeout = 5`, `time_difference` from the context,
@@ -272,7 +275,7 @@ short log. `Logger` itself drops everything when file and console logging are of
 | CDN session | drop the selector's key and require a new one (`isCdn: true`) |
 | foreign-DC worker | `removeTokenForDatacenter(dc)`, drop and require the key, mark the token missing |
 | ephemeral selector | drop and require the key |
-| otherwise (persistent key) | `context.checkIfLoggedOut(dc)` only (a fresh key exchange and bind that logs out only on `ENCRYPTED_MESSAGE_INVALID`); the same key is reinstalled on `AuthKeyRequired` |
+| otherwise (persistent key) | `context.checkIfLoggedOut(dc)` only (a fresh key exchange and bind; MtProtoKit's logs out on `ENCRYPTED_MESSAGE_INVALID`, the engine's only as section 9b says); the same key is reinstalled on `AuthKeyRequired` |
 
 While waiting, the rejected key id is remembered so a context key with that id is never reinstalled.
 If the context already holds a different key for the selector when a key is rejected (another session
@@ -292,11 +295,11 @@ a transfer on resume, and opens the gate on `contextDatacenterAuthTokenUpdated` 
 A non-CDN session with `useTempAuthKeys` and MtProtoKit's RSA keys (`MTDatacenterAuthDefaultPublicKeys`)
 is created with `pfs_lifetime = tempKeyExpiration` (24 h) and `pfs_make_permanent_key = 0`:
 
-- Its key is the context's persistent key. Permanent keys still come only from `MTContext`
-  (MtProtoKit): it also makes them on its own for `UnauthorizedAccount`'s key prefetch and for auth
-  transfers, so a second maker would race it and could leave a temporary key bound to a permanent key
-  the context no longer holds. Without one the engine asks (`AuthKeyRequired`) and the session requests
-  the persistent key from the context as before.
+- Its key is the context's persistent key. Permanent keys still come only from `MTContext`, the one
+  maker per datacenter; a second maker in the session would race it and could leave a temporary key
+  bound to a permanent key the context no longer holds. Without one the engine asks (`AuthKeyRequired`)
+  and the session requests the persistent key from the context, whose action makes it over the engine
+  while Rust carries the network (section 9b), over MtProtoKit's TCP otherwise.
 - The temporary key the context keeps for the session's address class (`ephemeralMain`, or
   `ephemeralMedia` for media addresses) goes in as `pfs_temporary_key` when it is bound to that
   permanent key (attribute `rustEngineBoundTo`; MtProtoKit's keys carry none) and has more than 5 minutes
@@ -321,6 +324,92 @@ is created with `pfs_lifetime = tempKeyExpiration` (24 h) and `pfs_make_permanen
   media), as MtProtoKit and tdlib do.
 - `AUTH_KEY_PERM_EMPTY` and `-404` are handled inside the engine (rebind or a new temporary key); the
   session never drops the permanent key for them.
+
+## 9b. MTContext's actions over the engine
+
+`MTContext` makes every auth key and transfers every authorization through one action per datacenter
+and selector (per datacenter for a transfer), with its own backoff and wake-ups for the connections
+that wait. MtProtoKit's actions use its TCP transports only, so on a network where only plain HTTP or
+Telegram Web reach Telegram a fresh login, the first use of another datacenter and the logout check
+never concluded. The bridge therefore gives the context actions that run on the engine
+(`RustEngineActions`, MtProtoKit's public `MTExternalActions.h`): `authActionFactory` and
+`transferAuthActionFactory`. `NetworkEngine.activate()` installs them when a network starts on the
+Rust engine and whenever a live switch moves it there; `deactivate()` removes them when it moves to
+MtProtoKit (`SwitchingNetworkEngine` deactivates the old engine before activating the new one) and ends
+every action still running on the engine (and any MTContext makes from its factories until they are
+cleared or replaced on MTContext's queue), which reports a failure, so MtProtoKit takes those keys and transfers over after MTContext's
+backoff (1 s after a first failure, at most 60 s) instead of waiting behind them (the kill switch must
+reach a login). App
+extensions never get them. `MTContext` stays the only coordinator and the only writer of keys and tokens.
+
+- **Permanent keys** (persistent selector, not a CDN): a key-only engine session (`generate_key = 1`,
+  no temporary expiry, role `Worker`, no requests, MtProtoKit's RSA keys, the context's main addresses
+  and proxy, Auto transport with Telegram Web) makes the key. The bridge takes the time difference the
+  handshake measured when the context's differs from it by more than 10 s (the sessions correct it
+  precisely) and calls `-[MTDatacenterAuthAction completeWithAuthKey:timestamp:serverSalt:]`, which
+  stores it exactly as MtProtoKit stores its own, unless the context got a permanent key for the
+  datacenter meanwhile (compare-and-set: the key sessions already use is never replaced). The engine
+  backs off failed handshakes 1 to 60 s; an attempt with no key after 300 s fails, and `MTContext` asks
+  again with its backoff. `UnauthorizedAccount`'s key prefetch asks
+  for permanent keys only with the Rust engine, so MtProtoKit's parked temporary-key actions do not open
+  TCP connections on a blocked network.
+- **The logout check** (`checkIfLoggedOut`, `probedPermanentKey`). The engine's `PermanentKeyInvalid` on
+  the home datacenter starts it only while these actions are installed. Otherwise (MtProtoKit's actions,
+  for example a session draining after a switch to MtProtoKit) it starts nothing, because MtProtoKit's
+  probe would decide on one refused bind. The gate (`rustEngineStartLogoutCheck`) is decided on
+  MTContext's queue: it needs the registry to name the engine's actions and the factories set there to be
+  theirs, and the check reads the factory in the same block. `activate` and `deactivate` change the registry at once and
+  write the factories only on that queue, in order. A check that passes the gate therefore always gets
+  the engine's action, never MtProtoKit's; if the engine was deactivated meanwhile, that action ends at
+  once. The check is a PFS engine session with the probed
+  key, `pfs_lifetime = 3600`, no permanent key of its own and no offered temporary key, sends nothing
+  but its bind. `TemporaryKeyBound`: the key is known (noted in the context registry). A bind refused with
+  `400 ENCRYPTED_MESSAGE_INVALID` leads on only when the context registry also has, for that key: the
+  engine's `PermanentKeyInvalid` (two fresh keys refused while the key was older than the engine's 60 s
+  immunity, and not taken by the bridge for a key installed into the session less than a minute ago,
+  since the session last had none), at most
+  5 minutes old; a
+  session's refused bind under the key, starting a refusal episode (refusals more than 300 s apart start
+  a new one), watched for at least 10 s; and no sign within the last day that the server knows the key
+  (tdlib's immunity, since a datacenter incident can hide a known key, `-404`s included). A sign is any
+  of:
+  - a call's result, cancelled or not;
+  - a server error other than `401`, other than `PROTOCOL_ERROR_*`, and other than the errors the engine
+    or the bridge make up for a call that may never have reached the server;
+  - an update;
+  - an accepted bind;
+  - any answer to an earlier validation call (below).
+
+  tdlib with PFS counts accepted binds only. The bridge also counts answers, because a launch reuses the
+  stored temporary key and binds nothing. As a result, a temporary key of a permanent key the server
+  destroyed, which still answers calls that need no authorization (R5-2), keeps the immunity going until
+  it expires. An authorized account is logged out by its main session's `401` meanwhile.
+
+  A session that stops leaves its last sign behind, and times come from `CLOCK_MONOTONIC_RAW`, which
+  never steps and counts time asleep. Then, as tdlib validates its main key after a refused bind, a
+  non-PFS engine session with no RSA keys sends `help.test` (without updates) under the permanent key
+  itself:
+  - any answer, an error included, keeps the account: a `401` under the permanent key itself, and
+    `PROTOCOL_ERROR_*` (raised after service messages the server encrypted under the key). Refused binds
+    alone are no proof: the server refuses them for a while for other reasons too, and so would a bug in
+    the engine's own bind code;
+  - only `AuthKeyInvalid` (`-404` twice, the second on a fresh connection), with the evidence still
+    holding when it comes, confirms the key unknown and logs out;
+  - no answer gives no verdict. Other bind refusals give no verdict; 5xx and 420
+  are retried by the engine three times, then no verdict. Nothing the check makes is stored. Before
+  login the verdict replaces the home key (`Network.permanentKeyUnknown`, Rust only) instead of logging
+  anything out.
+- **Authorization transfer**: `auth.exportAuthorization` goes to the master datacenter through the
+  context's running main session (no new connection or key), or a short-lived worker there; the import
+  goes to the destination through a short-lived worker that imports it itself (engine role `Worker`, no
+  token gate), takes the destination's permanent key from the context like any session (the engine makes
+  it when there is none) and asks for its temporary key as usual. The token goes to the context only if
+  the destination's permanent key is still the one the import ran under (checked and written in one
+  context transaction). After a failed import the bytes are never sent again: `AUTH_BYTES_INVALID` or a
+  server error (`TEMP_KEY_ROTATED` included) gets one fresh export per attempt (a flood wait is waited
+  out, and the engine's retransmission keeps the message id, which the server runs once); any other
+  failure, and an attempt not done within 120 s, fails the transfer, which `MTContext` retries with its
+  backoff (1, 2, 4 … 60 s).
 
 ## 10. Connection management
 
@@ -354,7 +443,7 @@ is created with `pfs_lifetime = tempKeyExpiration` (24 h) and `pfs_make_permanen
 | Proxy connection issues | `MTConnectionProbing` (proxy unreachable while the internet is reachable) | engine flag: proxy set, not connected, 3+ failed attempts | engine semantics |
 | Key rejected while the context already has a newer key | drops it and asks for another | installs the newer key | avoids rebind storms (R14) |
 | Network type | wifi/cellular per socket | cellular when the socket's local address is on a `pdp_ip*` interface | same accounting (`72d7e51f95`) |
-| Main-session `401` | logs out | logs out (`rustEngineAuthorizationRequiredAction`) | the `401` is the server's verdict; R1's `checkIfLoggedOut` probe is an MtProtoKit key exchange over TCP that never concludes where only HTTP or Telegram Web work (§14, risk 1) |
+| Main-session `401` | logs out | logs out (`rustEngineAuthorizationRequiredAction`) | the `401` is the server's verdict; R1's `checkIfLoggedOut` probe, a key exchange and bind (over the engine while its actions are installed, over MtProtoKit's TCP otherwise), can only say less |
 
 ## 12. Known gaps and FFI requests
 
@@ -400,8 +489,36 @@ exactly as `MTTcpConnection` does; iOS only.
   raw session create/destroy through the routing table. `RustEngineEndToEndTests` runs
   `RustNetworkSession` against the `mtproto-testserver` binary (`cargo build -p mtproto-testserver`
   first): completion, cancellation, flood waits, dropped connections, salt changes, a worker sharing the
-  main session's engine, and a media worker following its addresses between media and main keys. It
-  needs the shared logger that `RustEngineBridgeTests` installs, so run the whole test target.
+  main session's engine, and a media worker following its addresses between media and main keys.
+  `RustEngineContextActionsTests` (`--api` starts a second server, datacenter 4, sharing exports and
+  imports) covers section 9b: a fresh login over HTTP and over Telegram Web only, the test offset, the
+  compare-and-set against another maker in either order, MtProtoKit taking over an engine-made key,
+  the logout check's verdicts. It logs out exactly once for a forgotten key, over HTTP and over Telegram
+  Web only. It logs nobody out for:
+  - a bind that succeeds;
+  - server errors, or no answer;
+  - no report from the engine;
+  - calls completing under the key;
+  - refused binds after the key was answered under (including an incident that hides the key, `-404`s
+    and all, without validating it: nothing reaches the server under the key itself, and the test
+    server's `hidden_key_rejections` stays 0);
+  - refused binds from the start, when the validation call is answered, with a result or with a `401`;
+  - a validation call that gets no answer (the test server's `help-test ok|silent|error <code> <text>`,
+    and `help_tests` in `stats`).
+
+  It also pins the immunity's accepted limit, as in tdlib: a fresh context logs out once when the server
+  refuses binds and answers `-404` under the key itself (`hide-permanent-keys on`; at least two
+  `hidden_key_rejections`, the validation's).
+  `RustEngineEndToEndTests` checks that a report starts no check while MtProtoKit runs the key actions,
+  including from a session draining after a switch to MtProtoKit.
+
+  It also covers a switch to MtProtoKit ending a key
+  maker the engine cannot finish, a key maker giving up, and transfers over HTTP, through the main
+  session, cancelled, and with an import refused (`AUTH_BYTES_INVALID`, `500`) or an export refused.
+  `RustContextRegistryTests` pins the evidence rules without sessions, and the ordering on MTContext's
+  queue: the gate (`rustEngineStartLogoutCheck`), and the factory writes of `activate` and `deactivate`. MtProtoKit's TCP connections are
+  counted through `makeTcpConnectionInterface`: none while the engine makes keys and transfers. The tests
+  need the shared logger that `RustEngineBridgeTests` installs, so run the whole test target.
 
 ## 14. Risks (not yet exercised at runtime)
 
@@ -413,9 +530,11 @@ exactly as `MTTcpConnection` does; iOS only.
    the probe's `EphemeralMain` auth action completed at once on the key the context stored for that
    selector, never reached the server, and always reported "not removed". Since 2026-10-06 the probe
    carries `replacesExistingKey` and `probedPermanentKey` and really makes a fresh temporary key, binds it
-   to the probed permanent key and never stores it, giving up without a verdict after 120 s; it is what
-   the bridge uses for the engine's `PermanentKeyInvalid` on the home datacenter. It still runs over MtProtoKit's TCP, so it cannot confirm a `401` where only HTTP or
-   Telegram Web work, and the `401` path stays a direct logout.
+   to the probed permanent key and never stores it, giving up without a verdict after 120 s. The bridge
+   starts it for the engine's `PermanentKeyInvalid` on the home datacenter only while the engine's actions
+   are installed: it then runs over the engine and weighs the evidence and the validation call of section
+   9b. Refused binds alone never log out. A `401` is the server's own verdict, so that path stays a direct
+   logout.
 2. **Liveness.** Sessions follow `Network.isUserOnline` (`Account.shouldKeepOnlinePresence`, wired on iOS
    only). Online, a
    dead connection is dropped after about `2.5 × max(2, 1.5·rtt + 1)` s; offline (background, secondary
@@ -441,7 +560,7 @@ exactly as `MTTcpConnection` does; iOS only.
 The C ABI in `crates/mtproto-ffi/include/mtproto_engine.h` follows these rules. Any other host must
 follow them too.
 
-- **Version.** `mt_engine_abi_version()` must equal the version the host was built against (1).
+- **Version.** `mt_engine_abi_version()` must equal the version the host was built against (4).
 - **Engine.** `mt_engine_create` returns an owned pointer. `mt_engine_destroy` releases it:
   - Delivery stops at once. A secret payload that is already queued is zeroized, not delivered.
   - The worker threads are shut down and joined.

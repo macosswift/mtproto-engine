@@ -21,7 +21,11 @@ use mtproto_engine::{
     TransportPreference, WebEndpoint,
 };
 
-pub const ABI_VERSION: u32 = 3;
+pub const ABI_VERSION: u32 = 4;
+
+/// `MTEvent.flags` of `MTEventKindAuthKeyCreated`: exactly one is set.
+pub const AUTH_KEY_CREATED_TEMPORARY: u32 = 1 << 0;
+pub const AUTH_KEY_CREATED_PERMANENT: u32 = 1 << 1;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -322,11 +326,14 @@ impl EngineCallbacks for Bridge {
                 event.code = code;
                 self.emit(session, event, None);
             }
-            EngineEvent::AuthKeyCreated { key, salt, time_difference, expires_at } => {
+            EngineEvent::AuthKeyCreated { key, salt, time_difference, expires_at, dc_id } => {
                 let mut event = blank(21);
                 event.integer1 = salt;
                 event.integer2 = expires_at.map(i64::from).unwrap_or(0);
                 event.value1 = time_difference;
+                event.code = dc_id;
+                event.flags =
+                    if expires_at.is_some() { AUTH_KEY_CREATED_TEMPORARY } else { AUTH_KEY_CREATED_PERMANENT };
                 self.emit_secret(session, event, key.into_vec());
             }
             EngineEvent::AuthKeyCreationFailed { reason } => {

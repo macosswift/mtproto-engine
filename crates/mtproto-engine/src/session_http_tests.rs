@@ -744,6 +744,7 @@ fn the_hosts_permanent_key_given_mid_handshake_is_not_overwritten_by_the_one_mad
         Some(host_perm.id()),
         "the call ran under the permanent key the session made, not the host's"
     );
+    assert!(made.is_empty(), "the permanent key the session dropped was reported to the host: {made:x?}");
 }
 
 #[test]

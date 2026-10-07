@@ -180,6 +180,11 @@ pub struct Stats {
     pub handshake_dcs: Vec<(i32, bool)>,
     pub binds: usize,
     pub bind_failures: Vec<String>,
+    /// `help.test` calls that came under a permanent key the server knows (not a temporary key), answered
+    /// or not.
+    pub help_tests: usize,
+    /// Packets under a permanent key the server knows that got -404 because permanent keys were hidden.
+    pub hidden_key_rejections: usize,
     pub perm_empty_errors: usize,
     pub expired_key_rejections: usize,
     /// The auth key ids `destroy_auth_key` arrived under.
@@ -263,6 +268,33 @@ struct Shared {
     http: http::HttpShared,
     tcp_blackhole: bool,
     temp_keys: HashMap<u64, TempKey>,
+    bind_fault: Option<BindFault>,
+    help_test: HelpTestReply,
+    /// Messages sent under a permanent key itself (not a temporary key bound to it) get -404, as from a
+    /// server that cannot find the key for a while.
+    hide_permanent_keys: bool,
+}
+
+/// How `help.test`, the call a client sends under its permanent key to learn whether the server still
+/// knows it, is answered from now on.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum HelpTestReply {
+    /// `boolTrue`.
+    #[default]
+    Answer,
+    /// Never.
+    Silent,
+    /// With this error.
+    Error(i32, String),
+}
+
+/// How `auth.bindTempAuthKey` misbehaves from now on, whatever the server options say.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BindFault {
+    /// Every bind is refused with this code and error.
+    Refuse(i32, String),
+    /// No bind is ever answered.
+    Ignore,
 }
 
 pub struct TestServer {
@@ -295,6 +327,9 @@ impl TestServer {
             http: http::HttpShared::default(),
             tcp_blackhole: false,
             temp_keys: HashMap::new(),
+            bind_fault: None,
+            help_test: HelpTestReply::Answer,
+            hide_permanent_keys: false,
         }));
         let stop = Arc::new(AtomicBool::new(false));
         let thread = {
@@ -330,6 +365,22 @@ impl TestServer {
     /// MTProto; HTTP keeps working.
     pub fn set_tcp_blackhole(&self, enabled: bool) {
         self.shared.lock().unwrap().tcp_blackhole = enabled;
+    }
+
+    /// Messages under a permanent key itself get -404 from now on (true), or are read as usual (false).
+    /// Binds, which carry the permanent key inside, are not affected.
+    pub fn set_hide_permanent_keys(&self, hidden: bool) {
+        self.shared.lock().unwrap().hide_permanent_keys = hidden;
+    }
+
+    /// `help.test` is answered as `reply` says from now on.
+    pub fn set_help_test_reply(&self, reply: HelpTestReply) {
+        self.shared.lock().unwrap().help_test = reply;
+    }
+
+    /// Binds misbehave as `fault` says from now on; None goes back to the server options.
+    pub fn set_bind_fault(&self, fault: Option<BindFault>) {
+        self.shared.lock().unwrap().bind_fault = fault;
     }
 
     /// Forgets every temporary key, as when they expire or the server loses them: the next packet
@@ -1193,12 +1244,20 @@ fn process_packet(
                         }
                     }
                     ids::RPC_DROP_ANSWER => {}
-                    ids::AUTH_BIND_TEMP_AUTH_KEY if options.ignore_binds => {}
+                    ids::AUTH_BIND_TEMP_AUTH_KEY
+                        if options.ignore_binds || matches!(shared_ref.bind_fault, Some(BindFault::Ignore)) => {}
                     ids::AUTH_BIND_TEMP_AUTH_KEY => {
                         let rebind = shared_ref.temp_keys.get(&auth_key_id).is_some_and(|temp| temp.bound_to.is_some());
-                        let checked = match (options.refuse_binds, options.refuse_rebinds) {
-                            (Some(error), _) => Err((options.refuse_binds_code.unwrap_or(400), error)),
-                            (None, Some(error)) if rebind => Err((400, error)),
+                        let refused = match &shared_ref.bind_fault {
+                            Some(BindFault::Refuse(code, error)) => Some((*code, error.clone())),
+                            _ => None,
+                        };
+                        let checked = match (refused, options.refuse_binds, options.refuse_rebinds) {
+                            (Some((code, error)), _, _) => Err((code, error)),
+                            (None, Some(error), _) => {
+                                Err((options.refuse_binds_code.unwrap_or(400), error.to_string()))
+                            }
+                            (None, None, Some(error)) if rebind => Err((400, error.to_string())),
                             _ => check_bind(
                                 &shared_ref.keys,
                                 &mut shared_ref.temp_keys,
@@ -1208,7 +1267,7 @@ fn process_packet(
                                 &message.body,
                                 connection,
                             )
-                            .map_err(|error| (400, error)),
+                            .map_err(|error| (400, error.to_string())),
                         };
                         let reply = match checked {
                             Ok(()) => {
@@ -1218,8 +1277,8 @@ fn process_packet(
                                 sp::rpc_result(message.msg_id, &writer.into_inner())
                             }
                             Err((code, error)) => {
-                                stats.bind_failures.push(error.to_string());
-                                sp::rpc_error(message.msg_id, code, error)
+                                stats.bind_failures.push(error.clone());
+                                sp::rpc_error(message.msg_id, code, &error)
                             }
                         };
                         outgoing.push((reply, true));
@@ -1250,9 +1309,29 @@ fn process_packet(
                         let (tag, payload) = match call {
                             Some(Inner::Call(tag, payload)) => (tag, payload),
                             Some(Inner::Api(constructor, body)) => {
-                                let reply = match &options.api {
-                                    Some(world) => world.handle(options.datacenter_id, auth_key_id, constructor, &body),
-                                    None => api::ApiReply::Error(400, "METHOD_INVALID".into()),
+                                let permanent = shared_ref
+                                    .temp_keys
+                                    .get(&auth_key_id)
+                                    .and_then(|temp| temp.bound_to)
+                                    .unwrap_or(auth_key_id);
+                                let reply = if constructor == api::HELP_TEST {
+                                    stats.help_tests += usize::from(!shared_ref.temp_keys.contains_key(&auth_key_id));
+                                    match &shared_ref.help_test {
+                                        HelpTestReply::Silent => continue,
+                                        HelpTestReply::Error(code, text) => api::ApiReply::Error(*code, text.clone()),
+                                        HelpTestReply::Answer => {
+                                            let mut writer = Writer::new();
+                                            writer.write_u32(ids::BOOL_TRUE);
+                                            api::ApiReply::Result(writer.into_inner())
+                                        }
+                                    }
+                                } else {
+                                    match &options.api {
+                                        Some(world) => {
+                                            world.handle(options.datacenter_id, permanent, constructor, &body)
+                                        }
+                                        None => api::ApiReply::Error(400, "METHOD_INVALID".into()),
+                                    }
                                 };
                                 let body = match reply {
                                     api::ApiReply::Result(result) => sp::rpc_result(message.msg_id, &result),
@@ -1761,12 +1840,19 @@ fn register_key(shared: &mut Shared, outcome: &mtproto_core::test_support::Serve
     }
 }
 
-/// The key to decrypt with, unless it is a temporary key past its expiry, which the server forgets.
+/// The key to decrypt with, unless it is a temporary key past its expiry, which the server forgets, or a
+/// permanent key while they are hidden.
 fn usable_key(shared: &mut Shared, auth_key_id: u64, clock_offset: f64) -> Option<AuthKey> {
     if shared.temp_keys.get(&auth_key_id).is_some_and(|temp| temp.expires_at <= server_now(clock_offset)) {
         shared.temp_keys.remove(&auth_key_id);
         shared.keys.remove(&auth_key_id);
         shared.stats.expired_key_rejections += 1;
+        return None;
+    }
+    if shared.hide_permanent_keys && !shared.temp_keys.contains_key(&auth_key_id) {
+        if shared.keys.contains_key(&auth_key_id) {
+            shared.stats.hidden_key_rejections += 1;
+        }
         return None;
     }
     shared.keys.get(&auth_key_id).cloned()

@@ -360,10 +360,16 @@ impl SessionRuntime {
         self.next_attempt_at = now.mono;
     }
 
-    /// A temporary key made only to check the permanent key stays inside the session: the host runs no
-    /// PFS for it and would take any key it hears of for the session's permanent key.
+    /// Whether the host hears of a key the handshake made, which happens only for a key the session keeps.
+    /// A temporary key made only to check the permanent key stays inside the session: the host runs no PFS
+    /// for it and would take any key it hears of for the session's permanent key. A permanent key made while
+    /// the host gave one during the handshake is dropped (`take_handshake_key`).
     pub(super) fn reports_created_key(&self, temporary: bool) -> bool {
-        !(temporary && self.pfs.as_ref().is_some_and(|pfs| pfs.checks_permanent_key))
+        match &self.pfs {
+            Some(pfs) if temporary => !pfs.checks_permanent_key,
+            Some(pfs) => pfs.perm.is_none(),
+            None => true,
+        }
     }
 
     /// The datacenter a new key is made for, as MtProtoKit and tdlib send it: the obfuscation id,

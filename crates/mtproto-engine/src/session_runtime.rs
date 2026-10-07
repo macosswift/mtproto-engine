@@ -2006,6 +2006,7 @@ impl SessionRuntime {
                 Ok(false)
             }
             Ok(HandshakeStep::Done(result)) => {
+                let dc_id = handshake.datacenter_id();
                 self.handshake = None;
                 self.handshake_started_at = None;
                 self.handshake_failures = 0;
@@ -2025,6 +2026,7 @@ impl SessionRuntime {
                             salt: result.server_salt,
                             time_difference: result.time_difference,
                             expires_at,
+                            dc_id,
                         },
                     );
                 }

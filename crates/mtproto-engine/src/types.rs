@@ -417,11 +417,15 @@ pub enum EngineEvent {
     AuthKeyInvalid {
         code: i32,
     },
+    /// A key the session made and keeps: the permanent one (`expires_at` None) or a temporary one. `dc_id`
+    /// is the `dc` its handshake carried (the test offset included, negative for a media key). A key the
+    /// session drops at once (a permanent key made while the host gave one) is not reported.
     AuthKeyCreated {
         key: SecretBytes,
         salt: i64,
         time_difference: f64,
         expires_at: Option<i32>,
+        dc_id: i32,
     },
     AuthKeyCreationFailed {
         reason: String,

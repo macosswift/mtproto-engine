@@ -755,6 +755,7 @@ pub fn run(scenario: &ClusterScenario, binary: &str, engine: &str, seed: u64) ->
             cdn_datacenter_id: CDN_DC,
             reupload_needed: scenario.reupload,
             cdn_fault: scenario.cdn_fault,
+            ..WorldOptions::default()
         },
         &scenario.files,
         seed,

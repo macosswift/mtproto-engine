@@ -117,6 +117,11 @@ impl Handshake {
         self.config.temp_key_expires_in.is_some()
     }
 
+    /// The `dc` field of the inner data: the datacenter id with the test offset, negative for a media key.
+    pub fn datacenter_id(&self) -> i32 {
+        self.config.dc_id
+    }
+
     fn plain(&mut self, server_now: f64, body: &impl TlWrite) -> Vec<u8> {
         let msg_id = self.msg_ids.next(server_now);
         encode_plain_message(msg_id, &body.to_bytes())

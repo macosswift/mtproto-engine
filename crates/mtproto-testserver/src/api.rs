@@ -12,6 +12,9 @@ pub const AUTH_EXPORT_AUTHORIZATION: u32 = 0xe5bf_ffcd;
 pub const AUTH_IMPORT_AUTHORIZATION: u32 = 0xa57a_7dad;
 pub const HELP_GET_CDN_CONFIG: u32 = 0x5202_9342;
 pub const HELP_GET_NEAREST_DC: u32 = 0x1fb3_3026;
+/// `help.test`: what a client sends under its permanent key to learn whether the server still knows it;
+/// the server answers it as `HelpTestReply` says, with or without an API world.
+pub const HELP_TEST: u32 = 0xc0e2_02f7;
 pub const UPLOAD_SAVE_FILE_PART: u32 = 0xb304_a621;
 pub const UPLOAD_SAVE_BIG_FILE_PART: u32 = 0xde7b_673d;
 
@@ -87,11 +90,24 @@ pub struct WorldOptions {
     pub cdn_datacenter_id: i32,
     pub reupload_needed: bool,
     pub cdn_fault: CdnFault,
+    /// The first `auth.importAuthorization` fails with this code and error, as `AUTH_BYTES_INVALID` for
+    /// bytes that expired or a `500` for an inter-datacenter hiccup.
+    pub import_fails_once: Option<(i32, &'static str)>,
+    /// Exported bytes can be imported more than once. Off by default: whether Telegram accepts the same
+    /// bytes twice is not known, so clients must export again for every import.
+    pub reusable_exports: bool,
 }
 
 impl Default for WorldOptions {
     fn default() -> Self {
-        Self { main_datacenter_id: 2, cdn_datacenter_id: 203, reupload_needed: true, cdn_fault: CdnFault::None }
+        Self {
+            main_datacenter_id: 2,
+            cdn_datacenter_id: 203,
+            reupload_needed: true,
+            cdn_fault: CdnFault::None,
+            import_fails_once: None,
+            reusable_exports: false,
+        }
     }
 }
 
@@ -104,7 +120,9 @@ pub struct ApiStats {
     pub reuploads: usize,
     pub hash_requests: usize,
     pub exports: usize,
+    pub refused_exports: usize,
     pub imports: usize,
+    pub refused_imports: usize,
     pub unauthorized: usize,
     pub invalid_ranges: usize,
     pub bytes_served: u64,
@@ -138,6 +156,7 @@ struct WorldState {
     families: HashMap<u64, u64>,
     authorized: HashSet<(i32, u64)>,
     exports: HashMap<i64, (i32, Vec<u8>)>,
+    import_failed: bool,
     cdn_tokens: HashMap<Vec<u8>, CdnToken>,
     uploads: HashMap<i64, UploadState>,
     rng: XorShiftRandom,
@@ -303,6 +322,7 @@ impl ApiWorld {
                 families: HashMap::new(),
                 authorized: HashSet::new(),
                 exports: HashMap::new(),
+                import_failed: false,
                 cdn_tokens: HashMap::new(),
                 uploads: HashMap::new(),
                 rng: XorShiftRandom::new(seed),
@@ -350,10 +370,13 @@ impl ApiWorld {
             .collect()
     }
 
+    /// Calls the test server reads as API calls rather than tagged test calls: the world's own and
+    /// `help.test`, which the server answers itself.
     pub fn handles(constructor: u32) -> bool {
         matches!(
             constructor,
-            UPLOAD_GET_FILE
+            HELP_TEST
+                | UPLOAD_GET_FILE
                 | UPLOAD_GET_CDN_FILE
                 | UPLOAD_REUPLOAD_CDN_FILE
                 | UPLOAD_GET_CDN_FILE_HASHES
@@ -380,6 +403,7 @@ impl ApiWorld {
                     return ApiReply::Error(400, "INPUT_REQUEST_INVALID".into());
                 };
                 if datacenter_id != self.options.main_datacenter_id {
+                    state.stats.refused_exports += 1;
                     return ApiReply::Error(400, "DC_ID_INVALID".into());
                 }
                 state.stats.exports += 1;
@@ -397,9 +421,17 @@ impl ApiWorld {
                 let (Ok(id), Ok(bytes)) = (reader.read_i64(), reader.read_bytes()) else {
                     return ApiReply::Error(400, "INPUT_REQUEST_INVALID".into());
                 };
+                if let Some((code, error)) = self.options.import_fails_once.filter(|_| !state.import_failed) {
+                    state.import_failed = true;
+                    state.stats.refused_imports += 1;
+                    return ApiReply::Error(code, error.into());
+                }
                 match state.exports.get(&id) {
                     Some((target, expected)) if *target == datacenter_id && expected == bytes => {
                         state.stats.imports += 1;
+                        if !self.options.reusable_exports {
+                            state.exports.remove(&id);
+                        }
                         state.authorized.insert((datacenter_id, family));
                         let mut writer = Writer::new();
                         writer.write_u32(AUTH_AUTHORIZATION);
@@ -408,7 +440,10 @@ impl ApiWorld {
                         writer.write_i64(1000);
                         ApiReply::Result(writer.into_inner())
                     }
-                    _ => ApiReply::Error(400, "AUTH_BYTES_INVALID".into()),
+                    _ => {
+                        state.stats.refused_imports += 1;
+                        ApiReply::Error(400, "AUTH_BYTES_INVALID".into())
+                    }
                 }
             }
             HELP_GET_CDN_CONFIG => {

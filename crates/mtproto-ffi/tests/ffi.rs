@@ -51,7 +51,7 @@ fn c_abi_end_to_end() {
     let sink: &'static Sink = Box::leak(Box::default());
     let engine = unsafe { mt_engine_create(2, sink as *const Sink as *mut c_void, Some(on_event), None) };
     assert!(!engine.is_null());
-    assert_eq!(mt_engine_abi_version(), 3);
+    assert_eq!(mt_engine_abi_version(), 4);
     let host = server.address.ip().to_string();
     let address = MTAddress { host: string(&host), port: server.address.port(), secret: bytes(&[]) };
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64();

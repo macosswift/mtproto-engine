@@ -10,6 +10,7 @@ fn a_created_key_is_never_printed_by_debug() {
         salt: 7,
         time_difference: 1.5,
         expires_at: Some(86_400),
+        dc_id: 2,
     };
     let printed = format!("{event:?} {event:#?}");
     assert!(!printed.contains("171"), "the key bytes are printed: {printed}");

@@ -169,6 +169,11 @@ typedef enum {
     MTEventKindConnectionState = 18,
     MTEventKindAuthKeyRequired = 19,
     MTEventKindAuthKeyInvalid = 20,
+    /* A key the session made and keeps, as a secret payload: integer1 its first salt, integer2 its expiry
+       in server time (0 for a permanent key), value1 the time difference the handshake measured, code the
+       dc its handshake carried (test offset included, negative for a media key), flags
+       MTAuthKeyCreatedTemporary or MTAuthKeyCreatedPermanent. A key the session drops at once is not
+       reported. */
     MTEventKindAuthKeyCreated = 21,
     MTEventKindAuthKeyCreationFailed = 22,
     MTEventKindTransportFlood = 23,
@@ -197,6 +202,11 @@ typedef enum {
        give it back with mt_engine_set_route_memory on the next run. */
     MTEventKindRouteMemoryChanged = 35,
 } MTEventKind;
+
+enum {
+    MTAuthKeyCreatedTemporary = 1 << 0,
+    MTAuthKeyCreatedPermanent = 1 << 1,
+};
 
 enum {
     MTConnectionStateNetworkAvailable = 1 << 0,
