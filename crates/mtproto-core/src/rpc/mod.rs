@@ -1,3 +1,4 @@
+mod handover;
 mod wrap;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -160,6 +161,15 @@ pub enum RpcEvent {
         flood_wait_text: Option<String>,
         server_errors: u32,
     },
+    /// While handing over (`start_handover`): the request left this client for the host to send on
+    /// another session. `may_have_run` unless it never reached the server under any of the client's
+    /// sessions, or the server said it never ran it; `retry_after` is what is left of a wait the
+    /// request was serving (a flood wait, a server error's delay), in seconds.
+    Released {
+        id: RequestId,
+        may_have_run: bool,
+        retry_after: f64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,6 +198,10 @@ struct RequestState {
     pending_decision: Option<PendingDecision>,
     rejected_key: Option<u64>,
     temporary_key_rejections: u32,
+    /// An earlier copy of the request may have reached the server: under an earlier session of this
+    /// client, or one taken back from this session (an initConnection re-wrap). Only a handover reads
+    /// it; a later error answer does not clear it.
+    reached_server: bool,
 }
 
 impl RequestState {
@@ -210,6 +224,7 @@ impl RequestState {
             pending_decision: None,
             rejected_key: None,
             temporary_key_rejections: 0,
+            reached_server: false,
         }
     }
 }
@@ -264,6 +279,17 @@ impl PendingRequest {
     pub fn auth_token_ready(&mut self) {
         self.0.waiting_for_token = false;
     }
+
+    /// The request may have reached the server under an earlier session, or waits for the host's
+    /// answer to a retry question about the server's error.
+    pub fn may_have_run(&self) -> bool {
+        self.0.may_have_run_before() || self.0.pending_decision.is_some()
+    }
+
+    /// What is left of a wait the request was serving (see `RpcEvent::Released`).
+    pub fn retry_after(&self, now: Now) -> f64 {
+        self.0.retry_after(now)
+    }
 }
 
 fn has_invalid_size(body: &[u8]) -> bool {
@@ -304,6 +330,8 @@ pub struct RpcClient {
     auth_token_ready: bool,
     temporary_key_reported: Option<(u64, f64)>,
     binds: u64,
+    /// The requests go to another session: see `handover.rs`.
+    handover: bool,
 }
 
 impl RpcClient {
@@ -327,6 +355,7 @@ impl RpcClient {
             auth_token_ready: true,
             temporary_key_reported: None,
             binds: 0,
+            handover: false,
         }
     }
 
@@ -386,6 +415,10 @@ impl RpcClient {
             .map(|(id, _)| *id)
             .collect();
         for id in unsent {
+            let may_have_run = self.session.may_have_run(QueryId::from(id));
+            if let Some(state) = self.requests.get_mut(&id) {
+                state.reached_server |= may_have_run;
+            }
             self.session.cancel(QueryId::from(id));
             self.leave_session(id);
         }
@@ -429,6 +462,10 @@ impl RpcClient {
             });
             return;
         }
+        if self.handover {
+            self.release_new(RequestState::new(request, 0, now), now);
+            return;
+        }
         let seq = self.next_seq;
         self.next_seq += 1;
         self.requests.insert(id, RequestState::new(request, seq, now));
@@ -455,6 +492,10 @@ impl RpcClient {
             return;
         }
         state.temporary_key_rejections = 0;
+        if self.handover {
+            self.release_new(state, now);
+            return;
+        }
         state.seq = self.next_seq;
         self.next_seq += 1;
         state.in_session = false;
@@ -588,6 +629,10 @@ impl RpcClient {
 
     fn dispatch_ready(&mut self, now: Now) {
         self.debug_check_bookkeeping();
+        if self.handover {
+            self.release_handed_over(now);
+            return;
+        }
         if self.parked.is_empty() {
             return;
         }
@@ -766,6 +811,9 @@ impl RpcClient {
             SessionEvent::Pong { rtt } => self.events.push_back(RpcEvent::Pong { rtt }),
             SessionEvent::DroppedAnswerTooLarge { .. } => self.events.push_back(RpcEvent::ConnectionShouldReset),
             SessionEvent::DestroyAuthKey { outcome } => self.events.push_back(RpcEvent::AuthKeyDestroyed { outcome }),
+            SessionEvent::Released { id, may_have_run } => {
+                self.on_query_released(RequestId::from(id), may_have_run, now)
+            }
         }
     }
 
@@ -1087,7 +1135,8 @@ impl RpcClient {
         let order = std::mem::take(&mut self.order);
         let mut pending = Vec::with_capacity(order.len());
         for id in order.into_values() {
-            if let Some(state) = self.requests.remove(&id) {
+            if let Some(mut state) = self.requests.remove(&id) {
+                state.reached_server |= state.in_session && self.session.may_have_run(QueryId::from(id));
                 pending.push(PendingRequest(state));
             }
         }

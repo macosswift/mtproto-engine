@@ -20,6 +20,12 @@
 //!   when the server refuses or ignores binds);
 //! - duplicates: the test server executed no call twice (re-runs after a host-driven key change without
 //!   PFS are reported apart);
+//! - duplicates across sessions: `Drain` hands a session's requests back (`SessionRuntime::drain`) and the
+//!   host sends each released one on a fresh replacement session, a possibly-run one only when its policy
+//!   (a coin) allows; a `Plain` call that ran more often than those allowed re-runs explain is
+//!   `DuplicateAcrossSessions`, and a request a drained session neither answered nor released stalls;
+//!   re-runs that a local session reset in the session it moved to explains are plain duplicates, as
+//!   they would be without the move;
 //! - churn: no more than 150 connections accepted in any 10 s;
 //! - panics (debug assertions on), and an event for a request after it finished.
 //!
@@ -28,7 +34,8 @@
 //! cargo test -p mtproto-engine --lib explorer_long -- --ignored --nocapture`. `EXPLORER_SEED=n` replays
 //! one with its plan and log; `EXPLORER_PLAN_ONLY=1` prints plans; `EXPLORER_SHRINK_KNOWN=1` also shrinks
 //! the classes `known_class` lists (each has a deterministic test at the end of this file: drop its entry
-//! once fixed); `EXPLORER_SERVER_PLAIN=1` keeps the server plain; `EXPLORER_REPORT=path` saves the report.
+//! once fixed); `EXPLORER_SERVER_PLAIN=1` keeps the server plain; `EXPLORER_REPORT=path` saves the report;
+//! `EXPLORER_DRAIN_SHARE=0.2` makes that share of the events drains.
 
 use super::*;
 use crate::types::{KeyGeneration, PfsSetup, TransportPreference};
@@ -627,31 +634,83 @@ enum Tag {
 
 #[derive(Debug, Clone, PartialEq)]
 enum Ev {
-    Send { s: usize, tag: Tag, timeout_timer: bool, chain: bool, delegate: bool },
-    Cancel { s: usize, pick: u32 },
-    Fail { s: usize, pick: u32 },
+    Send {
+        s: usize,
+        tag: Tag,
+        timeout_timer: bool,
+        chain: bool,
+        delegate: bool,
+    },
+    Cancel {
+        s: usize,
+        pick: u32,
+    },
+    Fail {
+        s: usize,
+        pick: u32,
+    },
     Network(bool),
-    Paused { s: usize, on: bool },
-    Online { s: usize, on: bool },
-    Proxy { s: usize, kind: ProxyKind },
-    Addresses { s: usize, kind: AddrKind },
-    Transport { s: usize, transport: TransportPreference },
-    AuthKeyNone { s: usize },
-    AuthKeyNew { s: usize },
-    EnablePfs { s: usize, lifetime: i32 },
-    Destroy { s: usize },
+    Paused {
+        s: usize,
+        on: bool,
+    },
+    Online {
+        s: usize,
+        on: bool,
+    },
+    Proxy {
+        s: usize,
+        kind: ProxyKind,
+    },
+    Addresses {
+        s: usize,
+        kind: AddrKind,
+    },
+    Transport {
+        s: usize,
+        transport: TransportPreference,
+    },
+    AuthKeyNone {
+        s: usize,
+    },
+    AuthKeyNew {
+        s: usize,
+    },
+    EnablePfs {
+        s: usize,
+        lifetime: i32,
+    },
+    Destroy {
+        s: usize,
+    },
     Reset,
-    ObfuscationDc { s: usize },
-    TimeDifference { s: usize, delta: f64 },
-    AuthTokenReady { s: usize, ready: bool },
+    ObfuscationDc {
+        s: usize,
+    },
+    TimeDifference {
+        s: usize,
+        delta: f64,
+    },
+    AuthTokenReady {
+        s: usize,
+        ready: bool,
+    },
     Box(BoxMode),
     KillConnections,
     TcpBlackhole(bool),
     DropTemporaryKeys,
     UnbindTemporaryKeys,
-    RemovePermanent { s: usize },
+    RemovePermanent {
+        s: usize,
+    },
     DnsFlip,
     Sleep(f64),
+    /// The host moves session `s` to a new session (a live engine switch), waiting `deadline` seconds at
+    /// most for the answers the old one may still get.
+    Drain {
+        s: usize,
+        deadline: f64,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -692,6 +751,16 @@ struct Plan {
 }
 
 fn plan(seed: u64, steps: usize) -> Plan {
+    let share = std::env::var("EXPLORER_DRAIN_SHARE").ok().and_then(|value| value.parse().ok()).unwrap_or(0.0);
+    plan_with(seed, steps, share)
+}
+
+fn random_drain(r: &mut Prng, sessions: usize) -> Ev {
+    Ev::Drain { s: r.below(sessions as u64) as usize, deadline: r.pick(&[0.0, 1.0, 5.0, 5.0, 30.0]) }
+}
+
+/// A plan in which about `drain_share` of the steps send a few calls to a session and then drain it.
+fn plan_with(seed: u64, steps: usize, drain_share: f64) -> Plan {
     let mut r = Prng::new(seed);
     let count = match r.below(20) {
         0..=9 => 1,
@@ -726,7 +795,23 @@ fn plan(seed: u64, steps: usize) -> Plan {
     let mut at = 0.0;
     for _ in 0..steps {
         at += if r.chance(0.1) { 5.0 + r.unit() * 40.0 } else { r.unit() * 3.0 };
-        events.push((at, random_event(&mut r, count)));
+        if drain_share > 0.0 && r.chance(drain_share) {
+            let Ev::Drain { s, deadline } = random_drain(&mut r, count) else { unreachable!() };
+            for _ in 0..=r.below(4) {
+                let send = Ev::Send {
+                    s,
+                    tag: random_tag(&mut r),
+                    timeout_timer: false,
+                    chain: r.chance(0.3),
+                    delegate: r.chance(0.5),
+                };
+                events.push((at, send));
+            }
+            at += r.pick(&[0.0, 0.01, 0.05, 0.3]);
+            events.push((at, Ev::Drain { s, deadline }));
+        } else {
+            events.push((at, random_event(&mut r, count)));
+        }
     }
     let asynchronous_dns = r.chance(0.7);
     let dns_delay = r.pick(&[0.0, 0.05, 0.5, 2.0]);
@@ -839,7 +924,8 @@ fn random_event(r: &mut Prng, sessions: usize) -> Ev {
         88..=89 => Ev::DropTemporaryKeys,
         90 => Ev::UnbindTemporaryKeys,
         91 => Ev::RemovePermanent { s },
-        92..=94 => Ev::DnsFlip,
+        92..=93 => Ev::DnsFlip,
+        94 => random_drain(r, sessions),
         _ => Ev::Sleep(r.pick(&[3.0, 15.0, 45.0, 100.0])),
     }
 }
@@ -883,12 +969,46 @@ fn heal_events(plan: &Plan) -> Vec<(f64, Ev)> {
 
 #[derive(Debug, Clone, PartialEq)]
 enum Violation {
-    Spin { session: usize, at: f64, lasted: f64, state: String },
-    Stall { session: usize, id: u64, tag: Tag, sent_at: f64, history: String, state: String },
-    Duplicate { id: u64, tag: Tag, executions: u32, explained: Option<String>, history: String },
-    Panic { message: String },
-    AfterFinish { session: usize, id: u64, event: String },
-    Churn { at: f64, accepted: usize },
+    Spin {
+        session: usize,
+        at: f64,
+        lasted: f64,
+        state: String,
+    },
+    Stall {
+        session: usize,
+        id: u64,
+        tag: Tag,
+        sent_at: f64,
+        history: String,
+        state: String,
+    },
+    Duplicate {
+        id: u64,
+        tag: Tag,
+        executions: u32,
+        explained: Option<String>,
+        history: String,
+    },
+    /// A call moved between sessions ran more often than the moves its policy allowed explain.
+    DuplicateAcrossSessions {
+        id: u64,
+        executions: u32,
+        allowed: usize,
+        history: String,
+    },
+    Panic {
+        message: String,
+    },
+    AfterFinish {
+        session: usize,
+        id: u64,
+        event: String,
+    },
+    Churn {
+        at: f64,
+        accepted: usize,
+    },
 }
 
 impl Violation {
@@ -898,6 +1018,7 @@ impl Violation {
             Violation::Stall { .. } => "stall",
             Violation::Duplicate { explained: None, .. } => "duplicate",
             Violation::Duplicate { .. } => "duplicate-explained",
+            Violation::DuplicateAcrossSessions { .. } => "duplicate-across-sessions",
             Violation::Panic { .. } => "panic",
             Violation::AfterFinish { .. } => "after-finish",
             Violation::Churn { .. } => "churn",
@@ -926,6 +1047,11 @@ struct Req {
     awaiting_decision: bool,
     /// The session ran PFS when the call went out.
     pfs_at_send: bool,
+    body: Vec<u8>,
+    flags: RequestFlags,
+    /// Each time a drained session released it: whether it may have run, and whether the host sent it
+    /// on (always when it may not have run, by its policy otherwise).
+    moves: Vec<(bool, bool)>,
 }
 
 #[derive(Debug)]
@@ -937,6 +1063,8 @@ enum HostAction {
     /// The host hands over the key it holds when it acts, not when it was asked: a key it replaced in
     /// between must not come back.
     CurrentKey(usize),
+    /// A released request goes on the session that replaced its own, after the wait it was serving.
+    Resend(u64),
 }
 
 pub(super) struct Outcome {
@@ -947,6 +1075,7 @@ pub(super) struct Outcome {
     requests: usize,
     completed: usize,
     rotated: usize,
+    moved: usize,
     immediate: Vec<usize>,
     logs: Vec<String>,
 }
@@ -990,6 +1119,12 @@ struct Runner<'a> {
     schedule_offset: f64,
     heal_started: Option<f64>,
     heal_at: f64,
+    /// The session each of the plan's sessions runs on now: a drain replaces it.
+    current: Vec<usize>,
+    /// The plan's session each session runs for.
+    logical: Vec<usize>,
+    hints: Arc<crate::route_hints::RouteHints>,
+    uploads: Arc<Uploads>,
 }
 
 fn material(key: &AuthKey, now: Now) -> AuthKeyMaterial {
@@ -1070,9 +1205,11 @@ impl<'a> Runner<'a> {
             schedule_offset: 0.0,
             heal_started: None,
             heal_at: f64::INFINITY,
+            current: Vec::new(),
+            logical: Vec::new(),
+            hints: Arc::new(crate::route_hints::RouteHints::default()),
+            uploads: Arc::new(Uploads::default()),
         };
-        let hints = Arc::new(crate::route_hints::RouteHints::default());
-        let uploads = Arc::new(Uploads::default());
         let now = runner.now();
         for (index, session_plan) in plan.sessions.iter().enumerate() {
             let role =
@@ -1100,21 +1237,92 @@ impl<'a> Runner<'a> {
             if let Some(lifetime) = session_plan.pfs {
                 setup.pfs = Some(PfsSetup { lifetime, public_keys: public_keys(), ..Default::default() });
             }
-            let mut runtime = SessionRuntime::new(
-                SessionHandle(index as u64 + 1),
-                setup,
-                Token(TOKENS * (index + 1)),
-                now,
-                &mut runner.rng,
-            );
-            runtime.share_uploads(uploads.clone());
-            runtime.share_route_hints(hints.clone());
-            runner.sessions.push(runtime);
-            runner.host_keys.push(host_key);
-            runner.spin.push((0, None, 0, false));
-            runner.immediate.push(0);
+            runner.current.push(index);
+            runner.add_runtime(setup, host_key, index, now);
         }
         runner
+    }
+
+    fn add_runtime(&mut self, setup: SessionSetup, host_key: Option<AuthKey>, logical: usize, now: Now) -> usize {
+        let index = self.sessions.len();
+        let mut runtime = SessionRuntime::new(
+            SessionHandle(index as u64 + 1),
+            setup,
+            Token(TOKENS * (index + 1)),
+            now,
+            &mut self.rng,
+        );
+        runtime.share_uploads(self.uploads.clone());
+        runtime.share_route_hints(self.hints.clone());
+        self.sessions.push(runtime);
+        self.host_keys.push(host_key);
+        self.spin.push((0, None, 0, false));
+        self.immediate.push(0);
+        self.logical.push(logical);
+        index
+    }
+
+    /// The host moves session `r` to a new one set up as `r` is now, with the key it holds for it.
+    fn drain(&mut self, r: usize, deadline: f64, at: f64) {
+        if self.sessions[r].is_draining() {
+            return;
+        }
+        let now = self.now();
+        let logical = self.logical[r];
+        let session_plan = &self.plan.sessions[logical];
+        let old = &self.sessions[r].setup;
+        let mut setup = SessionSetup::new(2, old.role, old.addresses.clone());
+        setup.transport = old.transport;
+        setup.http_port = old.http_port;
+        setup.keep_connected = old.keep_connected;
+        setup.idle_disconnect_after = old.idle_disconnect_after;
+        setup.online = old.online;
+        setup.paused = old.paused;
+        setup.proxy = old.proxy.clone();
+        setup.tcp_recheck_after = old.tcp_recheck_after;
+        let host_key = self.host_keys[r].clone();
+        match &host_key {
+            Some(key) if session_plan.key != KeyPlan::HostLater => setup.auth_key = Some(material(key, now)),
+            Some(_) => {}
+            None => {
+                setup.key_generation = Some(KeyGeneration { public_keys: public_keys(), temporary_expires_in: None })
+            }
+        }
+        if let Some(pfs) = &self.sessions[r].pfs {
+            setup.pfs = Some(PfsSetup { lifetime: pfs.lifetime, public_keys: public_keys(), ..Default::default() });
+        }
+        let replacement = self.add_runtime(setup, host_key, logical, now);
+        self.current[logical] = replacement;
+        self.note_all_open(r, &format!("drained into s{replacement}"), at);
+        let registry = self.poll.registry();
+        self.sessions[replacement].set_network_available(self.network, now, registry);
+        self.sessions[r].drain(deadline, now, registry, &self.callbacks);
+    }
+
+    /// The session a plan event for session `s` goes to now.
+    fn routed(&self, event: &Ev) -> Ev {
+        let mut event = event.clone();
+        match &mut event {
+            Ev::Send { s, .. }
+            | Ev::Cancel { s, .. }
+            | Ev::Fail { s, .. }
+            | Ev::Paused { s, .. }
+            | Ev::Online { s, .. }
+            | Ev::Proxy { s, .. }
+            | Ev::Addresses { s, .. }
+            | Ev::Transport { s, .. }
+            | Ev::AuthKeyNone { s }
+            | Ev::AuthKeyNew { s }
+            | Ev::EnablePfs { s, .. }
+            | Ev::Destroy { s }
+            | Ev::ObfuscationDc { s }
+            | Ev::TimeDifference { s, .. }
+            | Ev::AuthTokenReady { s, .. }
+            | Ev::RemovePermanent { s }
+            | Ev::Drain { s, .. } => *s = self.current[*s],
+            _ => {}
+        }
+        event
     }
 
     fn now(&self) -> Now {
@@ -1189,10 +1397,11 @@ impl<'a> Runner<'a> {
     }
 
     fn apply(&mut self, event: &Ev) {
+        let event = self.routed(event);
         let now = self.now();
         let at = now.mono - self.base_mono();
         let registry = self.poll.registry();
-        match event.clone() {
+        match event {
             Ev::Send { s, tag, timeout_timer, chain, delegate } => {
                 let id = self.next_request;
                 self.next_request += 1;
@@ -1237,6 +1446,9 @@ impl<'a> Runner<'a> {
                         )],
                         awaiting_decision: false,
                         pfs_at_send: self.sessions[s].pfs.is_some(),
+                        body: body.clone(),
+                        flags,
+                        moves: Vec::new(),
                     },
                 );
                 self.sessions[s].send(RpcRequest { id: RequestId(id), body, flags, invoke_after }, now);
@@ -1376,6 +1588,7 @@ impl<'a> Runner<'a> {
                 self.skip_time(seconds);
                 self.schedule_offset += seconds;
             }
+            Ev::Drain { s, deadline } => self.drain(s, deadline, at),
         }
     }
 
@@ -1415,6 +1628,13 @@ impl<'a> Runner<'a> {
                 }
                 None => self.perform(HostAction::NewKey(s)),
             },
+            HostAction::Resend(id) => {
+                let Some(request) = self.requests.get(&id).filter(|request| request.state == ReqState::Open) else {
+                    return;
+                };
+                let (s, body, flags) = (request.session, request.body.clone(), request.flags);
+                self.sessions[s].send(RpcRequest { id: RequestId(id), body, flags, invoke_after: None }, now);
+            }
             HostAction::NewKey(s) => {
                 let key = self.fresh_key();
                 self.host_keys[s] = Some(key.clone());
@@ -1453,6 +1673,35 @@ impl<'a> Runner<'a> {
                     let delay = self.prng.unit() * 1.5;
                     self.actions.push((now.mono + delay, HostAction::DecideRetry(s, id, retry)));
                 }
+                EngineEvent::Rpc(RpcEvent::Released { id, may_have_run, retry_after }) => {
+                    let allowed = !may_have_run || self.prng.chance(0.5);
+                    let target = self.current[self.logical[s]];
+                    let Some(request) = self.requests.get_mut(&id.0) else {
+                        continue;
+                    };
+                    if request.state != ReqState::Open || request.session != s {
+                        let event = format!("released by s{s} while {:?} on s{}", request.state, request.session);
+                        if request.state == ReqState::Cancelled {
+                            request.history.push(format!("{at:.2} {event}"));
+                        } else {
+                            self.violations.push(Violation::AfterFinish { session: s, id: id.0, event });
+                        }
+                        continue;
+                    }
+                    request.moves.push((may_have_run, allowed));
+                    request.history.push(format!(
+                        "{at:.2} released by s{s} ({}, wait {retry_after:.2}): {}",
+                        if may_have_run { "may have run" } else { "never ran" },
+                        if allowed { format!("sent on s{target}") } else { "policy refuses, failed".to_string() }
+                    ));
+                    if allowed {
+                        request.session = target;
+                        self.actions.push((now.mono + retry_after, HostAction::Resend(id.0)));
+                    } else {
+                        request.state = ReqState::Failed;
+                    }
+                }
+                EngineEvent::Closed => self.note_all_open(s, "session closed", at),
                 EngineEvent::Rpc(RpcEvent::UpdatesReset) => self.note_all_open(s, "session reset", at),
                 EngineEvent::Rpc(RpcEvent::TemporaryKeyBound) => self.note_all_open(s, "temporary key bound", at),
                 EngineEvent::AuthKeyCreated { expires_at: Some(_), .. } => {
@@ -1704,6 +1953,7 @@ impl<'a> Runner<'a> {
             let (_, action) = self.actions.remove(0);
             self.perform(action);
         }
+        touched.resize(self.sessions.len(), false);
         self.dns.now = now.mono;
         let mut delivered = Vec::new();
         self.dns.due.retain(|(at, host, port)| {
@@ -1879,6 +2129,8 @@ impl<'a> Runner<'a> {
                 continue;
             }
             let history = request.history.join("; ");
+            let moved = !request.moves.is_empty();
+            let allowed = request.moves.iter().filter(|(may_have_run, allowed)| *may_have_run && *allowed).count();
             let first_change = [
                 "set_auth_key(None)",
                 "set_auth_key(new)",
@@ -1890,7 +2142,7 @@ impl<'a> Runner<'a> {
             .iter()
             .filter_map(|marker| history.find(marker))
             .min();
-            let pfs = self.plan.sessions[request.session].pfs.is_some()
+            let pfs = self.plan.sessions[self.logical[request.session]].pfs.is_some()
                 || request.pfs_at_send
                 || history.find("enable_pfs").is_some_and(|at| first_change.is_none_or(|change| at < change));
             let key_changes = [
@@ -1929,6 +2181,45 @@ impl<'a> Runner<'a> {
                 .find(|marker| history.contains(**marker))
                 .map(|marker| format!("non-PFS key change ({marker})"))
             };
+            if moved {
+                let in_session = if explained.is_some() { key_changes } else { 0 };
+                let last_move = history.rfind(": sent on s").unwrap_or(0);
+                let resets_after_move = history[last_move..].matches("session reset").count();
+                if count as usize > 1 + allowed + in_session && count as usize <= 1 + allowed + resets_after_move {
+                    self.violations.push(Violation::Duplicate {
+                        id: key,
+                        tag: request.tag,
+                        executions: count,
+                        explained: None,
+                        history,
+                    });
+                } else if count as usize > 1 + allowed + in_session {
+                    self.violations.push(Violation::DuplicateAcrossSessions {
+                        id: key,
+                        executions: count,
+                        allowed,
+                        history,
+                    });
+                } else if allowed > 0 {
+                    self.violations.push(Violation::Duplicate {
+                        id: key,
+                        tag: request.tag,
+                        executions: count,
+                        explained: Some(format!("moved as possibly run {allowed} times, the host's policy allowed it")),
+                        history,
+                    });
+                } else {
+                    let explained = explained.map(|reason| format!("{reason}, then moved"));
+                    self.violations.push(Violation::Duplicate {
+                        id: key,
+                        tag: request.tag,
+                        executions: count,
+                        explained,
+                        history,
+                    });
+                }
+                continue;
+            }
             let explained = explained.filter(|_| count as usize <= 1 + key_changes);
             self.violations.push(Violation::Duplicate {
                 id: key,
@@ -1948,6 +2239,7 @@ impl<'a> Runner<'a> {
             .values()
             .filter(|request| request.history.iter().any(|line| line.contains("TEMP_KEY_ROTATED")))
             .count();
+        let moved = self.requests.values().filter(|request| !request.moves.is_empty()).count();
         let logs = self.recorder.logs.lock().unwrap().iter().cloned().collect();
         Outcome {
             violations: self.violations,
@@ -1957,6 +2249,7 @@ impl<'a> Runner<'a> {
             requests: self.requests.len(),
             completed,
             rotated,
+            moved,
             immediate: self.immediate,
             logs,
         }
@@ -1983,6 +2276,7 @@ fn run_plan(plan: &Plan, stop_on: Option<&'static str>) -> Outcome {
             requests: 0,
             completed: 0,
             rotated: 0,
+            moved: 0,
             immediate: Vec::new(),
             logs: Vec::new(),
         }
@@ -2075,7 +2369,8 @@ fn event_session(event: &Ev) -> Option<usize> {
         | Ev::ObfuscationDc { s }
         | Ev::TimeDifference { s, .. }
         | Ev::AuthTokenReady { s, .. }
-        | Ev::RemovePermanent { s } => Some(*s),
+        | Ev::RemovePermanent { s }
+        | Ev::Drain { s, .. } => Some(*s),
         _ => None,
     }
 }
@@ -2097,7 +2392,8 @@ fn renumber(event: &mut Ev, removed: usize) {
         | Ev::ObfuscationDc { s }
         | Ev::TimeDifference { s, .. }
         | Ev::AuthTokenReady { s, .. }
-        | Ev::RemovePermanent { s } => s,
+        | Ev::RemovePermanent { s }
+        | Ev::Drain { s, .. } => s,
         _ => return,
     };
     if *s > removed {
@@ -2124,14 +2420,15 @@ fn describe_plan(plan: &Plan) -> String {
 
 fn describe_outcome(outcome: &Outcome) -> String {
     let mut out = format!(
-        "{} turns ({:?} at once), {:.1} s virtual in {:.1} s real, {} requests ({} completed, {} TEMP_KEY_ROTATED)\n",
+        "{} turns ({:?} at once), {:.1} s virtual in {:.1} s real, {} requests ({} completed, {} TEMP_KEY_ROTATED, {} moved)\n",
         outcome.turns,
         outcome.immediate,
         outcome.virtual_time,
         outcome.real_time,
         outcome.requests,
         outcome.completed,
-        outcome.rotated
+        outcome.rotated,
+        outcome.moved
     );
     for violation in &outcome.violations {
         out.push_str(&format!("  {violation:?}\n"));
@@ -2165,6 +2462,33 @@ fn explorer_quick() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A few fixed seeds whose schedules drain sessions often.
+#[test]
+fn explorer_drain_quick() {
+    let seeds: Vec<u64> = (101..=106).collect();
+    let outcomes: Vec<(u64, Outcome)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = seeds
+            .iter()
+            .map(|seed| {
+                let seed = *seed;
+                scope.spawn(move || (seed, run_plan(&plan_with(seed, 12, 0.25), None)))
+            })
+            .collect();
+        handles.into_iter().map(|handle| handle.join().unwrap()).collect()
+    });
+    let mut failures = Vec::new();
+    let mut moved = 0;
+    for (seed, outcome) in outcomes {
+        eprintln!("seed {seed}: {}", describe_outcome(&outcome));
+        moved += outcome.moved;
+        if first_kind(&outcome).is_some() {
+            failures.push(format!("{}{}", describe_plan(&plan_with(seed, 12, 0.25)), describe_outcome(&outcome)));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    assert!(moved > 0, "the seeds move requests between sessions");
 }
 
 /// The long explorer: `EXPLORER_SEEDS` seeds from `EXPLORER_FIRST`, `EXPLORER_STEPS` events each, on

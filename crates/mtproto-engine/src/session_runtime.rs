@@ -31,6 +31,8 @@ mod http;
 use http::{AutoState, HttpState};
 #[path = "session_carrier.rs"]
 mod carrier;
+#[path = "session_drain.rs"]
+mod drain;
 #[path = "session_pfs.rs"]
 mod pfs;
 #[path = "session_websocket.rs"]
@@ -223,6 +225,8 @@ pub struct SessionRuntime {
     network_generation: u64,
     /// Streams the host opens (Telegram Web's HTTPS endpoint), and how their news reaches the worker.
     host_streams: Option<(Arc<crate::host_stream::HostStreams>, Arc<crate::host_stream::WorkerSignal>)>,
+    /// Set while the requests go back to the host for another session (`drain`).
+    drain: Option<drain::DrainState>,
 }
 
 impl SessionRuntime {
@@ -290,6 +294,7 @@ impl SessionRuntime {
             hints: Arc::default(),
             network_generation: 0,
             host_streams: None,
+            drain: None,
             setup,
         };
         let cdn = runtime.setup.role == SessionRole::Cdn;
@@ -410,7 +415,7 @@ impl SessionRuntime {
 
     /// Drops the session's client: its requests wait in `queued` for the next one, ahead of anything
     /// queued since, and what it still held for the host goes out with the next pump.
-    fn retire_rpc(&mut self) {
+    fn retire_rpc(&mut self, now: Now) {
         let Some(mut rpc) = self.rpc.take() else {
             return;
         };
@@ -423,6 +428,12 @@ impl SessionRuntime {
                     | RpcEvent::ConnectionShouldReset
             )
         }));
+        if self.is_draining() {
+            let mut pending = rpc.into_pending();
+            pending.extend(self.queued.drain(..));
+            self.release_retired(pending, now);
+            return;
+        }
         let mut pending: VecDeque<PendingRequest> = rpc.into_pending().into();
         pending.extend(self.queued.drain(..));
         self.queued = pending;
@@ -457,6 +468,10 @@ impl SessionRuntime {
 
     pub fn send(&mut self, request: RpcRequest, now: Now) {
         self.last_activity_at = now.mono;
+        if self.is_draining() {
+            self.undelivered.push(RpcEvent::Released { id: request.id, may_have_run: false, retry_after: 0.0 });
+            return;
+        }
         if request.invoke_after.is_some_and(|after| self.rotated.contains(&after)) {
             self.note_rotated(request.id);
             self.undelivered.push(RpcEvent::Failed {
@@ -567,7 +582,7 @@ impl SessionRuntime {
                     pfs.forget_permanent_key();
                 }
                 self.close_connection(registry, now, false);
-                self.retire_rpc();
+                self.retire_rpc(now);
                 self.reported_key_required = false;
             }
         }
@@ -2095,7 +2110,7 @@ impl SessionRuntime {
                 } else {
                     callbacks.on_event(self.handle, EngineEvent::AuthKeyInvalid { code });
                 }
-                self.retire_rpc();
+                self.retire_rpc(now);
                 self.close_reason = Some(CloseReason::ServerRejected);
             }
             TransportErrorKind::Flood => {
@@ -2209,6 +2224,7 @@ impl SessionRuntime {
                     RpcEvent::Completed { .. } | RpcEvent::Failed { .. } => {
                         self.last_activity_at = now.mono;
                         self.deliveries = self.deliveries.wrapping_add(1);
+                        self.note_drain_answer(now);
                     }
                     RpcEvent::Update { .. } => self.deliveries = self.deliveries.wrapping_add(1),
                     _ => {}
@@ -2248,6 +2264,9 @@ impl SessionRuntime {
         callbacks: &Arc<dyn EngineCallbacks>,
         rng: &mut OsRandom,
     ) {
+        if self.drive_drain(now, registry, callbacks) {
+            return;
+        }
         if self.rpc.is_none()
             && self.setup.key_generation.is_none()
             && self.pfs.as_ref().is_none_or(PfsState::awaits_permanent_key)
@@ -2530,11 +2549,14 @@ impl SessionRuntime {
     }
 
     pub fn next_deadline(&mut self, now: Now, config: &EngineConfig) -> Option<f64> {
+        if self.closed {
+            return (!self.undelivered.is_empty()).then_some(now.mono);
+        }
         self.refresh_uploads(now);
         if self.http.is_some() {
             return self.next_http_deadline(now, config);
         }
-        let mut deadline = f64::INFINITY;
+        let mut deadline = self.drain_deadline().unwrap_or(f64::INFINITY);
         let wants = self.wants_connection(now);
         if wants && self.connection.is_none() {
             deadline = deadline.min(self.next_attempt_at.max(now.mono));
@@ -2594,6 +2616,9 @@ impl SessionRuntime {
 
     fn next_http_deadline(&mut self, now: Now, config: &EngineConfig) -> Option<f64> {
         let mut deadline = self.http_deadline(now, config).unwrap_or(f64::INFINITY);
+        if let Some(at) = self.drain_deadline() {
+            deadline = deadline.min(at);
+        }
         if !self.network_available
             && !self.has_link()
             && self.http_route_possible()

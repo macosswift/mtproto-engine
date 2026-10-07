@@ -257,6 +257,13 @@ impl Engine {
         self.post(handle, Command::DestroyAuthKey(handle));
     }
 
+    /// Hands the session's requests back for another session without running any twice
+    /// (`session_drain.rs`): `RpcEvent::Released` for each, then `EngineEvent::Closed`, within
+    /// `deadline` seconds (extended while answers arrive, 30 s at most).
+    pub fn drain(&self, handle: SessionHandle, deadline: f64) {
+        self.post(handle, Command::Drain(handle, deadline));
+    }
+
     pub fn set_network_available(&self, available: bool) {
         self.broadcast(|| Command::SetNetworkAvailable(available));
     }

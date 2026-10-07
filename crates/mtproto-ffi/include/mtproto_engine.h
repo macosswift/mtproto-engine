@@ -201,11 +201,20 @@ typedef enum {
     /* Engine-wide, for session 0: what was learned about named networks changed (payload); store it and
        give it back with mt_engine_set_route_memory on the next run. */
     MTEventKindRouteMemoryChanged = 35,
+    /* After mt_session_drain: the request (request_id) left the session for the host to send on another
+       one. flags MTReleasedMayHaveRun when it may have reached the server (it went out and no answer
+       came), otherwise it never ran there. value1: seconds to wait before sending it again, what is left
+       of a flood wait or a server error's delay (0 when it may have run). */
+    MTEventKindReleased = 36,
 } MTEventKind;
 
 enum {
     MTAuthKeyCreatedTemporary = 1 << 0,
     MTAuthKeyCreatedPermanent = 1 << 1,
+};
+
+enum {
+    MTReleasedMayHaveRun = 1 << 0,
 };
 
 enum {
@@ -359,6 +368,16 @@ void mt_session_decide_retry(MTEngine *engine, MTSessionHandle session, MTReques
 void mt_session_invalidate_initialization(MTEngine *engine, MTSessionHandle session);
 void mt_session_set_time_difference(MTEngine *engine, MTSessionHandle session, double difference);
 void mt_session_destroy_auth_key(MTEngine *engine, MTSessionHandle session);
+/* Hands the session's requests back for another session without running any twice (a live engine
+   switch). A request that never reached the server is released at once (MTEventKindReleased, not run).
+   One the server may have stays: the session sends it again only under its own message id and
+   completes it when its answer comes; it sends no other request. A request the server says it never
+   got, or that would have to go under a new message id, is released then. At the deadline, `deadline`
+   seconds from now, extended by 5 s while answers keep arriving and 30 s at most, every request left
+   is released (MTReleasedMayHaveRun when it went out), then MTEventKindClosed; Closed comes as soon as
+   nothing is left. Requests sent to the session afterwards are released at once. A second call is
+   ignored. */
+void mt_session_drain(MTEngine *engine, MTSessionHandle session, double deadline);
 
 const uint8_t *mt_buffer_data(const MTBuffer *buffer);
 size_t mt_buffer_length(const MTBuffer *buffer);

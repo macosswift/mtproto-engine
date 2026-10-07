@@ -352,7 +352,7 @@ impl SessionRuntime {
         };
         self.setup.key_generation =
             Some(crate::types::KeyGeneration { public_keys: pfs.public_keys, temporary_expires_in: None });
-        self.retire_rpc();
+        self.retire_rpc(now);
         self.close_connection(registry, now, false);
         if let Some(http) = &mut self.http {
             http.forget_opened();
@@ -697,13 +697,17 @@ impl SessionRuntime {
         callbacks: &Arc<dyn EngineCallbacks>,
         rng: &mut OsRandom,
     ) {
+        if self.is_draining() {
+            self.end_drain_for_new_key(now, registry, callbacks);
+            return;
+        }
         if fail_transmitted {
             self.fail_unanswered_requests(registry, now, callbacks);
         }
         if self.rpc.is_none() {
             return;
         }
-        self.retire_rpc();
+        self.retire_rpc(now);
         let idle = !self.setup.keep_connected && self.queued.is_empty();
         if let Some(pfs) = &mut self.pfs {
             pfs.temp_expires_at = None;
@@ -740,6 +744,9 @@ impl SessionRuntime {
         now: Now,
         callbacks: &Arc<dyn EngineCallbacks>,
     ) {
+        if self.is_draining() {
+            return;
+        }
         let transmitted = self.rpc.as_ref().map(mtproto_core::rpc::RpcClient::transmitted_requests).unwrap_or_default();
         if !transmitted.is_empty() {
             let chained = self.rpc.as_ref().map(|rpc| rpc.dependents_of(&transmitted)).unwrap_or_default();
@@ -780,7 +787,7 @@ impl SessionRuntime {
             return;
         };
         self.fail_unanswered_requests(registry, now, callbacks);
-        self.retire_rpc();
+        self.retire_rpc(now);
         let held = std::mem::take(&mut self.queued);
         self.close_connection(registry, now, false);
         if let Some(pfs) = &mut self.pfs {
@@ -806,7 +813,7 @@ impl SessionRuntime {
 
     /// The permanent key is gone: the requests wait for a new one, made with the next call.
     fn start_over_after_destroy(&mut self, registry: &Registry, now: Now, callbacks: &Arc<dyn EngineCallbacks>) {
-        self.retire_rpc();
+        self.retire_rpc(now);
         let idle = !self.setup.keep_connected && self.queued.is_empty();
         if let Some(pfs) = &mut self.pfs {
             pfs.forget_permanent_key();

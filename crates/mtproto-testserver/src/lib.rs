@@ -158,11 +158,19 @@ pub struct Stats {
     pub redelivered_answers: usize,
     pub chaos_injected: HashMap<&'static str, usize>,
     pub unique_executions: HashMap<(u32, u64), u32>,
-    pub first_executions: HashMap<(u32, u64), (i64, i64)>,
+    /// The session, msg_id and auth key id of each call's first execution.
+    pub first_executions: HashMap<(u32, u64), (i64, i64, u64)>,
     pub duplicate_records: Vec<String>,
     pub duplicate_executions: usize,
+    /// Duplicate executions that came under another auth key than the first: another engine's session
+    /// (each engine makes a temporary key of its own) or another temporary key ran the call again.
+    pub cross_key_duplicates: usize,
     pub bad_msgs_sent: usize,
     pub session_ids: HashSet<i64>,
+    /// When each client session sent its first packet, as Unix time.
+    pub session_first_seen: HashMap<i64, f64>,
+    /// The sessions of each duplicate execution: the first run's and the repeat's.
+    pub duplicate_sessions: Vec<(i64, i64)>,
     pub transport_errors_sent: usize,
     pub client_packets: usize,
     pub client_bytes: usize,
@@ -194,6 +202,8 @@ pub struct Stats {
     pub executed_under: Vec<(u32, u64)>,
     /// Each executed call's tag and the auth key id it arrived under.
     pub executed_with_key: Vec<(u32, u64)>,
+    /// Each executed call's tag and the client session it arrived in.
+    pub executed_in_session: Vec<(u32, i64)>,
 }
 
 /// A key made by a `p_q_inner_data_temp_dc` handshake: it expires, and API calls under it are refused
@@ -1131,7 +1141,9 @@ fn process_packet(
             }
         }
         let stats = &mut shared_ref.stats;
-        stats.session_ids.insert(session_id);
+        if stats.session_ids.insert(session_id) {
+            stats.session_first_seen.insert(session_id, unix_now());
+        }
         stats.client_packets += 1;
         stats.client_bytes += packet.len();
         *stats.calls_per_packet.entry(decoded.messages.len()).or_insert(0) += 1;
@@ -1423,6 +1435,7 @@ fn process_packet(
                             .map_or(auth_key_id, |temp| temp.bound_to.unwrap_or(0));
                         stats.executed_under.push((tag, executed_under));
                         stats.executed_with_key.push((tag, auth_key_id));
+                        stats.executed_in_session.push((tag, session_id));
                         let count = {
                             let entry = stats.executions.entry(tag).or_insert(0);
                             *entry += 1;
@@ -1434,20 +1447,26 @@ fn process_packet(
                             *entry += 1;
                             if *entry > 1 {
                                 stats.duplicate_executions += 1;
-                                let first = stats.first_executions.get(&(tag, key)).copied().unwrap_or((0, 0));
+                                let first = stats.first_executions.get(&(tag, key)).copied().unwrap_or((0, 0, 0));
+                                if first.2 != auth_key_id {
+                                    stats.cross_key_duplicates += 1;
+                                }
+                                stats.duplicate_sessions.push((first.0, session_id));
                                 if stats.duplicate_records.len() < 64 {
                                     stats.duplicate_records.push(format!(
-                                        "key {key}: first session {:x} msg {:x}, again session {:x} msg {:x} container {:?} fault {:?}",
+                                        "key {key}: first session {:x} msg {:x} auth key {:x}, again session {:x} msg {:x} auth key {:x} container {:?} fault {:?}",
                                         first.0,
                                         first.1,
+                                        first.2,
                                         session_id,
                                         message.msg_id,
+                                        auth_key_id,
                                         message.container_id,
                                         fault.map(chaos::Fault::name)
                                     ));
                                 }
                             } else {
-                                stats.first_executions.insert((tag, key), (session_id, message.msg_id));
+                                stats.first_executions.insert((tag, key), (session_id, message.msg_id, auth_key_id));
                             }
                         }
                         let reply = sp::rpc_result(message.msg_id, &result_body(tag, &payload));

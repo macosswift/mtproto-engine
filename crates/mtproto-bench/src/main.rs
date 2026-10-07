@@ -309,6 +309,43 @@ fn main() {
             if let Some(path) = out {
                 std::fs::write(format!("{path}.md"), &table).expect("write markdown");
             }
+            if killswitch {
+                for result in &results {
+                    eprintln!(
+                        "killswitch {} {}: {} duplicate executions, {} across engines, {} across auth keys, {} keys, {} double completions",
+                        result.scenario,
+                        result.engine,
+                        result.duplicate_executions,
+                        result.cross_engine_duplicates,
+                        result.cross_key_duplicates,
+                        result.execution_keys,
+                        result.double_completions
+                    );
+                }
+                let duplicated: Vec<String> = results
+                    .iter()
+                    .filter(|result| {
+                        result.cross_engine_duplicates > 0
+                            || result.cross_key_duplicates > 0
+                            || result.double_completions > 0
+                    })
+                    .map(|result| {
+                        format!(
+                            "{} {}: {} duplicate executions across engines, {} across auth keys, {} double completions",
+                            result.scenario,
+                            result.engine,
+                            result.cross_engine_duplicates,
+                            result.cross_key_duplicates,
+                            result.double_completions
+                        )
+                    })
+                    .collect();
+                if !duplicated.is_empty() {
+                    eprintln!("a live engine switch ran calls twice:\n{}", duplicated.join("\n"));
+                    std::process::exit(1);
+                }
+                eprintln!("killswitch: no call ran in two engines in {} runs", results.len());
+            }
         }
         _ => {
             eprintln!(

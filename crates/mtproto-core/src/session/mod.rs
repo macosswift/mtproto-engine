@@ -1,4 +1,5 @@
 mod dedupe;
+mod handover;
 mod salts;
 #[cfg(test)]
 mod sec_audit_replay_tests;
@@ -172,6 +173,7 @@ pub enum SessionEvent {
     Pong { rtt: f64 },
     DroppedAnswerTooLarge { total: usize },
     DestroyAuthKey { outcome: DestroyAuthKeyOutcome },
+    Released { id: QueryId, may_have_run: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -314,6 +316,10 @@ struct Query {
     rejections: u32,
     server_resends: u32,
     may_have_arrived: bool,
+    /// An earlier copy of the query may have run: it went back to the queue without the server saying
+    /// it never got it (a new server session, a local reset, msgs_state_info "nothing known").
+    /// Sticky, for a handover (`Session::may_have_run`).
+    maybe_ran_before: bool,
     retransmit_refused: bool,
     /// The packet that carried the query under its current msg_id on this connection. None once the
     /// query is retransmitted, as its answer may then be for a transmission on an earlier connection.
@@ -521,6 +527,8 @@ pub struct Session {
     bind: Option<(QueryId, BindRequest)>,
     /// The key is temporary and not bound yet: nothing but the bind query goes out.
     bind_gate: bool,
+    /// The queries go to another session: see `handover.rs`.
+    handover: bool,
 
     events: VecDeque<SessionEvent>,
 }
@@ -627,6 +635,7 @@ impl Session {
             http_receiving_until: 0.0,
             bind: None,
             bind_gate: false,
+            handover: false,
             events: VecDeque::new(),
         }
     }
@@ -944,6 +953,14 @@ impl Session {
     /// The query went out at least once, so the server may have it.
     pub fn was_transmitted(&self, id: QueryId) -> bool {
         self.queries.get(&id).is_some_and(|query| query.state != QueryState::Pending || query.may_have_arrived)
+    }
+
+    /// The query is out under its msg_id, or an earlier copy of it may have run: moved to another
+    /// session it could run twice.
+    pub fn may_have_run(&self, id: QueryId) -> bool {
+        self.queries
+            .get(&id)
+            .is_some_and(|query| query.state != QueryState::Pending || query.may_have_arrived || query.maybe_ran_before)
     }
 
     pub fn set_online(&mut self, online: bool, now: Now) {
@@ -1373,6 +1390,7 @@ impl Session {
                 rejections: 0,
                 server_resends: 0,
                 may_have_arrived: false,
+                maybe_ran_before: false,
                 retransmit_refused: false,
                 arrival_seq: None,
             },
@@ -1613,9 +1631,29 @@ impl Session {
     }
 
     fn requeue_front(&mut self, id: QueryId) {
+        if self.handover && self.hand_back(id, true) {
+            return;
+        }
+        self.note_maybe_ran(id);
         if self.release_query_message(id).is_some() {
             self.pending.push_front(id);
         }
+    }
+
+    /// A sent copy of the query goes back to the queue without the server saying it never got it.
+    fn note_maybe_ran(&mut self, id: QueryId) {
+        if let Some(query) = self.queries.get_mut(&id).filter(|query| query.state != QueryState::Pending) {
+            query.maybe_ran_before = true;
+        }
+    }
+
+    /// The server answered a state question about the query without saying it got it: with status 1
+    /// ("nothing known", the msg_id may be too old for it to remember) it may have run it.
+    fn resend_unconfirmed(&mut self, id: QueryId, may_have_run: bool, now: Now) {
+        if may_have_run {
+            self.note_maybe_ran(id);
+        }
+        self.resend_query(id, now);
     }
 
     fn resend_query(&mut self, id: QueryId, now: Now) {
@@ -1624,6 +1662,9 @@ impl Session {
         else {
             return;
         };
+        if self.handover && self.hand_back(id, false) {
+            return;
+        }
         let position = self
             .pending
             .iter()
@@ -1976,6 +2017,10 @@ impl Session {
         }
         for (id, msg_id) in context.deferred_resends {
             if self.queries.get(&id).is_some_and(|query| query.state != QueryState::Pending && query.msg_id == msg_id) {
+                if self.handover && self.hand_back(id, true) {
+                    continue;
+                }
+                self.note_maybe_ran(id);
                 self.resend_query(id, now);
             }
         }
@@ -2596,11 +2641,11 @@ impl Session {
             };
             match status & 7 {
                 1..=3 => {
-                    self.resend_query(id, now);
+                    self.resend_unconfirmed(id, status & 7 == 1, now);
                     return;
                 }
                 0 if answer_msg_id.is_none() => {
-                    self.resend_query(id, now);
+                    self.resend_unconfirmed(id, true, now);
                     return;
                 }
                 _ => {
@@ -2762,7 +2807,7 @@ impl Session {
                     .is_some_and(|query| query.state == QueryState::Sent && query.may_have_arrived);
                 match state & 7 {
                     1..=3 if stale => {}
-                    1..=3 => self.resend_query(id, now),
+                    1..=3 => self.resend_unconfirmed(id, state & 7 == 1, now),
                     4 => self.mark_acknowledged(id),
                     _ => {}
                 }
@@ -3106,7 +3151,8 @@ impl Session {
 
     /// Queries are waiting to go out, fresh or again, and may.
     pub fn has_queries_to_send(&self) -> bool {
-        self.pending.iter().chain(self.to_retransmit.iter()).any(|id| !self.is_gated(*id))
+        (!self.handover && self.pending.iter().any(|id| !self.is_gated(*id)))
+            || self.to_retransmit.iter().any(|id| !self.is_gated(*id))
     }
 
     /// The key is temporary and not bound yet: no query goes out until `start_bind`'s does and is
@@ -3148,6 +3194,7 @@ impl Session {
                 rejections: 0,
                 server_resends: 0,
                 may_have_arrived: false,
+                maybe_ran_before: false,
                 retransmit_refused: false,
                 arrival_seq: None,
             },
@@ -3329,7 +3376,12 @@ impl Session {
             let id = self.pending.remove(position).expect("position is valid");
             self.pending.push_front(id);
         }
-        if queries && has_salt && !probe_first && self.to_retransmit.iter().all(|id| self.is_gated(*id)) {
+        if queries
+            && has_salt
+            && !probe_first
+            && !self.handover
+            && self.to_retransmit.iter().all(|id| self.is_gated(*id))
+        {
             let mut sent_now: HashMap<QueryId, i64> = HashMap::new();
             while let Some(&id) = self.pending.front() {
                 if query_messages.len() >= self.config.max_container_queries {
@@ -3532,7 +3584,8 @@ impl Session {
             .reduce(f64::min);
         self.to_resend_answer.extend(held_answers);
 
-        let pending_held = self.pending.iter().all(|id| self.is_gated(*id) || self.waits_for_a_slot(*id));
+        let pending_held =
+            self.handover || self.pending.iter().all(|id| self.is_gated(*id) || self.waits_for_a_slot(*id));
         let retransmit_held = self.to_retransmit.iter().all(|id| self.is_gated(*id));
         let nothing_left = pending_held
             && self.to_ack.is_empty()

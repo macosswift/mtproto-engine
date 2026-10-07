@@ -169,7 +169,9 @@ and send them (see 9).
 | Event | Handling |
 |---|---|
 | `Completed`, `Failed`, `RetryDecisionRequired`, `Acknowledged`, `Progress` | section 4 |
-| `FloodWaitReported`, `Pong`, `Closed` | ignored (`ReportFloodWait` is never requested) |
+| `FloodWaitReported`, `Pong` | ignored (`ReportFloodWait` is never requested); a `Pong` counts as hearing the server for the local health check (section 9c) |
+| `Released` (ABI 5) | only after `mt_session_drain` (section 9c): flag 0 moves the request to the replacement session after `value1` seconds (what is left of a flood wait); `MTReleasedMayHaveRun` asks the request's `shouldContinueAfterError` with one more server error and moves it if allowed, fails it with `500 ENGINE_SWITCHED` otherwise |
+| `Closed` | after `mt_session_drain`: the drain is over, `movePendingRequests`' completion runs; otherwise ignored |
 | `VerificationRequired` | APNS: `context.performExternalRequestVerification(withNonce:)`; reCAPTCHA: `performExternalRecaptchaRequestVerification(withMethod:siteKey:)`. First value -> `mt_session_resolve_apns(nonce, value)` / `mt_session_resolve_recaptcha(value)` (nil -> empty string, as MtProtoKit encodes it), including TelegramCore's own 15 s timeout literals. Signal completes or errors without a value, or 20 s pass: `mt_session_fail_request(403, "APNS_PUSH_TIMEOUT" / "RECAPTCHA_TIMEOUT")` |
 | `AuthorizationRequired` | main session only: logged to the log and short log, then `delegate.networkSessionAuthorizationRequired()` (MtProtoKitEngine does the same; `Network` logs the account out). The engine emits it only for a main-session `401` that is not `SESSION_PASSWORD_NEEDED`; `AUTH_KEY_PERM_EMPTY` never gets here |
 | `SoftAuthReset` | main only: `delegate.networkSessionSoftAuthReset()` |
@@ -411,6 +413,79 @@ extensions never get them. `MTContext` stays the only coordinator and the only w
   failure, and an attempt not done within 120 s, fails the transfer, which `MTContext` retries with its
   backoff (1, 2, 4 … 60 s).
 
+## 9c. Live engine switch: the drain
+
+`SwitchingNetworkEngine` (macOS) moves a network between engines live: the server's kill switch, the
+local health check below, the Developer picker. Every session gets a replacement at once; the old one
+hands its requests over with `NetworkEngineSession.movePendingRequests(to:deadline:completion:)`, the
+deadline being the switch's drain timeout (5 s), and stops when the completion runs. Requests go to the
+session current when each one moves, so a request released after a further switch skips a session that
+drains in turn.
+
+- **Rust** (`mt_session_drain`, engine `session_drain.rs`): a request that never reached the server is
+  released at once (`Released`, flag 0) and moves. One the server may have stays in the old session: it
+  goes out again only under its own msg_id (the server never runs a msg_id twice) and an answer that
+  comes completes it there. The draining session sends no request it had not sent before; pings,
+  acknowledgements and the service messages about its requests still go. A request that would have to go
+  under a new msg_id is released instead: as never run when the server said it did not get it or
+  rejected its only copy, as possibly run after a covering `new_session_created`, a local session reset,
+  a `msgs_state_info` "nothing known" (status 1, also what a server that forgot an old msg_id says) or a
+  key change (the answer could never come under another key; no new key is made). Once a copy may have
+  run, the request stays possibly run, also when it went back to the queue before the drain began or
+  was taken back to be wrapped with `initConnection` again. One exception, the same as without a switch:
+  when the server answers a later copy in the same session with an error the request is retried for (a
+  flood wait, a server error, `AUTH_KEY_PERM_EMPTY`), that answer counts, and the request leaves as never
+  run (MtProtoKit likewise); a copy that went out under an earlier session or before a re-wrap keeps the
+  request possibly run. A request chained
+  with `invoke_after` to one still waiting stays until that one is answered or released, so the chain
+  moves in its order. A request chained to one that leaves with a wait (a flood wait) is released with
+  no wait of its own and can reach the new session first: without a switch a dependent that has not
+  gone out is not held either, but one the server already answered with `MSG_WAIT_*` would be. The deadline grows by 5 s while answers keep arriving, 30 s at most; then every
+  request left is released (possibly run if it ever went out) and the engine sends `Closed`. A request
+  sent to the session afterwards is released at once. The bridge moves held and resubmitted requests
+  itself, leaves an engine report that the permanent key is unknown to the replacement (B2 review L7:
+  after a switch to MtProtoKit, MtProtoKit's probe would judge it on a single refusal), writes no
+  temporary key to the context while draining, stops its connection watchdog, and has a backstop 15 s
+  past the longest drain.
+- **MtProtoKit** (`-[MTRequestMessageService handOverRequests:]`): the same split by `MTRequest.requestContext`
+  and `MTRequest.mayHaveReachedServer` (set whenever the request goes out under a message id, cleared
+  when the server answers it with an error after which it goes again): a request with no message id
+  leaves at once, as possibly run if it went out before (a transport reset just before the switch drops
+  every message id); one with a message id waits for its answer and is sent again only under that id;
+  one that loses its message id meanwhile leaves as possibly run; one the server answered with an error
+  it is retried for leaves as never run, after its wait. The adapter runs the deadline the same way.
+- **Possibly run** follows the request's own policy, as `500 TEMP_KEY_ROTATED` does after a key rotation:
+  `shouldContinueAfterError` with one more server error; most of TelegramCore's requests allow a server
+  error, so such a call can still run twice when the old session never gets its answer. A call whose
+  policy refuses fails with `500 ENGINE_SWITCHED` and runs once.
+- **Temporary keys**: when the network leaves the Rust engine, the temporary key its main sessions keep
+  in the context (`rustEngineBoundTo`) is removed from the context (the draining session keeps its copy),
+  so MtProtoKit's replacement makes and binds a key of its own and two main sessions of the account never
+  talk under one temporary key. A switch to Rust shares MtProtoKit's key with the draining MtProtoKit
+  session for the drain (30 s at most), as MtProtoKit's own sessions of one datacenter share it: MtProtoKit
+  takes whatever key the context holds for its selector, so a key of the engine's own written there would
+  move the draining session onto it anyway, after dropping its connection and with it the answers the
+  drain waits for.
+
+**Local health check** (`NetworkLivenessMonitor`, macOS, a network that can switch, Rust only): when the
+main session has heard nothing from the server for 45 s of awake time, resumed, carrying the network
+(the window starts again at a switch to Rust) and with the network available all along, and has no
+answered connection (a session on one is never judged, whatever it waits for: the engine drops a
+connection the server stops answering, and only then is the session judged), MtProtoKit's TCP
+asks the same datacenter's addresses for a `res_pq` (10 s, through the context's proxy; never through a
+WEB proxy). If it answers and the engine still heard nothing, the network reports it to
+`NetworkTelemetry` (failure class `engine_fallback`, method `engine.local_health`, with the engine's
+latest connection drops) and moves to MtProtoKit until the next launch (`disableRustEngine`,
+`local-health`). One probe per network (`RustNetworkIdentity`) per 10 minutes, process-wide. The bridge
+reports what it heard (`serverActivity`): the latest answer, update, pong, bind answer or answered
+connection, or the moment it lost an answered connection (an idle session pings every minute or so,
+so a key rotation's reconnect must not find it silent since its last pong), how long requests have
+waited (reported, not judged), and whether the connection answered. The bridge's clock runs through
+sleep, so the monitor starts its window again at every wake, also one no reachability change marks.
+Over HTTP an open connection stays "answered", so an HTTP-carried session is never judged; MtProtoKit's
+TCP probe would mostly fail there anyway. The probe limit is per network for the whole process: after
+one account's probe, another account's silent session waits up to ten minutes for its own.
+
 ## 10. Connection management
 
 - Reachability: one `MTNetworkAvailability`; every change calls `mt_engine_set_network_available`,
@@ -516,7 +591,11 @@ exactly as `MTTcpConnection` does; iOS only.
   maker the engine cannot finish, a key maker giving up, and transfers over HTTP, through the main
   session, cancelled, and with an import refused (`AUTH_BYTES_INVALID`, `500`) or an export refused.
   `RustContextRegistryTests` pins the evidence rules without sessions, and the ordering on MTContext's
-  queue: the gate (`rustEngineStartLogoutCheck`), and the factory writes of `activate` and `deactivate`. MtProtoKit's TCP connections are
+  queue: the gate (`rustEngineStartLogoutCheck`), and the factory writes of `activate` and `deactivate`.
+  `RustEngineDrainTests` covers section 9c: R3-C (a call the server ran is not run again by a switch:
+  it fails with `500 ENGINE_SWITCHED` under a refusing policy), a call whose policy allows a server
+  error moving at the deadline, an answer completing on the draining session, never-sent requests
+  moving at once, the replacement's own temporary key, and MtProtoKit handing over to Rust. MtProtoKit's TCP connections are
   counted through `makeTcpConnectionInterface`: none while the engine makes keys and transfers. The tests
   need the shared logger that `RustEngineBridgeTests` installs, so run the whole test target.
 
@@ -560,7 +639,8 @@ exactly as `MTTcpConnection` does; iOS only.
 The C ABI in `crates/mtproto-ffi/include/mtproto_engine.h` follows these rules. Any other host must
 follow them too.
 
-- **Version.** `mt_engine_abi_version()` must equal the version the host was built against (4).
+- **Version.** `mt_engine_abi_version()` must equal the version the host was built against (5: ABI 5
+  added `mt_session_drain` and `MTEventKindReleased`).
 - **Engine.** `mt_engine_create` returns an owned pointer. `mt_engine_destroy` releases it:
   - Delivery stops at once. A secret payload that is already queued is zeroized, not delivered.
   - The worker threads are shut down and joined.

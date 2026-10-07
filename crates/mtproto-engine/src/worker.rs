@@ -51,6 +51,7 @@ pub enum Command {
     InvalidateInitialization(SessionHandle),
     SetTimeDifference(SessionHandle, f64),
     DestroyAuthKey(SessionHandle),
+    Drain(SessionHandle, f64),
     SetNetworkAvailable(bool),
     ResetConnections,
     Resolved { host: String, port: u16, addresses: Vec<std::net::SocketAddr> },
@@ -430,6 +431,11 @@ impl Worker {
                 Command::DestroyAuthKey(handle) => {
                     if let Some(session) = self.sessions.get_mut(&handle) {
                         session.destroy_auth_key(now, self.poll.registry(), &self.callbacks, &mut self.rng);
+                    }
+                }
+                Command::Drain(handle, deadline) => {
+                    if let Some(session) = self.sessions.get_mut(&handle) {
+                        session.drain(deadline, now, self.poll.registry(), &self.callbacks);
                     }
                 }
                 Command::SetTimeDifference(handle, difference) => {

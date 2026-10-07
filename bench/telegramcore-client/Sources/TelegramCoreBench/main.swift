@@ -4,7 +4,7 @@ import MtProtoKit
 import Postbox
 @testable import TelegramApi
 @testable import TelegramCore
-import MTProtoRustEngine
+@testable import MTProtoRustEngine
 import OpenSSLEncryption
 
 func writeStderr(_ text: String) {
@@ -111,6 +111,8 @@ struct BenchConfig {
     let files: [FileConfig]
     let injections: [InjectConfig]
     let proxy: ProxyConfig?
+    /// The test server's RSA key (PEM): neither engine knows it, and both make temporary keys with it.
+    let publicKey: String?
 
     static func load(_ path: String) -> BenchConfig {
         guard let data = FileManager.default.contents(atPath: path), let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -154,7 +156,7 @@ struct BenchConfig {
         if let item = object["proxy"] as? [String: Any] {
             proxy = ProxyConfig(kind: item["kind"] as? String ?? "mtp", host: item["host"] as? String ?? "127.0.0.1", port: (item["port"] as? NSNumber)?.intValue ?? 0, secret: dataFromHex(item["secret"] as? String ?? ""))
         }
-        return BenchConfig(mainDatacenterId: mainDatacenterId, datacenters: datacenters, files: files, injections: injections, proxy: proxy)
+        return BenchConfig(mainDatacenterId: mainDatacenterId, datacenters: datacenters, files: files, injections: injections, proxy: proxy, publicKey: object["public_key"] as? String)
     }
 }
 
@@ -320,6 +322,35 @@ func openTemporaryPostbox(basePath: String) -> Postbox {
     return result!
 }
 
+/// The engine inputs a network reads from the account manager (TelegramCore builds them only from a
+/// transaction): a temporary one with the engine the run asks for.
+func networkEngineInputs(basePath: String, engine: NetworkEngineKind) -> NetworkEngineInputs {
+    let accountManager = AccountManager<TelegramAccountManagerTypes>(basePath: basePath + "/accounts", isTemporary: true, isReadOnly: false, useCaches: false, removeDatabaseOnError: true, accessChallenge: AccountManagerAccessChallenge(prepare: { _ in
+    }, resolve: { current, _ in
+        return current
+    }, finishInitialization: {
+    }))
+    let semaphore = DispatchSemaphore(value: 0)
+    var result: NetworkEngineInputs?
+    let disposable = (accountManager.transaction { transaction -> NetworkEngineInputs in
+        transaction.updateSharedData(SharedDataKeys.networkEngineSettings, { _ in
+            return PreferencesEntry(NetworkEngineSettings(engine: engine))
+        })
+        return networkEngineInputs(transaction: transaction)
+    }).start(next: { inputs in
+        result = inputs
+        semaphore.signal()
+    })
+    if !waitRunningMainLoop(semaphore, timeout: 30) {
+        fail("account manager did not open")
+    }
+    disposable.dispose()
+    guard let inputs = result else {
+        fail("account manager did not open")
+    }
+    return inputs
+}
+
 func makeNetwork(arguments: Arguments, config: BenchConfig, keychain: Keychain, basePath: String, provider: EncryptionProvider) -> Network {
     let engineKind: NetworkEngineKind = arguments.engine == "rust" ? .rust : .mtProtoKit
     let initialization = NetworkInitializationArguments(
@@ -337,7 +368,7 @@ func makeNetwork(arguments: Arguments, config: BenchConfig, keychain: Keychain, 
         deviceModelName: "TelegramCore bench",
         useBetaFeatures: false,
         isICloudEnabled: false,
-        networkEngineFactory: RustNetworkEngineFactory()
+        networkEngineFactory: BenchRustEngineFactory(publicKey: config.publicKey)
     )
     let semaphore = DispatchSemaphore(value: 0)
     var result: Network?
@@ -347,7 +378,8 @@ func makeNetwork(arguments: Arguments, config: BenchConfig, keychain: Keychain, 
         let server = ProxyServerSettings(host: proxy.host, port: Int32(proxy.port), connection: connection)
         proxySettings = ProxySettings(enabled: true, servers: [server], activeServer: server, useForCalls: false)
     }
-    let disposable = initializedNetwork(accountId: AccountRecordId(rawValue: 1), arguments: initialization, supplementary: true, datacenterId: config.mainDatacenterId, keychain: keychain, basePath: basePath, testingEnvironment: false, languageCode: "en", proxySettings: proxySettings, networkSettings: nil, networkEngineSettings: NetworkEngineSettings(engine: engineKind), phoneNumber: nil, useRequestTimeoutTimers: true, appConfiguration: AppConfiguration.defaultValue).start(next: { network in
+    let networkEngine = networkEngineInputs(basePath: basePath, engine: engineKind)
+    let disposable = initializedNetwork(accountId: AccountRecordId(rawValue: 1), arguments: initialization, supplementary: true, datacenterId: config.mainDatacenterId, keychain: keychain, basePath: basePath, testingEnvironment: false, languageCode: "en", proxySettings: proxySettings, networkSettings: nil, networkEngine: networkEngine, phoneNumber: nil, useRequestTimeoutTimers: true, appConfiguration: AppConfiguration.defaultValue).start(next: { network in
         result = network
         semaphore.signal()
     })
@@ -361,7 +393,51 @@ func makeNetwork(arguments: Arguments, config: BenchConfig, keychain: Keychain, 
     if network.engineKind != engineKind {
         fail("engine \(engineKind) was declined, got \(network.engineKind)")
     }
+    if network.engineKind == .mtProtoKit {
+        installTestKeyExchange(network: network, config: config)
+    }
     return network
+}
+
+/// The production factory, except that the engine takes the test server's RSA key: with PFS in the
+/// engine it makes and binds a temporary key of its own, as in the app. `TC_BENCH_RUST_WITHOUT_TEST_KEY=1`
+/// leaves the key out: the engine then never gets a key the server takes, a Rust engine that cannot
+/// connect while MtProtoKit can (the local health check's case). Run it sandboxed to localhost: the
+/// engine would otherwise try Telegram Web's endpoints.
+struct BenchRustEngineFactory: NetworkEngineFactory {
+    let publicKey: String?
+
+    var supportsWebProxy: Bool {
+        return true
+    }
+
+    func makeEngine(context: MTContext, isAppExtension: Bool) -> NetworkEngine? {
+        let withoutKey = ProcessInfo.processInfo.environment["TC_BENCH_RUST_WITHOUT_TEST_KEY"] == "1"
+        guard let publicKey = self.publicKey, !withoutKey, let runtime = RustEngineRuntime.shared else {
+            return RustNetworkEngineFactory().makeEngine(context: context, isAppExtension: isAppExtension)
+        }
+        return RustNetworkEngine(runtime: runtime, context: context, serverPublicKeys: [publicKey])
+    }
+}
+
+/// MtProtoKit takes a key exchange's RSA keys from the context only for a CDN, so its key exchanges
+/// are made as for a CDN with the test server's key in the context (the same as the engine's
+/// end-to-end tests). Installed while MtProtoKit runs: the Rust engine puts its own actions in place
+/// while it runs and removes them when the network leaves it.
+func installTestKeyExchange(network: Network, config: BenchConfig) {
+    guard let publicKey = config.publicKey else {
+        return
+    }
+    let context = network.context
+    for datacenter in config.datacenters {
+        context.updatePublicKeysForDatacenter(withId: datacenter.id, publicKeys: [["key": publicKey]])
+    }
+    let factory: @convention(block) (MTDatacenterAuthInfoSelector, Bool, Bool, @escaping (MTDatacenterAuthAction?, Bool) -> Void) -> MTDatacenterAuthAction = { selector, _, skipBind, completion in
+        return MTDatacenterAuthAction(authKeyInfoSelector: selector, isCdn: true, skipBind: skipBind, completion: { action, success in
+            completion(action, success)
+        })
+    }
+    context.setValue(factory, forKey: "authActionFactory")
 }
 
 struct Latency {
@@ -435,6 +511,10 @@ final class Recorder {
     private(set) var lastProgressAt = 0.0
     var stalled = false
     var engineSwitched = false
+    /// When each accepted switch happened, as Unix time: the test server tells the engines' sessions apart by it.
+    var switchTimes: [Double] = []
+    /// The network left the engine the run asked for on its own (`NetworkLivenessMonitor`).
+    var engineFellBack = false
 
     func elapsed() -> Double {
         return Double(DispatchTime.now().uptimeNanoseconds &- self.start) / 1e9
@@ -513,7 +593,7 @@ final class Recorder {
         let throughput = elapsed > 0 ? Double(self.bytes) / 1e6 / elapsed : 0
         var output = "{\"engine\":\"\(engine)\",\"workload\":\"\(workload)\",\"completed\":\(self.completed),\"failed\":\(failed),\"elapsed\":\(formatNumber(elapsed)),"
         output += "\"latency_ms\":{\"p50\":\(formatNumber(latency.p50)),\"p95\":\(formatNumber(latency.p95)),\"p99\":\(formatNumber(latency.p99)),\"max\":\(formatNumber(latency.max))},"
-        output += "\"bytes\":\(self.bytes),\"throughput_mbps\":\(formatNumber(throughput)),\"verify_failures\":\(self.verifyFailures),\"cancellations\":\(self.cancellations),\"double_completions\":\(self.doubleCompletions),\"stalled\":\(self.stalled ? 1 : 0),\"engine_switched\":\(self.engineSwitched ? 1 : 0),\"issued\":\(self.sent.count),\"transfers_done\":\(self.transfersDone),\"transfers_elapsed\":\(formatNumber(self.lastTransferAt)),\"requests\":["
+        output += "\"bytes\":\(self.bytes),\"throughput_mbps\":\(formatNumber(throughput)),\"verify_failures\":\(self.verifyFailures),\"cancellations\":\(self.cancellations),\"double_completions\":\(self.doubleCompletions),\"stalled\":\(self.stalled ? 1 : 0),\"engine_switched\":\(self.engineSwitched ? 1 : 0),\"engine_fell_back\":\(self.engineFellBack ? 1 : 0),\"switch_times\":[\(self.switchTimes.map(formatNumber).joined(separator: ","))],\"issued\":\(self.sent.count),\"transfers_done\":\(self.transfersDone),\"transfers_elapsed\":\(formatNumber(self.lastTransferAt)),\"requests\":["
         if !self.compact {
             output += zip(self.sent, self.done).map { "[\(formatNumber($0)),\($1.map(formatNumber) ?? "null")]" }.joined(separator: ",")
         }
@@ -670,6 +750,7 @@ final class Bench {
     private var nextFile = 0
     private var finishedFiles = 0
     private var rng: UInt64
+    private var expectedEngine: (() -> NetworkEngineKind)?
 
     init(arguments: Arguments, config: BenchConfig, network: Network, postbox: Postbox) {
         self.arguments = arguments
@@ -798,6 +879,10 @@ final class Bench {
             }
         }
         waitRunningMainLoop(done)
+        let started = self.arguments.engine == "rust" ? NetworkEngineKind.rust : .mtProtoKit
+        self.queue.sync {
+            self.recorder.engineFellBack = self.network.engineKind != (self.expectedEngine?() ?? started)
+        }
         let label = self.arguments.engineLabel ?? self.arguments.engine
         return self.recorder.report(engine: label, workload: workload, latencyFromProbes: latencyFromProbes)
     }
@@ -917,12 +1002,20 @@ final class Bench {
             fixedTarget = nil
         }
         var accepted = 0
+        var expected = network.engineKind
+        self.expectedEngine = { expected }
         for time in times {
             self.queue.after(time, {
                 let from = network.engineKind
                 let target = fixedTarget ?? (from == .rust ? .mtProtoKit : .rust)
+                let switchedAt = Date().timeIntervalSince1970
                 if network.switchEngine(to: target, reason: "bench") && network.engineKind == target {
                     accepted += 1
+                    expected = target
+                    recorder.switchTimes.append(switchedAt)
+                }
+                if network.engineKind == .mtProtoKit {
+                    installTestKeyExchange(network: network, config: self.config)
                 }
                 recorder.engineSwitched = accepted == times.count
                 writeStderr("engine switch \(from.rawValue) -> \(target.rawValue), now \(network.engineKind.rawValue), \(accepted)/\(times.count) accepted")
@@ -953,6 +1046,50 @@ final class Bench {
 
     /// `total` numbered calls with `concurrency` in flight; with `total == 0`, calls for `duration`
     /// seconds, then waits for the ones in flight.
+    /// `TC_BENCH_STRICT_CALLS=1`: torture calls refuse to run again after a server error, as calls that
+    /// must not run twice do. A live engine switch then fails a call that may have run (`500
+    /// ENGINE_SWITCHED`) instead of moving it, so any duplicate execution is the engines' own.
+    private static let strictCalls = ProcessInfo.processInfo.environment["TC_BENCH_STRICT_CALLS"] != nil
+
+    private static func call(_ network: Network, tag: UInt32, index: UInt64) -> Signal<CallResult, MTRpcError> {
+        let data = makeCall(tag: tag, index: index)
+        if !Bench.strictCalls {
+            return network.request(data)
+        }
+        let requestService = network.requestService
+        return Signal { subscriber in
+            let request = NetworkEngineRequest(
+                payload: data.1.makeData(),
+                metadata: WrappedRequestMetadata(metadata: WrappedFunctionDescription(data.0), tag: nil),
+                shortMetadata: WrappedRequestShortMetadata(shortMetadata: WrappedShortFunctionDescription(data.0)),
+                parse: { response in
+                    return data.2.parse(Buffer(data: response)).map { BoxedMessage($0) }
+                },
+                options: NetworkEngineRequestOptions(),
+                shouldContinueAfterError: { context in
+                    return context.internalServerErrorCount == 0
+                },
+                dependsOn: nil,
+                acknowledged: nil,
+                progress: nil,
+                completed: { result in
+                    switch result {
+                    case let .success(response):
+                        if let value = (response.result as? BoxedMessage)?.body as? CallResult {
+                            subscriber.putNext(value)
+                            subscriber.putCompletion()
+                        } else {
+                            subscriber.putError(MTRpcError(errorCode: 500, errorDescription: "TL_VERIFICATION_ERROR"))
+                        }
+                    case let .failure(failure):
+                        subscriber.putError(failure.error)
+                    }
+                }
+            )
+            return requestService.add(request)
+        }
+    }
+
     private func torture(total requested: Int, deadline: Date, done: DispatchSemaphore) {
         let total = requested > 0 ? requested : Int.max
         let issueUntil = requested > 0 ? Date.distantFuture : Date().addingTimeInterval(self.arguments.duration)
@@ -969,7 +1106,7 @@ final class Bench {
                 issued += 1
                 inFlight += 1
                 let tag = UInt32(1 + index % 900)
-                let _ = (network.request(makeCall(tag: tag, index: UInt64(index)))
+                let _ = (Bench.call(network, tag: tag, index: UInt64(index))
                 |> deliverOn(queue)).start(next: { result in
                     if result.tag != tag || result.index != UInt64(index) {
                         recorder.addVerifyFailure()

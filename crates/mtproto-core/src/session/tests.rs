@@ -4848,3 +4848,6 @@ fn a_far_future_msg_id_does_not_hide_a_later_update_loss() {
     assert_eq!(losses(&mut h, 1.0, 0x0202_0202), 1);
     assert_eq!(losses(&mut h, 60.0, 0x0303_0303), 1, "a loss 60 s after the last fetch is not covered by it");
 }
+
+#[path = "handover_tests.rs"]
+mod handover_tests;

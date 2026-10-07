@@ -83,12 +83,21 @@ pub struct ClusterResult {
     pub issued: usize,
     pub double_completions: usize,
     pub duplicate_executions: usize,
+    /// Duplicate executions under another auth key than the first: across engines (see the test server).
+    pub cross_key_duplicates: usize,
+    /// The auth keys calls ran under: at least one per engine the run went through.
+    pub execution_keys: usize,
+    /// Duplicate executions whose two runs came from sessions of different engines: a session belongs to
+    /// the engine the client had switched to when the session's first packet came.
+    pub cross_engine_duplicates: usize,
     pub chaos_injected: usize,
     pub client_packets: usize,
     pub client_bytes: usize,
     pub loop_rejections: usize,
     pub stalled: bool,
     pub engine_switched: bool,
+    /// The client's network left the engine under test on its own (the local health check).
+    pub engine_fell_back: bool,
     pub upload_parts: usize,
     /// Upload parts the server received more than once.
     pub upload_duplicates: usize,
@@ -736,6 +745,18 @@ fn wait_with_usage(pid: u32) -> (f64, f64, String) {
     (cpu, usage.ru_maxrss as f64 / (1024.0 * 1024.0), exit)
 }
 
+/// A JSON array of numbers in the client's report line, empty when it is missing.
+fn extra_numbers(output: &str, field: &str) -> Vec<f64> {
+    let needle = format!("\"{field}\":[");
+    output
+        .rfind(&needle)
+        .and_then(|start| {
+            let rest = &output[start + needle.len()..];
+            rest.find(']').map(|end| rest[..end].split(',').filter_map(|value| value.trim().parse().ok()).collect())
+        })
+        .unwrap_or_default()
+}
+
 fn extra_number(output: &str, field: &str) -> usize {
     let needle = format!("\"{field}\":");
     output
@@ -860,8 +881,9 @@ pub fn run(scenario: &ClusterScenario, binary: &str, engine: &str, seed: u64) ->
             format!("{{\"id\":{},\"dc\":{},\"size\":{},\"cdn\":{}}}", file.id, file.datacenter_id, file.size, file.cdn)
         })
         .collect();
+    let public_key = mtproto_engine::mtproto_core::test_support::test_rsa_public_key_pem().replace('\n', "\\n");
     let config = format!(
-        "{{\"main_datacenter_id\":{MAIN_DC},\"datacenters\":[{}],\"files\":[{}],\"inject\":{},\"proxy\":{}}}",
+        "{{\"main_datacenter_id\":{MAIN_DC},\"datacenters\":[{}],\"files\":[{}],\"inject\":{},\"proxy\":{},\"public_key\":\"{public_key}\"}}",
         datacenters.join(","),
         files.join(","),
         inject.unwrap_or_else(|| "[]".into()),
@@ -936,11 +958,15 @@ pub fn run(scenario: &ClusterScenario, binary: &str, engine: &str, seed: u64) ->
         issued: 0,
         double_completions: 0,
         duplicate_executions: 0,
+        cross_key_duplicates: 0,
+        execution_keys: 0,
+        cross_engine_duplicates: 0,
         chaos_injected: 0,
         client_packets: 0,
         client_bytes: 0,
         loop_rejections: 0,
         stalled: false,
+        engine_fell_back: false,
         engine_switched: false,
         upload_parts: 0,
         upload_duplicates: 0,
@@ -990,9 +1016,21 @@ pub fn run(scenario: &ClusterScenario, binary: &str, engine: &str, seed: u64) ->
     result.double_completions = extra_number(line, "double_completions");
     result.stalled = extra_number(line, "stalled") == 1;
     result.engine_switched = extra_number(line, "engine_switched") == 1;
+    result.engine_fell_back = extra_number(line, "engine_fell_back") == 1;
     result.issued = extra_number(line, "issued");
     main_server.with_stats(|stats| {
         result.duplicate_executions = stats.duplicate_executions;
+        result.cross_key_duplicates = stats.cross_key_duplicates;
+        let switch_times = extra_numbers(line, "switch_times");
+        let engine_of = |session: i64| {
+            stats.session_first_seen.get(&session).map(|seen| switch_times.iter().filter(|at| **at <= *seen).count())
+        };
+        result.cross_engine_duplicates = stats
+            .duplicate_sessions
+            .iter()
+            .filter(|(first, again)| engine_of(*first).is_none() || engine_of(*first) != engine_of(*again))
+            .count();
+        result.execution_keys = stats.executed_with_key.iter().map(|(_, key)| *key).collect::<std::collections::HashSet<_>>().len();
         if std::env::var_os("TC_BENCH_DUPLICATES").is_some() {
             for record in &stats.duplicate_records {
                 eprintln!("duplicate: {record}");
@@ -1197,8 +1235,15 @@ pub fn torture_markdown(results: &[ClusterResult]) -> String {
             continue;
         };
         let rate = if report.elapsed > 0.0 { report.completed as f64 / report.elapsed } else { 0.0 };
+        let process = match (result.stalled, result.engine_switched) {
+            (true, true) => format!("{} (stalled, switched)", result.exit),
+            (true, false) => format!("{} (stalled)", result.exit),
+            (false, true) => format!("{} (switched)", result.exit),
+            (false, false) => result.exit.clone(),
+        };
+        let fell_back = if result.engine_fell_back { " (engine fell back)" } else { "" };
         out.push_str(&format!(
-            "| {} | {} | {}/{} | {} | {} | {} | {} | {} | {:.2} | {:.1} | {:.0} | {:.2} | {:.1} | {} | {} | {:.1} | {} | {} |\n",
+            "| {} | {} | {}/{} | {} | {} | {} | {} | {} | {:.2} | {:.1} | {:.0} | {:.2} | {:.1} | {} | {} | {:.1} | {} | {}{} |\n",
             result.scenario,
             result.engine,
             report.completed,
@@ -1217,12 +1262,8 @@ pub fn torture_markdown(results: &[ClusterResult]) -> String {
             result.client_packets,
             result.client_bytes as f64 / 1e6,
             result.loop_rejections,
-            match (result.stalled, result.engine_switched) {
-                (true, true) => format!("{} (stalled, switched)", result.exit),
-                (true, false) => format!("{} (stalled)", result.exit),
-                (false, true) => format!("{} (switched)", result.exit),
-                (false, false) => result.exit.clone(),
-            },
+            process,
+            fell_back,
         ));
     }
     out

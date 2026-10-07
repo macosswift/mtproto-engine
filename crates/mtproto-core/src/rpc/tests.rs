@@ -1315,3 +1315,6 @@ fn a_call_whose_announced_answer_never_comes_fails_instead_of_running_again() {
 
 #[path = "coverage_tests.rs"]
 mod coverage;
+
+#[path = "handover_tests.rs"]
+mod handover_tests;

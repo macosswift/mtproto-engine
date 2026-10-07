@@ -136,6 +136,16 @@ fn main() {
         }
         match line.trim() {
             "stats" => println!("{}", server.with_stats(summary)),
+            "sessions" => {
+                let executed: Vec<String> = server.with_stats(|stats| {
+                    stats
+                        .executed_in_session
+                        .iter()
+                        .map(|(tag, session)| format!("{{\"tag\":{tag},\"session\":{session}}}"))
+                        .collect()
+                });
+                println!("{{\"executed\":[{}]}}", executed.join(","));
+            }
             "foreign-stats" => {
                 println!("{}", foreign.as_ref().map(|foreign| foreign.with_stats(summary)).unwrap_or_default())
             }
