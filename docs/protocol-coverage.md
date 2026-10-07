@@ -235,7 +235,7 @@ always means a fresh `msg_id`.
 | E13 | `420 FLOOD_WAIT_X` / `FLOOD_PREMIUM_WAIT_X` (any code containing the marker) | B4.2 | Wait clamp(X, 1 s, 14 d), surface above the budget | Wait X (0 = immediate, no cap) | Wait clamp(X, 1 s, 14 d) unless automatic waiting is off; reported or delegated on request; unparsable X surfaces | `rpc::flood_wait_is_waited_out_and_reported`, `rpc::flood_wait_surfaces_without_automatic_wait`, `rpc::flood_wait_delays_are_bounded`, `rpc::delegated_retry_decisions_for_flood_and_server_errors`, `engine::flood_wait_and_server_errors_are_retried_transparently` | fixed |
 | E14 | `420 SLOWMODE_WAIT_X`, `2FA_CONFIRM_WAIT_X`, `TAKEOUT_INIT_DELAY_X`, `PREMIUM_SUB_ACTIVE_UNTIL_X`, `FROZEN_METHOD_INVALID` | B4.2 | Returned | Surfaced | Surfaced verbatim | `rpc::unparsable_flood_and_frozen_method_surface`, `rpc::other_error_classes_surface_verbatim` | ok |
 | E15 | `500` (incl. `INTERDC_X_CALL_ERROR`, `WORKER_BUSY_TOO_LONG_RETRY`, `RANDOM_ID_DUPLICATE`, server-side `TL_PARSING_ERROR`, `AUTH_KEY_UNSYNCHRONIZED`) | B4.1 | Backoff 1..64 s | Retry every 2 s if the gate allows | Retry after 2, 4, 8, 16 s; surfaced when retries are disabled; delegated on request | `rpc::server_errors_retry_with_backoff_or_fail`, `rpc::negative_and_normalized_codes_are_retried_as_server_errors`, `engine::flood_wait_and_server_errors_are_retried_transparently` | ok |
-| E16 | Negative codes (`-503 Timeout`, `-500`, any other negative) | B4.1 | Backoff | `-500` only | Server-error class (previously only −500 and −503) | `rpc::negative_and_normalized_codes_are_retried_as_server_errors` | fixed |
+| E16 | Negative codes (`-503 Timeout`, `-500`, any other negative) | B4.1 | Backoff | `-500` only | `-500` only, retried as E15 (`is_server_error` is 500/−500); `-503` and every other negative code surface at once (E24) | `rpc::negative_and_normalized_codes_are_retried_as_server_errors`, `rpc::other_negative_codes_surface_like_mtprotokit` | fixed |
 | E17 | Invalid codes: 0, ≥ 10000, ≤ −10000 | §5.7 | Treated as 500 | Verbatim | Normalized to 500 (retried as E15) | `rpc_errors_are_sanitized_like_tdlib`, `tl::rpc_errors_are_sanitized`, `rpc::negative_and_normalized_codes_are_retried_as_server_errors` | fixed |
 | E18 | Error text that is not valid UTF-8 | §5.7 | `INVALID_UTF8_ERROR_MESSAGE` | Lossy | `INVALID_UTF8_ERROR_MESSAGE` (previously lossy replacement characters) | `rpc::invalid_utf8_error_messages_are_replaced`, `rpc_errors_are_sanitized_like_tdlib` | fixed |
 | E19 | Other unknown codes (418, 502, …) | B4 | Returned | Surfaced | Surfaced verbatim | `rpc::other_error_classes_surface_verbatim` | ok |
@@ -401,7 +401,6 @@ production.
 
 ## Not covered (deliberately)
 
-- **HTTPS** to `*.web.telegram.org`: plain HTTP only; TLS would add a TLS stack to the engine.
 - **Answers lost after the server acknowledged a query** (the server says "received" but never answers):
   tdlib closes the connection after 60 s and asks again, which never resolves either; the engine relies on
   host request timeouts. Unacknowledged queries are fully covered (A01, A03).

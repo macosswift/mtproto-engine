@@ -190,7 +190,9 @@ and send them (see 9).
 | `AuthKeyCreated` | PFS sessions: a temporary key is held until `TemporaryKeyInUse` names it (a permanent key cannot come: the session never allows the engine to make one). Other sessions: logged only |
 | `TemporaryKeyInUse` | the key the session talks under (salts and init hash go to its auth info). One the session made (`flags & 1 == 0`), for the address class the session has now (`code` is the obfuscation id it was made for), is written to the class's ephemeral selector with `rustEngineBoundTo` = the permanent key id in `request_id`, unless the context keeps a longer-lived key bound to the same permanent key |
 | `TemporaryKeyDropped` | the context's key for the selector is removed if it is that key |
-| `TemporaryKeyBound`, `TemporaryKeyBindFailed`, `PermanentKeyInvalid`, `AuthKeyCreationFailed`, `TransportFlood` | logged only (MtProtoKit does not log out on a refused permanent key either; the engine retries a minute later) |
+| `PermanentKeyInvalid` | PFS sessions, unless the key replaced another less than 60 s ago: on another datacenter the permanent key and its token are dropped and made anew; on the home datacenter `context.checkIfLoggedOut(dc)`, whose probe makes and binds a fresh temporary key over MtProtoKit's TCP (never stored, never answered by a stored key) and logs out only when that bind is refused with `ENCRYPTED_MESSAGE_INVALID` |
+| `TemporaryKeyBound`, `TemporaryKeyBindFailed`, `AuthKeyCreationFailed`, `TransportFlood` | logged only |
+| `AuthKeyDestroyed` (28) | not mapped (`RustEngineEventKind` has no case, so the event is dropped): TelegramCore never calls `mt_session_destroy_auth_key` yet |
 
 ## 6. MTContext reads and writes
 
@@ -270,7 +272,7 @@ short log. `Logger` itself drops everything when file and console logging are of
 | CDN session | drop the selector's key and require a new one (`isCdn: true`) |
 | foreign-DC worker | `removeTokenForDatacenter(dc)`, drop and require the key, mark the token missing |
 | ephemeral selector | drop and require the key |
-| otherwise (persistent key) | `context.checkIfLoggedOut(dc)` only; the same key is reinstalled on `AuthKeyRequired` |
+| otherwise (persistent key) | `context.checkIfLoggedOut(dc)` only (a fresh key exchange and bind that logs out only on `ENCRYPTED_MESSAGE_INVALID`); the same key is reinstalled on `AuthKeyRequired` |
 
 While waiting, the rejected key id is remembered so a context key with that id is never reinstalled.
 If the context already holds a different key for the selector when a key is rejected (another session
@@ -346,24 +348,24 @@ is created with `pfs_lifetime = tempKeyExpiration` (24 h) and `pfs_make_permanen
 | Token gating | only at transport reset; a 401 parks only that request | engine gates every request while the token is missing | engine semantics; same outcome once the token arrives |
 | IPv6 | chosen per connection by scheme stats | IPv6 addresses appended only when MTContext would consider IPv6 at creation/refresh | the engine cycles a fixed list |
 | SOCKS5 + per-address secret | address secret used through SOCKS5 | ignored by the engine | engine `proxy_secret` returns nil for SOCKS5 |
-| `-503` and other negative codes | surfaced | engine asks for a retry decision (server error) | engine semantics |
 | Main session lifetime | retained forever by the update-service cycle | destroyed with its `Network` | no cycle needed; sockets close |
 | Duplicate reset for `updatesTooLong` | one `.reset` | one `.reset` (wrapper skips the second) | engine emits both |
 | Cancelling an in-flight request with `expectedResponseSize >= 512 KB` | new session id + transport reset | engine sends `rpc_drop_answer` and resets the connection, session kept | engine semantics |
 | Proxy connection issues | `MTConnectionProbing` (proxy unreachable while the internet is reachable) | engine flag: proxy set, not connected, 3+ failed attempts | engine semantics |
 | Key rejected while the context already has a newer key | drops it and asks for another | installs the newer key | avoids rebind storms (R14) |
 | Network type | wifi/cellular per socket | cellular when the socket's local address is on a `pdp_ip*` interface | same accounting (`72d7e51f95`) |
-| Main-session `401` | logs out | logs out (`rustEngineAuthorizationRequiredAction`) | R1's `checkIfLoggedOut` probe cannot confirm it: its `EphemeralMain` auth action completes on the stored temporary key without contacting the server (§14, risk 1) |
+| Main-session `401` | logs out | logs out (`rustEngineAuthorizationRequiredAction`) | the `401` is the server's verdict; R1's `checkIfLoggedOut` probe is an MtProtoKit key exchange over TCP that never concludes where only HTTP or Telegram Web work (§14, risk 1) |
 
 ## 12. Known gaps and FFI requests
 
-Status (2026-10-02): items 1, 2, 4, 5 and 6 are fixed in the engine by `72d7e51f95` (token gate
+Status (2026-10-06): items 1, 2, 4, 5 and 6 are fixed in the engine by `72d7e51f95` (token gate
 across key swaps, `set_auth_key(None)` keeps requests, live `set_obfuscation_dc_id`, connect
 timeouts report the address, `NetworkUsage` reports cellular). Item 7 is addressed by
 `RustEngineEndToEndTests`, which drives the `mtproto-testserver` binary. Item 8: the iOS Bazel
-targets exist (§2); `build.sh` still builds no iOS slices, which iOS does not use. Item 3 is open
-for stream connections: the host-stream ABI exists and carries HTTP connections (Telegram Web's
-HTTPS endpoint, 2026-10-05), the WEB proxy carrier and WSS are next. The design agreed for iOS: mirror MtProtoKit's selection, i.e. own sockets when
+targets exist (§2); `build.sh` still builds no iOS slices, which iOS does not use. Item 3 is fixed
+for everything but plain TCP through an injected interface: the host-stream ABI carries Telegram
+Web's HTTPS (HT13) and WebSocket (HT14) endpoints and the WEB proxy carrier (`RustCarrierStreams`),
+so a WEB proxy no longer needs MtProtoKit. The design agreed for iOS: mirror MtProtoKit's selection, i.e. own sockets when
 `context.makeTcpConnectionInterface` is nil and the injected interface (Network.framework,
 the WEB proxy carrier) when set; a host-stream C ABI (`open`/`write`/`read`/`close` callbacks,
 host-to-engine `connected`/`received`/`closed` keyed by session and a never-reused `conn_id`, one
@@ -377,12 +379,12 @@ exactly as `MTTcpConnection` does; iOS only.
    after `-404` are dispatched during `install_key`, before the following `SetAuthTokenReady(false)`,
    so a foreign-DC worker can send them without an imported authorization (one extra `401` and
    re-transfer; nothing is lost). Fix: keep the flag in `SessionRuntime` and pass it to `RpcClient::new`.
-2. **`mt_session_set_auth_key` with an empty key drops all requests** (`set_auth_key(None)` discards the
-   `RpcClient`). The wrapper never calls it; an FFI to drop a key while keeping requests (as `-404`
-   does) would replace the pause hold.
-3. **No injected transport.** `context.makeTcpConnectionInterface` (NWConnection on macOS 14+, WEB
-   proxy carrier) cannot be used; the engine always opens its own sockets. Needs a byte-stream
-   callback interface in the C ABI.
+2. **`mt_session_set_auth_key` with an empty key** (fixed by `72d7e51f95`): it keeps the requests now
+   (it used to discard the `RpcClient`). The wrapper still never calls it and holds the session paused
+   instead.
+3. **Injected transport** (mostly fixed): host streams carry Telegram Web's HTTPS and WebSocket
+   endpoints and the WEB proxy carrier; plain TCP still uses the engine's own sockets, never
+   `context.makeTcpConnectionInterface` (NWConnection on macOS 14+).
 4. **No `AddressResult` on connect timeouts**, hence the Swift watchdog.
 5. **Network interface** is not reported with `NetworkUsage`; iOS cellular accounting needs it.
 6. iOS: no Bazel `BUILD` for the package or the xcframework, no iOS slices in `build.sh`.
@@ -407,13 +409,13 @@ exactly as `MTTcpConnection` does; iOS only.
    session `401` other than `SESSION_PASSWORD_NEEDED` logs the account out. If the engine ever sends a
    request with a key the server does not associate with the authorization and gets
    `AUTH_KEY_UNREGISTERED` instead of `AUTH_KEY_PERM_EMPTY`, that is irreversible. integration.md R1's
-   suggestion, routing the callback through `MTContext.checkIfLoggedOut`, does **not** work and was
-   withdrawn (2026-10-02): `checkIfAuthKeyRemovedWithContext` runs an `EphemeralMain` auth action, and
-   `-[MTDatacenterAuthAction execute:]` completes at once when the context stores a key for that
-   selector, which the main session's own temporary key always is. The probe never reaches the server,
-   always reports "not removed", and a session terminated from another device never logged out. A
-   working safety net needs a different confirmation (for example a rebind of a fresh temporary key
-   and logging out on a second `401`).
+   suggestion, routing the callback through `MTContext.checkIfLoggedOut`, was withdrawn (2026-10-02):
+   the probe's `EphemeralMain` auth action completed at once on the key the context stored for that
+   selector, never reached the server, and always reported "not removed". Since 2026-10-06 the probe
+   carries `replacesExistingKey` and `probedPermanentKey` and really makes a fresh temporary key, binds it
+   to the probed permanent key and never stores it, giving up without a verdict after 120 s; it is what
+   the bridge uses for the engine's `PermanentKeyInvalid` on the home datacenter. It still runs over MtProtoKit's TCP, so it cannot confirm a `401` where only HTTP or
+   Telegram Web work, and the `401` path stays a direct logout.
 2. **Liveness.** Sessions follow `Network.isUserOnline` (`Account.shouldKeepOnlinePresence`, wired on iOS
    only). Online, a
    dead connection is dropped after about `2.5 × max(2, 1.5·rtt + 1)` s; offline (background, secondary
