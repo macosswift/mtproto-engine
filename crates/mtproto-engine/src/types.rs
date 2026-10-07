@@ -313,8 +313,9 @@ impl SessionSetup {
             Some(ProxyConfig::MtProxy { secret, .. }) | Some(ProxyConfig::Web { secret, .. }) => {
                 ProxySecret::from_binary(secret, true).ok()
             }
-            Some(ProxyConfig::Socks5 { .. }) | Some(ProxyConfig::Http { .. }) => None,
-            None => address.secret.as_ref().and_then(|secret| ProxySecret::from_binary(secret, true).ok()),
+            Some(ProxyConfig::Socks5 { .. }) | Some(ProxyConfig::Http { .. }) | None => {
+                address.secret.as_ref().and_then(|secret| ProxySecret::from_binary(secret, true).ok())
+            }
         }
     }
 }

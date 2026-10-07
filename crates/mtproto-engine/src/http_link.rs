@@ -82,6 +82,9 @@ pub struct HttpConn {
     socks_out: Vec<u8>,
     route: HttpRoute,
     write_buffer: Vec<u8>,
+    /// Its requests carry `Proxy-Authorization` or its SOCKS5 output a password: the buffers are wiped,
+    /// not just cleared, and never left behind by a reallocation.
+    secret: bool,
     write_offset: usize,
     writable_interest: bool,
     written_total: u64,
@@ -136,7 +139,10 @@ impl HttpConn {
         address_index: usize,
         now: f64,
     ) -> Self {
+        let secret = matches!(&route, HttpRoute::Forwarded { credentials: Some(_), .. })
+            || socks.as_ref().is_some_and(|(_, auth)| auth.is_some());
         Self {
+            secret,
             pipe,
             token,
             phase: Phase::Connecting,
@@ -273,7 +279,15 @@ impl HttpConn {
     ) -> Result<(), HttpConnError> {
         compact(&mut self.write_buffer, &mut self.write_offset);
         let unsent_before = self.write_buffer.len() - self.write_offset;
-        write_post_head(&self.route, body.len(), &mut self.write_buffer);
+        if self.secret {
+            let mut head = Vec::with_capacity(4096);
+            write_post_head(&self.route, body.len(), &mut head);
+            reserve_wiping(&mut self.write_buffer, head.len() + body.len());
+            self.write_buffer.extend_from_slice(&head);
+            mtproto_core::Zeroize::zeroize(&mut head);
+        } else {
+            write_post_head(&self.route, body.len(), &mut self.write_buffer);
+        }
         self.write_buffer.extend_from_slice(body);
         let unsent = self.write_buffer.len() - self.write_offset;
         let end_offset = self.written_total + unsent as u64;
@@ -316,6 +330,9 @@ impl HttpConn {
                         Ok(written) => {
                             self.bytes_out += written as u64;
                             self.socks_out.drain(..written);
+                            if self.socks_out.is_empty() && self.secret {
+                                mtproto_core::Zeroize::zeroize(&mut self.socks_out);
+                            }
                         }
                         Err(error) if error.kind() == ErrorKind::WouldBlock => break,
                         Err(error) if error.kind() == ErrorKind::Interrupted => continue,
@@ -343,6 +360,9 @@ impl HttpConn {
                     }
                 }
                 if self.write_offset == self.write_buffer.len() {
+                    if self.secret {
+                        mtproto_core::Zeroize::zeroize(&mut self.write_buffer);
+                    }
                     self.write_buffer.clear();
                     self.write_offset = 0;
                     if self.write_buffer.capacity() > 256 * 1024 {
@@ -421,7 +441,11 @@ impl HttpConn {
                     loop {
                         match handshake.feed(&mut self.input).map_err(HttpConnError::Socks)? {
                             Socks5Progress::NeedMore => break,
-                            Socks5Progress::Send(bytes) => self.socks_out.extend_from_slice(&bytes),
+                            Socks5Progress::Send(mut bytes) => {
+                                reserve_wiping(&mut self.socks_out, bytes.len());
+                                self.socks_out.extend_from_slice(&bytes);
+                                mtproto_core::Zeroize::zeroize(&mut bytes);
+                            }
                             Socks5Progress::Connected => {
                                 self.phase = Phase::Ready;
                                 self.established_at = Some(now);
@@ -489,9 +513,32 @@ impl HttpConn {
     pub fn shrink(&mut self) {
         self.input.shrink_if_idle(16 * 1024);
         if self.write_buffer.is_empty() && self.write_buffer.capacity() > 64 * 1024 {
+            if self.secret {
+                mtproto_core::Zeroize::zeroize(&mut self.write_buffer);
+            }
             self.write_buffer = Vec::new();
         }
     }
+}
+
+impl Drop for HttpConn {
+    fn drop(&mut self) {
+        if self.secret {
+            mtproto_core::Zeroize::zeroize(&mut self.write_buffer);
+            mtproto_core::Zeroize::zeroize(&mut self.socks_out);
+        }
+    }
+}
+
+/// Room for `additional` bytes without a reallocation that would free the old block unwiped.
+fn reserve_wiping(buffer: &mut Vec<u8>, additional: usize) {
+    if buffer.capacity() - buffer.len() >= additional {
+        return;
+    }
+    let mut bigger = Vec::with_capacity((buffer.len() + additional).max(buffer.capacity() * 2));
+    bigger.extend_from_slice(buffer);
+    mtproto_core::Zeroize::zeroize(buffer);
+    *buffer = bigger;
 }
 
 fn compact(buffer: &mut Vec<u8>, offset: &mut usize) {

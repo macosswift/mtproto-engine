@@ -28,9 +28,17 @@ impl Drop for HttpCredentials {
 }
 
 impl HttpCredentials {
+    /// `Basic <base64(user:password)>`, built in buffers sized up front and wiped by the caller.
     fn header_value(&self) -> String {
-        let raw = format!("{}:{}", self.username, self.password);
-        format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(raw.as_bytes()))
+        let mut raw = String::with_capacity(self.username.len() + 1 + self.password.len());
+        raw.push_str(&self.username);
+        raw.push(':');
+        raw.push_str(&self.password);
+        let mut value = String::with_capacity(6 + base64::encoded_len(raw.len(), true).unwrap_or(0));
+        value.push_str("Basic ");
+        base64::engine::general_purpose::STANDARD.encode_string(raw.as_bytes(), &mut value);
+        zeroize::Zeroize::zeroize(&mut raw);
+        value
     }
 }
 
@@ -65,9 +73,12 @@ pub fn write_post_head(route: &HttpRoute, body_len: usize, out: &mut Vec<u8>) {
             out.extend_from_slice(authority.as_bytes());
             out.extend_from_slice(b"\r\nProxy-Connection: keep-alive\r\nConnection: keep-alive\r\n");
             if let Some(credentials) = credentials {
+                let mut value = credentials.header_value();
+                out.reserve(value.len() + 128);
                 out.extend_from_slice(b"Proxy-Authorization: ");
-                out.extend_from_slice(credentials.header_value().as_bytes());
+                out.extend_from_slice(value.as_bytes());
                 out.extend_from_slice(b"\r\n");
+                zeroize::Zeroize::zeroize(&mut value);
             }
         }
         HttpRoute::Web { host, path } => {
@@ -500,12 +511,18 @@ pub enum HttpConnectError {
 
 impl HttpConnectHandshake {
     pub fn new(authority: &str, credentials: Option<&HttpCredentials>) -> (Self, Vec<u8>) {
-        let mut request =
-            format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nProxy-Connection: keep-alive\r\n");
-        if let Some(credentials) = credentials {
+        let mut value = credentials.map(HttpCredentials::header_value);
+        let mut request = String::with_capacity(96 + 2 * authority.len() + value.as_ref().map_or(0, String::len));
+        request.push_str("CONNECT ");
+        request.push_str(authority);
+        request.push_str(" HTTP/1.1\r\nHost: ");
+        request.push_str(authority);
+        request.push_str("\r\nProxy-Connection: keep-alive\r\n");
+        if let Some(value) = value.as_mut() {
             request.push_str("Proxy-Authorization: ");
-            request.push_str(&credentials.header_value());
+            request.push_str(value);
             request.push_str("\r\n");
+            zeroize::Zeroize::zeroize(value);
         }
         request.push_str("\r\n");
         (Self { done: false }, request.into_bytes())

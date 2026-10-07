@@ -93,6 +93,8 @@ pub struct Connection {
     websocket: Option<WebSocketLink>,
     write_buffer: Vec<u8>,
     write_offset: usize,
+    /// The write buffer carried proxy credentials: wiped, not just cleared, once written.
+    write_buffer_secret: bool,
     writable_interest: bool,
     pub address_index: usize,
     /// Where the socket goes: the address, or the proxy's.
@@ -108,6 +110,14 @@ pub struct Connection {
     pub bytes_in: u64,
     pub bytes_out: u64,
     written_total: u64,
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        if self.write_buffer_secret {
+            mtproto_core::Zeroize::zeroize(&mut self.write_buffer);
+        }
+    }
 }
 
 impl Connection {
@@ -175,6 +185,7 @@ impl Connection {
             pending_websocket: websocket,
             websocket: None,
             write_buffer: Vec::new(),
+            write_buffer_secret: false,
             write_offset: 0,
             writable_interest: true,
             address_index,
@@ -241,8 +252,8 @@ impl Connection {
                         self.phase = Phase::Socks { handshake };
                     }
                     Some(Tunnel::HttpConnect { authority, credentials }) => {
-                        let (handshake, request) = HttpConnectHandshake::new(&authority, credentials.as_ref());
-                        self.write_buffer.extend_from_slice(&request);
+                        let (handshake, mut request) = HttpConnectHandshake::new(&authority, credentials.as_ref());
+                        self.write_secret(&mut request);
                         self.phase = Phase::HttpTunnel { handshake };
                     }
                     None => {
@@ -293,6 +304,13 @@ impl Connection {
         result.and(framing)
     }
 
+    fn write_secret(&mut self, bytes: &mut Vec<u8>) {
+        self.write_buffer.reserve(bytes.len() + 64);
+        self.write_buffer.extend_from_slice(bytes);
+        mtproto_core::Zeroize::zeroize(bytes);
+        self.write_buffer_secret = true;
+    }
+
     fn compact_write_buffer(&mut self) {
         compact_written_prefix(&mut self.write_buffer, &mut self.write_offset);
     }
@@ -330,6 +348,9 @@ impl Connection {
             }
         }
         if self.write_offset == self.write_buffer.len() {
+            if std::mem::take(&mut self.write_buffer_secret) {
+                mtproto_core::Zeroize::zeroize(&mut self.write_buffer);
+            }
             self.write_buffer.clear();
             self.write_offset = 0;
             if self.write_buffer.capacity() > 256 * 1024 {
@@ -405,7 +426,12 @@ impl Connection {
                 loop {
                     match handshake.feed(&mut self.socks_input).map_err(ConnectionError::Socks)? {
                         Socks5Progress::NeedMore => break,
-                        Socks5Progress::Send(bytes) => self.write_buffer.extend_from_slice(&bytes),
+                        Socks5Progress::Send(mut bytes) => {
+                            self.write_buffer.reserve(bytes.len() + 64);
+                            self.write_buffer.extend_from_slice(&bytes);
+                            mtproto_core::Zeroize::zeroize(&mut bytes);
+                            self.write_buffer_secret = true;
+                        }
                         Socks5Progress::Connected => {
                             let leftover = self.socks_input.as_slice().to_vec();
                             self.socks_input = InputBuffer::new();

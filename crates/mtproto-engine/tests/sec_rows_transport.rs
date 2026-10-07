@@ -286,7 +286,6 @@ fn answer_after_first_error(first: FirstError) -> (Vec<u8>, usize) {
 }
 
 #[test]
-#[ignore = "T-17: frames after a packet that failed its check are still processed (session_runtime.rs handle_io second pass)"]
 fn nothing_after_a_failed_packet_is_processed_on_the_same_connection() {
     let (body, connections) = answer_after_first_error(FirstError::CorruptedPacket);
     assert_eq!(body, FRESH, "the answer behind the corrupted packet was taken from the failed connection");
@@ -294,7 +293,6 @@ fn nothing_after_a_failed_packet_is_processed_on_the_same_connection() {
 }
 
 #[test]
-#[ignore = "T-17: frames after a transport error frame are still processed (session_runtime.rs handle_io second pass)"]
 fn nothing_after_a_transport_error_is_processed_on_the_same_connection() {
     let (body, connections) = answer_after_first_error(FirstError::TransportError(-429));
     assert_eq!(body, FRESH, "the answer behind the transport error was taken from the failed connection");
@@ -302,7 +300,6 @@ fn nothing_after_a_transport_error_is_processed_on_the_same_connection() {
 }
 
 #[test]
-#[ignore = "T-17: two -404 frames in one read count as a rejection confirmed on a fresh connection (session_runtime.rs handle_io second pass)"]
 fn two_forged_404_frames_on_one_connection_are_one_rejection() {
     let key = random_key(4407);
     let dc = StickyDc::start(key.clone(), FirstError::RepeatedTransportError(-404));
@@ -385,7 +382,6 @@ fn an_address_with_a_secret_is_never_tried_over_plain_http() {
 }
 
 #[test]
-#[ignore = "T-13: behind a SOCKS5 or HTTP proxy the dcOption secret of the address is dropped (types.rs proxy_secret)"]
 fn a_datacenter_secret_is_kept_behind_a_socks5_proxy() {
     let key = random_key(4404);
     let secret = vec![0x7bu8; 16];

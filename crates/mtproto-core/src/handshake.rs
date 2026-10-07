@@ -4,7 +4,7 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::auth_key::AuthKey;
 use crate::crypto::{
     DhError, DhPrimeCache, RsaPublicKey, SecureRandom, aes_ige_decrypt, aes_ige_encrypt, check_dh_params,
-    check_g_a_or_b, factorize_pq, handshake_tmp_aes, is_probable_prime, sha1, sha1_parts, to_fixed_be,
+    check_g_a_or_b, factorize_pq, handshake_tmp_aes, is_probable_prime, secret_modpow, sha1, sha1_parts, to_fixed_be,
 };
 use crate::message::{MessageError, constant_time_eq, decode_plain_message, encode_plain_message};
 use crate::msg_id::MsgIdGenerator;
@@ -73,12 +73,12 @@ enum State {
     WaitDhParams {
         nonce: [u8; 16],
         server_nonce: [u8; 16],
-        new_nonce: Zeroizing<[u8; 32]>,
+        new_nonce: Box<Zeroizing<[u8; 32]>>,
     },
     WaitDhGen {
         nonce: [u8; 16],
         server_nonce: [u8; 16],
-        new_nonce: Zeroizing<[u8; 32]>,
+        new_nonce: Box<Zeroizing<[u8; 32]>>,
         auth_key: AuthKey,
         prime: BigUint,
         g: u32,
@@ -122,7 +122,23 @@ impl Handshake {
         encode_plain_message(msg_id, &body.to_bytes())
     }
 
+    /// One step of the exchange. The exponentiation, the hashes and the moves of the key leave copies
+    /// of the key and of `b` in dead stack frames, where the next large struct built on the stack would
+    /// pick them up as padding and carry them to the heap: those frames are wiped before returning.
     pub fn on_packet(
+        &mut self,
+        packet: &[u8],
+        local_unix_now: f64,
+        prime_cache: Option<&mut dyn DhPrimeCache>,
+        rng: &mut impl SecureRandom,
+    ) -> Result<HandshakeStep, HandshakeError> {
+        let step = self.step(packet, local_unix_now, prime_cache, rng);
+        wipe_stack_below();
+        step
+    }
+
+    #[inline(never)]
+    fn step(
         &mut self,
         packet: &[u8],
         local_unix_now: f64,
@@ -155,14 +171,15 @@ impl Handshake {
                 let (p, q) = factorize_pq(pq).ok_or(HandshakeError::FactorizationFailed)?;
                 let p_bytes = minimal_be(p);
                 let q_bytes = minimal_be(q);
-                let new_nonce: Zeroizing<[u8; 32]> = Zeroizing::new(rng.array());
+                let mut new_nonce = Box::new(Zeroizing::new([0u8; 32]));
+                rng.fill(&mut new_nonce[..]);
                 let mut inner = PqInnerData {
                     pq: res_pq.pq.clone(),
                     p: p_bytes.clone(),
                     q: q_bytes.clone(),
                     nonce,
                     server_nonce: res_pq.server_nonce,
-                    new_nonce: *new_nonce,
+                    new_nonce: **new_nonce,
                     dc: self.config.dc_id,
                     expires_in: self.config.temp_key_expires_in,
                 };
@@ -318,7 +335,7 @@ impl Handshake {
         &mut self,
         nonce: [u8; 16],
         server_nonce: [u8; 16],
-        new_nonce: Zeroizing<[u8; 32]>,
+        new_nonce: Box<Zeroizing<[u8; 32]>>,
         prime: BigUint,
         g: u32,
         g_a: BigUint,
@@ -329,21 +346,22 @@ impl Handshake {
         retries: u32,
         rng: &mut impl SecureRandom,
     ) -> Result<HandshakeStep, HandshakeError> {
-        let generator = BigUint::from(g);
-        let (b, g_b) = loop {
-            let mut b_bytes = [0u8; 256];
-            rng.fill(&mut b_bytes);
-            let b = BigUint::from_bytes_be(&b_bytes);
-            b_bytes.zeroize();
-            let g_b = generator.modpow(&b, &prime);
+        let unsupported = HandshakeError::Dh(DhError::PrimeNotSafe);
+        let prime_bytes = to_fixed_be::<256>(&prime).ok_or(unsupported.clone())?;
+        let g_a_bytes = to_fixed_be::<256>(&g_a).ok_or(unsupported.clone())?;
+        let generator = to_fixed_be::<256>(&BigUint::from(g)).ok_or(unsupported.clone())?;
+        let mut b = Zeroizing::new([0u8; 256]);
+        let g_b = loop {
+            rng.fill(&mut b[..]);
+            let g_b = BigUint::from_bytes_be(&secret_modpow(&generator, &b, &prime_bytes).ok_or(unsupported.clone())?);
             if check_g_a_or_b(&g_b, &prime).is_ok() {
-                break (b, g_b);
+                break g_b;
             }
         };
-        let key_number = g_a.modpow(&b, &prime);
+        let mut key_bytes = secret_modpow(&g_a_bytes, &b, &prime_bytes).ok_or(unsupported)?;
         drop(b);
-        let key_bytes = to_fixed_be::<256>(&key_number).expect("key fits 2048 bits");
         let auth_key = AuthKey::new(key_bytes);
+        key_bytes.zeroize();
 
         let inner = ClientDhInnerData { nonce, server_nonce, retry_id, g_b: g_b.to_bytes_be() };
         let inner_bytes = inner.to_bytes();
@@ -371,6 +389,14 @@ impl Handshake {
         };
         Ok(HandshakeStep::Send(packet))
     }
+}
+
+/// Zeroes the stack the handshake's callees used, below the caller's frame.
+#[inline(never)]
+fn wipe_stack_below() {
+    let mut frames = [0u8; 32 * 1024];
+    frames.zeroize();
+    core::hint::black_box(&frames);
 }
 
 fn check_nonces(

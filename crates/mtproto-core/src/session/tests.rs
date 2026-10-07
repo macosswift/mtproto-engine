@@ -2612,13 +2612,14 @@ fn a_server_cannot_make_the_client_upload_a_query_forever() {
 fn outgoing_containers_never_exceed_1024_messages() {
     let mut h = Harness::new();
     h.sync();
-    for tag in 0..1500u32 {
+    let queries = MAX_INFLIGHT_QUERIES as u64;
+    for tag in 0..queries as u32 {
         h.session.send(QueryId(tag as u64 + 1), query_body(tag), QueryOptions::default(), h.now);
     }
     h.flush_all();
-    let sent: Vec<i64> = (0..1500u64).filter_map(|tag| h.session.query_msg_id(QueryId(tag + 1))).collect();
-    assert_eq!(sent.len(), 1500);
-    for tag in 0..1500u64 {
+    let sent: Vec<i64> = (0..queries).filter_map(|tag| h.session.query_msg_id(QueryId(tag + 1))).collect();
+    assert_eq!(sent.len(), queries as usize);
+    for tag in 0..queries {
         let _ = h.session.cancel(QueryId(tag + 1));
     }
     for msg_id in sent {
@@ -2638,7 +2639,7 @@ fn outgoing_containers_never_exceed_1024_messages() {
         );
         drops += packet.messages.iter().filter(|message| message.constructor() == ids::RPC_DROP_ANSWER).count();
     }
-    assert_eq!(drops, 1500, "every cancelled query's answer is dropped eventually");
+    assert_eq!(drops, queries as usize, "every cancelled query's answer is dropped eventually");
 }
 
 #[test]

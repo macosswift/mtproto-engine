@@ -99,7 +99,6 @@ fn proxy_secrets_leave_no_copy_in_freed_memory() {
 }
 
 #[test]
-#[ignore = "H-03: ProxySecret::from_link tries URL-safe base64 first; a standard-base64 secret fails it late and the partly decoded key is freed unwiped"]
 fn a_standard_base64_proxy_secret_leaves_no_partial_decoding_in_freed_memory() {
     let key = link_key();
     let fake_tls = [&[0xeeu8][..], &key, b"telegram.com>"].concat();
@@ -159,7 +158,6 @@ fn a_transport_stream_leaves_no_proxy_secret_or_obfuscation_key_in_freed_memory(
 }
 
 #[test]
-#[ignore = "H-03: a fake-TLS TransportStream keeps a copy of the proxy key in TlsState and frees it unwiped"]
 fn a_fake_tls_stream_leaves_no_proxy_key_in_freed_memory() {
     let key: [u8; 16] = pattern(4);
     let mut raw = vec![0xeeu8];
@@ -196,7 +194,6 @@ fn a_fake_tls_stream_leaves_no_proxy_key_in_freed_memory() {
 }
 
 #[test]
-#[ignore = "H-03: Socks5Auth has no Drop, so the SOCKS5 password the handshake keeps is freed unwiped"]
 fn socks5_credentials_leave_no_copy_in_freed_memory() {
     let password = "correct-horse-battery-staple".to_string();
     let mut watch = freed_memory::watch();
@@ -219,7 +216,6 @@ fn socks5_credentials_leave_no_copy_in_freed_memory() {
 }
 
 #[test]
-#[ignore = "H-03: HttpCredentials::header_value builds `user:password` and its Basic encoding in Strings freed unwiped"]
 fn http_proxy_credentials_leave_no_copy_in_freed_memory() {
     let password = "correct-horse-battery-staple".to_string();
     let basic = base64::engine::general_purpose::STANDARD.encode(format!("user:{password}"));
@@ -333,7 +329,6 @@ fn new_nonce(exchange: &Exchange) -> [u8; 32] {
 }
 
 #[test]
-#[ignore = "K-16: new_nonce stays behind in the handshake's memory when the state moves (mem::replace) and is freed unwiped"]
 fn after_dh_gen_ok_no_new_nonce_or_tmp_aes_is_left_in_freed_memory() {
     let first = exchange(16, None);
     let new_nonce = new_nonce(&first);
@@ -349,7 +344,6 @@ fn after_dh_gen_ok_no_new_nonce_or_tmp_aes_is_left_in_freed_memory() {
 }
 
 #[test]
-#[ignore = "K-16: the DH exponent b and the shared key g_a^b are num-bigint values, freed unwiped"]
 fn after_dh_gen_ok_no_dh_exponent_or_shared_key_number_is_left_in_freed_memory() {
     let first = exchange(17, None);
     assert!(first.rng.count256 >= 1, "b was drawn");

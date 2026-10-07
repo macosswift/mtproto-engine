@@ -103,13 +103,14 @@ pub fn check_g_a_or_b(value: &BigUint, prime: &BigUint) -> Result<(), DhError> {
 }
 
 pub fn to_fixed_be<const N: usize>(value: &BigUint) -> Option<[u8; N]> {
-    let bytes = value.to_bytes_be();
-    if bytes.len() > N {
-        return None;
-    }
-    let mut out = [0u8; N];
-    out[N - bytes.len()..].copy_from_slice(&bytes);
-    Some(out)
+    let mut bytes = value.to_bytes_be();
+    let out = (bytes.len() <= N).then(|| {
+        let mut out = [0u8; N];
+        out[N - bytes.len()..].copy_from_slice(&bytes);
+        out
+    });
+    zeroize::Zeroize::zeroize(&mut bytes);
+    out
 }
 
 #[cfg(test)]

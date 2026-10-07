@@ -354,7 +354,6 @@ fn a_cdn_connection_carries_only_the_hosts_calls_in_the_anonymous_wrapper() {
 /// method a CDN serves. A CDN session the host sets up with PFS still talks under its CDN key and sends
 /// no temporary key handshake and no bind to the CDN.
 #[test]
-#[ignore = "B-52: a CDN session set up with PFS makes a temporary key on the CDN and sends it auth.bindTempAuthKey"]
 fn a_cdn_session_never_binds_a_temporary_key_even_when_the_host_asks_for_pfs() {
     let cdn_key = random_key(5202);
     let cdn = TestServer::start(

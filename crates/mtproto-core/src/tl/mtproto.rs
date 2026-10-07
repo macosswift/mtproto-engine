@@ -503,7 +503,12 @@ impl<'a> ServiceMessage<'a> {
             },
             ids::MSG_RESEND_REQ => Self::MsgResendReq(reader.read_i64_vector(MAX_VECTOR_ITEMS)?),
             ids::MSG_RESEND_ANS_REQ => Self::MsgResendAnsReq(reader.read_i64_vector(MAX_VECTOR_ITEMS)?),
-            ids::PING | ids::PING_DELAY_DISCONNECT => Self::Ping { ping_id: reader.read_i64()? },
+            ids::PING => Self::Ping { ping_id: reader.read_i64()? },
+            ids::PING_DELAY_DISCONNECT => {
+                let ping_id = reader.read_i64()?;
+                reader.read_i32()?;
+                Self::Ping { ping_id }
+            }
             ids::MSG_COPY => Self::MsgCopy(parse_copied_message(&mut reader)?),
             ids::HTTP_WAIT => Self::HttpWait {
                 max_delay: reader.read_i32()?,
@@ -542,6 +547,9 @@ impl<'a> ServiceMessage<'a> {
                 return Ok(Self::Other { constructor, body });
             }
         };
+        if !matches!(message, Self::RpcResult { .. } | Self::Container(_) | Self::Ignored { .. }) {
+            reader.finish()?;
+        }
         Ok(message)
     }
 }

@@ -39,9 +39,9 @@ impl core::fmt::Debug for ProxySecret {
 impl ProxySecret {
     pub fn from_link(encoded: &str, truncate_if_needed: bool) -> Result<Self, ProxySecretError> {
         let mut decoded = decode_hex(encoded)
-            .or_else(|| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(encoded.trim_end_matches('=')).ok())
-            .or_else(|| base64::engine::general_purpose::STANDARD.decode(encoded).ok())
-            .or_else(|| base64::engine::general_purpose::STANDARD_NO_PAD.decode(encoded).ok())
+            .or_else(|| decode_base64(&base64::engine::general_purpose::URL_SAFE_NO_PAD, encoded.trim_end_matches('=')))
+            .or_else(|| decode_base64(&base64::engine::general_purpose::STANDARD, encoded))
+            .or_else(|| decode_base64(&base64::engine::general_purpose::STANDARD_NO_PAD, encoded))
             .ok_or(ProxySecretError::Wrong)?;
         let secret = Self::from_binary(&decoded, truncate_if_needed);
         zeroize::Zeroize::zeroize(&mut decoded);
@@ -90,7 +90,32 @@ fn decode_hex(text: &str) -> Option<Vec<u8>> {
     if !text.len().is_multiple_of(2) || text.is_empty() {
         return None;
     }
-    (0..text.len()).step_by(2).map(|i| u8::from_str_radix(text.get(i..i + 2)?, 16).ok()).collect()
+    let mut decoded = Vec::with_capacity(text.len() / 2);
+    for index in (0..text.len()).step_by(2) {
+        match text.get(index..index + 2).and_then(|pair| u8::from_str_radix(pair, 16).ok()) {
+            Some(byte) => decoded.push(byte),
+            None => {
+                zeroize::Zeroize::zeroize(&mut decoded);
+                return None;
+            }
+        }
+    }
+    Some(decoded)
+}
+
+/// Decodes into one buffer that is wiped when the text turns out not to be in this alphabet.
+fn decode_base64(engine: &impl Engine, text: &str) -> Option<Vec<u8>> {
+    let mut decoded = vec![0u8; base64::decoded_len_estimate(text.len())];
+    match engine.decode_slice(text, &mut decoded) {
+        Ok(length) => {
+            decoded.truncate(length);
+            Some(decoded)
+        }
+        Err(_) => {
+            zeroize::Zeroize::zeroize(&mut decoded);
+            None
+        }
+    }
 }
 
 #[cfg(test)]

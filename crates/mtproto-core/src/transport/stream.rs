@@ -29,6 +29,15 @@ enum TlsState {
     Established,
 }
 
+impl Drop for TlsState {
+    fn drop(&mut self) {
+        if let TlsState::WaitingForServerHello { client_random, secret } = self {
+            zeroize::Zeroize::zeroize(client_random);
+            zeroize::Zeroize::zeroize(secret);
+        }
+    }
+}
+
 pub struct TransportStream {
     decoder: FrameDecoder,
     encryptor: AesCtr,

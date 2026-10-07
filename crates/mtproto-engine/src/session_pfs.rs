@@ -68,6 +68,9 @@ pub(super) struct PfsState {
     lost_in_a_row: u32,
     /// Rebinds after AUTH_KEY_PERM_EMPTY with no fresh packet since: a second one replaces the key.
     perm_empty_rebinds: u32,
+    /// Temporary keys dropped after a 401 on a non-main session with no call completed since: a bind
+    /// that succeeds does not reset it, so a server or host that keeps answering 401 meets a backoff.
+    unauthorized_in_a_row: u32,
     /// The key went while the session was idle: the next one is made when there is work for it.
     pub(super) lazy: bool,
     /// `destroy_auth_key` goes under the permanent key, with every request held; once it is answered
@@ -231,6 +234,20 @@ impl PfsState {
                 .min(PFS_REGENERATE_BACKOFF_MAX),
         };
         self.refusals = self.refusals.saturating_add(1);
+        self.need_regenerate = true;
+        self.regenerate_at = now.mono + delay;
+    }
+
+    /// A non-main session got a 401 under a bound temporary key: another key is made, at once the first
+    /// time, then backing off like a refused key until a call completes.
+    fn regenerate_after_unauthorized(&mut self, now: Now) {
+        let delay = match self.unauthorized_in_a_row {
+            0 => 0.0,
+            count => {
+                (PFS_REGENERATE_BACKOFF_BASE * f64::from(1u32 << (count - 1).min(10))).min(PFS_REGENERATE_BACKOFF_MAX)
+            }
+        };
+        self.unauthorized_in_a_row = self.unauthorized_in_a_row.saturating_add(1);
         self.need_regenerate = true;
         self.regenerate_at = now.mono + delay;
     }
@@ -546,6 +563,7 @@ impl SessionRuntime {
             return;
         };
         rpc.hold_until_bound();
+        rpc.set_stored_init_hash(None);
         rpc.bind_temporary_key(perm.key.clone(), expires_at.floor() as i32, now, rng);
         pfs.binding = true;
         pfs.need_rebind = false;
@@ -555,6 +573,7 @@ impl SessionRuntime {
     /// Notes what a bind answer or a rejected temporary key asks for; `drive_pfs` acts on it. False
     /// when the event is the engine's own business and not the host's.
     pub(super) fn observe_pfs_event(&mut self, event: &RpcEvent, now: Now) -> bool {
+        let main = matches!(self.setup.role, mtproto_core::rpc::SessionRole::Main);
         let Some(pfs) = &mut self.pfs else {
             return true;
         };
@@ -602,6 +621,15 @@ impl SessionRuntime {
                 }
                 true
             }
+            RpcEvent::AuthTokenRequired | RpcEvent::Failed { code: 401, .. } if !main => {
+                let excluded = matches!(event, RpcEvent::Failed { message, .. }
+                    if message == "AUTH_KEY_PERM_EMPTY" || message.contains("SESSION_PASSWORD_NEEDED"));
+                if pfs.bound && !excluded {
+                    pfs.bound = false;
+                    pfs.regenerate_after_unauthorized(now);
+                }
+                true
+            }
             RpcEvent::TemporaryKeyRejected => {
                 if pfs.bound && pfs.perm_empty_rebinds >= 1 {
                     pfs.bound = false;
@@ -646,6 +674,7 @@ impl SessionRuntime {
         if let Some(pfs) = &mut self.pfs {
             pfs.lost_in_a_row = 0;
             pfs.perm_empty_rebinds = 0;
+            pfs.unauthorized_in_a_row = 0;
         }
     }
 

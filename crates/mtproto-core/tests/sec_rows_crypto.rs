@@ -345,7 +345,6 @@ fn every_service_object_parses_when_it_ends_exactly() {
 }
 
 #[test]
-#[ignore = "L-09: ServiceMessage::parse never checks that a service object ends where its fields end"]
 fn service_objects_with_trailing_bytes_are_refused_like_tdlib_fetch_end() {
     let mut accepted = Vec::new();
     for (name, mut body) in service_objects() {

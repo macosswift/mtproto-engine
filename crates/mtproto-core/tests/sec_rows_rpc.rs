@@ -194,7 +194,6 @@ fn outgoing_gzip_only_for_compressible_requests_above_255_bytes_and_never_for_fi
 }
 
 #[test]
-#[ignore = "B-29: nothing caps the queries in flight; 1500 go out unanswered at once"]
 fn no_more_than_1024_queries_are_in_flight_at_once() {
     let mut h = Harness::new(SessionRole::Main, Some("h1"));
     for id in 1..=1500u64 {

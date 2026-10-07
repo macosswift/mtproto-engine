@@ -292,7 +292,8 @@ impl SessionRuntime {
             host_streams: None,
             setup,
         };
-        if let Some(pfs) = runtime.setup.pfs.take().filter(|pfs| !pfs.public_keys.is_empty()) {
+        let cdn = runtime.setup.role == SessionRole::Cdn;
+        if let Some(pfs) = runtime.setup.pfs.take().filter(|pfs| !pfs.public_keys.is_empty() && !cdn) {
             let perm = runtime.setup.auth_key.take();
             runtime.pfs = Some(PfsState::new(pfs, perm));
             runtime.setup.key_generation = None;
@@ -650,7 +651,7 @@ impl SessionRuntime {
         callbacks: &Arc<dyn EngineCallbacks>,
         rng: &mut OsRandom,
     ) {
-        if setup.public_keys.is_empty() {
+        if setup.public_keys.is_empty() || self.setup.role == SessionRole::Cdn {
             return;
         }
         if let Some(pfs) = &mut self.pfs {
@@ -1682,6 +1683,7 @@ impl SessionRuntime {
         }
         let mut more_readable = false;
         let mut failure: Option<ConnectionError> = None;
+        let mut processing_failed = false;
         if writable {
             let result = self.connection.as_mut().expect("connection").handle_writable(registry, now.mono);
             if self.racer.is_some()
@@ -1713,6 +1715,7 @@ impl SessionRuntime {
                         }
                         if let Err(error) = self.process_incoming(registry, now, callbacks, rng) {
                             failure = Some(error);
+                            processing_failed = true;
                             break;
                         }
                         if self.frame_is_progressing(now) {
@@ -1740,10 +1743,12 @@ impl SessionRuntime {
             if let Err(error) = self.process_incoming(registry, now, callbacks, rng) {
                 failure = Some(error);
             }
-        } else if matches!(
-            failure,
-            Some(ConnectionError::Closed) | Some(ConnectionError::Io(_)) | Some(ConnectionError::WebSocket(_))
-        ) && let Err(error) = self.process_incoming(registry, now, callbacks, rng)
+        } else if !processing_failed
+            && matches!(
+                failure,
+                Some(ConnectionError::Closed) | Some(ConnectionError::Io(_)) | Some(ConnectionError::WebSocket(_))
+            )
+            && let Err(error) = self.process_incoming(registry, now, callbacks, rng)
         {
             failure = Some(error);
         }

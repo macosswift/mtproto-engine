@@ -369,8 +369,26 @@ impl RpcClient {
         }
     }
 
+    /// What the key was initialized with. When the next call has to initialize the connection again (after
+    /// auth.bindTempAuthKey), calls handed to the session but not sent yet were wrapped without
+    /// initConnection: they are taken back and wrapped again, so the first call to go carries it.
     pub fn set_stored_init_hash(&mut self, hash: Option<String>) {
         self.stored_init_hash = hash;
+        if !self.needs_initialization() {
+            return;
+        }
+        let unsent: Vec<RequestId> = self
+            .requests
+            .iter()
+            .filter(|(id, state)| {
+                state.in_session && !state.wrapped_with_init && !self.session.was_transmitted(QueryId::from(**id))
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in unsent {
+            self.session.cancel(QueryId::from(id));
+            self.leave_session(id);
+        }
     }
 
     pub fn update_environment(&mut self, environment: ApiEnvironment, noop_request: Option<RpcRequest>, now: Now) {

@@ -37,6 +37,8 @@ pub const MAX_NESTING_DEPTH: usize = 8;
 pub const MAX_AWAITED_ANSWERS: usize = 1024;
 pub const MAX_MESSAGES_PER_PACKET: usize = 4 * 1024;
 pub const MAX_CONTAINER_MESSAGES_OUT: usize = 1024;
+/// Queries sent and not answered yet, as tdlib's MAX_INFLIGHT_QUERIES: more wait until one is answered.
+pub const MAX_INFLIGHT_QUERIES: usize = 1024;
 pub const CONTAINER_RESERVED_SLOTS: usize = 2;
 pub const MAX_UNPACKED_PER_PACKET: usize = 64 * 1024 * 1024;
 pub const CLOCK_JUMP_THRESHOLD: f64 = 1.0;
@@ -1381,9 +1383,13 @@ impl Session {
     }
 
     pub fn cancel(&mut self, id: QueryId) -> CancelOutcome {
+        let was_full = self.in_flight_is_full();
         let Some(query) = self.queries.remove(&id) else {
             return CancelOutcome::NotFound;
         };
+        if was_full && query.state != QueryState::Pending {
+            self.slot_freed();
+        }
         Self::count_transition(&mut self.pending_queries, &mut self.unknown_queries, Some(query.state), None);
         self.to_retransmit.retain(|other| *other != id);
         match query.state {
@@ -1621,7 +1627,7 @@ impl Session {
         let position = self
             .pending
             .iter()
-            .position(|other| self.queries.get(other).is_some_and(|other| other.msg_id > msg_id))
+            .position(|other| self.queries.get(other).is_some_and(|other| other.seq_no == 0 || other.msg_id > msg_id))
             .unwrap_or(self.pending.len());
         if self.release_query_message(id).is_some() {
             self.pending.insert(position.min(self.pending.len()), id);
@@ -2490,7 +2496,11 @@ impl Session {
     }
 
     fn complete_query(&mut self, id: QueryId, msg_id: i64) {
+        let was_full = self.in_flight_is_full();
         if let Some(query) = self.queries.remove(&id) {
+            if was_full && query.state != QueryState::Pending {
+                self.slot_freed();
+            }
             Self::count_transition(&mut self.pending_queries, &mut self.unknown_queries, Some(query.state), None);
             self.by_msg_id.remove(&msg_id);
             self.detach_from_container(query.container_id, msg_id);
@@ -3170,6 +3180,21 @@ impl Session {
         (self.bind_gate && self.bind.as_ref().is_none_or(|(bind, _)| *bind != id)) || self.is_destroying_auth_key()
     }
 
+    fn in_flight_is_full(&self) -> bool {
+        self.queries.len() - self.pending_queries >= MAX_INFLIGHT_QUERIES
+    }
+
+    /// A query waiting for one of the MAX_INFLIGHT_QUERIES slots; the bind never waits.
+    fn waits_for_a_slot(&self, id: QueryId) -> bool {
+        self.in_flight_is_full() && self.bind.as_ref().is_none_or(|(bind, _)| *bind != id)
+    }
+
+    fn slot_freed(&mut self) {
+        if !self.pending.is_empty() {
+            self.send_before(0.0);
+        }
+    }
+
     fn bind_body(&self, id: QueryId, msg_id: i64, rng: &mut impl SecureRandom) -> Option<Vec<u8>> {
         let (bind, request) = self.bind.as_ref()?;
         if *bind != id {
@@ -3310,7 +3335,7 @@ impl Session {
                 if query_messages.len() >= self.config.max_container_queries {
                     break;
                 }
-                if self.is_gated(id) {
+                if self.is_gated(id) || self.waits_for_a_slot(id) {
                     break;
                 }
                 let Some((body_len, invoke_after)) =
@@ -3507,7 +3532,7 @@ impl Session {
             .reduce(f64::min);
         self.to_resend_answer.extend(held_answers);
 
-        let pending_held = self.pending.iter().all(|id| self.is_gated(*id));
+        let pending_held = self.pending.iter().all(|id| self.is_gated(*id) || self.waits_for_a_slot(*id));
         let retransmit_held = self.to_retransmit.iter().all(|id| self.is_gated(*id));
         let nothing_left = pending_held
             && self.to_ack.is_empty()

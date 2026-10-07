@@ -174,7 +174,6 @@ fn auth_key_perm_empty_under_engine_pfs_never_touches_the_permanent_key() {
 }
 
 #[test]
-#[ignore = "B-31: a 401 on a non-main session under engine PFS keeps the temporary key (tdlib drops it)"]
 fn a_401_on_a_non_main_session_under_engine_pfs_replaces_its_temporary_key() {
     let perm = random_key(7302);
     let server = live_server(vec![perm.clone()]);
@@ -257,7 +256,6 @@ fn init_connection_goes_with_the_first_call_under_every_new_temporary_key() {
 }
 
 #[test]
-#[ignore = "B-70: a rebind of the same temporary key after AUTH_KEY_PERM_EMPTY is not followed by initConnection"]
 fn init_connection_goes_with_the_first_call_after_a_rebind_of_the_same_temporary_key() {
     let perm = random_key(7305);
     let server = live_server(vec![perm.clone()]);

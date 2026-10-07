@@ -155,7 +155,6 @@ fn a_session_with_an_address_secret_leaves_no_secret_in_freed_memory() {
 }
 
 #[test]
-#[ignore = "H-03: the engine copies the SOCKS5 password into Socks5Auth (no Drop) and the auth request it writes, both freed unwiped"]
 fn a_session_through_an_authenticating_socks5_proxy_leaves_no_password_in_freed_memory() {
     let key = random_key(302);
     let server = TestServer::start(vec![key.clone()], ServerOptions { socks5: true, ..Default::default() });
@@ -175,7 +174,6 @@ fn a_session_through_an_authenticating_socks5_proxy_leaves_no_password_in_freed_
 }
 
 #[test]
-#[ignore = "H-03: a fake-TLS connection keeps the MTProxy key in TransportStream's TlsState and frees it unwiped"]
 fn a_session_through_a_fake_tls_mtproxy_leaves_no_proxy_key_in_freed_memory() {
     let mut secret = [&[0xeeu8][..], &proxy_key()].concat();
     secret.extend_from_slice(b"www.example.com");

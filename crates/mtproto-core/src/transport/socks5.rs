@@ -13,6 +13,12 @@ pub struct Socks5Auth {
     pub password: String,
 }
 
+impl Drop for Socks5Auth {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.password);
+    }
+}
+
 impl core::fmt::Debug for Socks5Auth {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str("Socks5Auth(..)")
@@ -124,7 +130,8 @@ impl Socks5Handshake {
                         let Some(auth) = &self.auth else {
                             return Err(Socks5Error::UnsupportedMethod(method));
                         };
-                        let mut request = vec![1, auth.username.len() as u8];
+                        let mut request = Vec::with_capacity(3 + auth.username.len() + auth.password.len());
+                        request.extend_from_slice(&[1, auth.username.len() as u8]);
                         request.extend_from_slice(auth.username.as_bytes());
                         request.push(auth.password.len() as u8);
                         request.extend_from_slice(auth.password.as_bytes());
